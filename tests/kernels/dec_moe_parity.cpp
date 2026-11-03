@@ -1486,9 +1486,12 @@ int main(int argc, char** argv) {
                 std::snprintf(what, sizeof what, "fused VRAM T=%d (%d groups)", T, P.counts[0]);
                 report(what, l, ndiff_rows(a3, b3, rows), rows.size() * H);
                 ck(cudaMemsetAsync(d_p3, 0, (size_t) K::kDmCap * H * 4, s0), "memset");
+                int major = 0;
+                ck(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0), "compute capability");
                 for (int kind : {1, 2, 3}) {
-                    // the TMA kernel stages 8 gate/up or 32 down rows in 11776 bytes: wider rows have no such kernel
-                    if (kind == 1 && (L.gu_row * 8 > 11776 || L.d_row * 32 > 11776)) continue;
+                    // the TMA kernel stages 8 gate/up or 32 down rows in 11776 bytes: wider rows have no such kernel;
+                    // its bulk copies need compute capability 9.0
+                    if (kind == 1 && (L.gu_row * 8 > 11776 || L.d_row * 32 > 11776 || major < 9)) continue;
                     ck(cudaMemsetAsync(d_p3, 0, (size_t) K::kDmCap * H * 4, s0), "memset");
                     K::dec_moe_vram(L, d_plan, d_xq2, d_vscr, d_p3, d_vsync, s0, kind, n);
                     ck(cudaStreamSynchronize(s0), "vram kind");
@@ -1517,7 +1520,9 @@ int main(int argc, char** argv) {
                 }) - r0;
                 const double uf = time_us(s0, 200, [&] { route(); K::dec_moe_vram(L, d_plan, d_xq2, d_vscr, d_parts, d_vsync, s0); }) - r0;
                 // the bulk-copy kernel stages 8 gate/up and 32 down rows: formats with wider rows are not timed (nan)
-                const bool tma_fits = L.gu_row * 8 <= 11776 && L.d_row * 32 <= 11776;
+                int cc = 0;
+                cudaDeviceGetAttribute(&cc, cudaDevAttrComputeCapabilityMajor, 0);
+                const bool tma_fits = L.gu_row * 8 <= 11776 && L.d_row * 32 <= 11776 && cc >= 9;
                 const double ut = !tma_fits ? std::nan("") :
                     time_us(s0, 200, [&] { route(); K::dec_moe_vram(L, d_plan, d_xq2, d_vscr, d_parts, d_vsync, s0, 1); }) - r0;
                 const double u2 = time_us(s0, 200, [&] { route(); K::dec_moe_vram(L, d_plan, d_xq2, d_vscr, d_parts, d_vsync, s0, 2, n); }) - r0;
