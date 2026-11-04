@@ -1450,4 +1450,59 @@ void gpu_stamp(unsigned long long* buf, int i, void* stream) {
     gpu_stamp_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(buf, i);
 }
 
+// gdn_commit_lazy_kernel's read-ahead as a launch of its own: one warp a block, its first lane requesting the lines in
+// pieces of at most 32 KiB as that kernel does (requests from every lane land less in L2: the surplus is dropped).  The
+// wait for the combine's mark ends after kL2AheadWaitNs, so a launch that starts late never keeps its SMs.
+namespace {
+constexpr unsigned long long kL2AheadWaitNs = 50000;
+__device__ uint32_t g_l2_ahead_sink;
+__device__ __forceinline__ unsigned long long l2_ahead_now() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+__global__ void __launch_bounds__(32) gdn_l2_ahead_kernel(const uint32_t* stop, uint32_t stop_value, GdnLazyPf pf) {
+    bool off = false;
+    for (int i = threadIdx.x; i < pf.n_ids; i += 32) {
+        const int id = __ldcg(pf.ids + i);
+        off |= id >= 0 && id < pf.n_expert && __ldcg(pf.ptab + id) == 0ull;
+    }
+    if (!__any_sync(0xffffffffu, off) || threadIdx.x != 0) return;
+    auto tier_wait = [&](uint32_t w) { return w == (stop_value | 0x80000000u) || w == (stop_value | 0x40000000u); };
+    const unsigned long long t0 = l2_ahead_now();
+    uint32_t v;
+    while (!tier_wait(v = ld_acquire(stop)) && v != stop_value && l2_ahead_now() - t0 < kL2AheadWaitNs) __nanosleep(256);
+    if (!tier_wait(v)) return;
+    uint64_t total_b = 0;
+    for (int r = 0; r < kLazyPfRanges; ++r) total_b += pf.n[r];
+    uint32_t acc = 0;
+    for (uint64_t o0 = (uint64_t) blockIdx.x * kLazyPfStep; o0 < total_b; o0 += (uint64_t) gridDim.x * kLazyPfStep) {
+        const uint64_t o1 = min(o0 + kLazyPfStep, total_b);
+        const char* last = nullptr;
+        for (uint64_t o = o0; o < o1;) {
+            int r = 0;
+            uint64_t ro = o;
+            while (r < kLazyPfRanges - 1 && ro >= pf.n[r]) { ro -= pf.n[r]; ++r; }
+            const uint64_t take = min(min(o1 - o, pf.n[r] - ro), (uint64_t) 32768);
+            const char* src = (const char*) pf.p[r] + ro;
+            for (uint64_t q = 0; q < take; q += 128) asm volatile("prefetch.global.L2 [%0];" ::"l"(src + q));
+            if (take >= 16) last = src + take - 16;
+            o += take;
+        }
+        if (last != nullptr) {
+            const uint4 w = __ldcg((const uint4*) last);
+            acc ^= w.x ^ w.y ^ w.z ^ w.w;
+        }
+        if (!tier_wait(ld_acquire(stop))) break;
+    }
+    if (acc == 0x9e3779b9u) g_l2_ahead_sink = acc;   // keeps the reads (never in practice)
+}
+}  // namespace
+
+void gdn_l2_ahead(const uint32_t* stop, uint32_t stop_value, void* stream, const GdnLazyPf& pf) {
+    if (stop == nullptr || pf.n[0] == 0) return;
+    gdn_l2_ahead_kernel<<<kLazyPfBlocks, 32, 0, (cudaStream_t) stream>>>(stop, stop_value, pf);
+    check("gdn_l2_ahead");
+}
+
 }  // namespace basalt::kernels

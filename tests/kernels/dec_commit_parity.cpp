@@ -943,6 +943,34 @@ bool lazy_tests(cudaStream_t s) {
             if (host(z.g.state, bytes) != ref) { std::printf("  lazy read-ahead form %d: the state differs\n", form); ok = false; }
         }
         CK(cudaStreamDestroy(o));
+        // gdn_l2_ahead, the same read-ahead launched alone: it ends once the word turns, at once with every entry on
+        // CUDA0, and on its own when the combine never marks a wait (form 1: the word stays at the previous ring)
+        CK(cudaStreamCreateWithFlags(&o, cudaStreamNonBlocking));
+        for (int form = 0; form < 4; ++form) {
+            std::vector<unsigned long long> hp(512, form == 2 ? 1ull : 0ull);
+            CK(cudaMemcpy(ptab, hp.data(), 512 * 8, cudaMemcpyHostToDevice));
+            GdnLazyPf pf;
+            pf.p[0] = wbuf; pf.n[0] = WB / 2; pf.p[1] = wbuf + WB / 2; pf.n[1] = WB / 2;
+            pf.ids = ids; pf.n_ids = 80; pf.n_expert = 512; pf.ptab = ptab;
+            const uint32_t ring = 5;
+            const uint32_t w0 = form == 1 ? ring - 1 : form == 3 ? (ring | 0x40000000u) : (ring | 0x80000000u);
+            CK(cudaMemcpy(z.stop, &w0, 4, cudaMemcpyHostToDevice));
+            gdn_l2_ahead(z.stop, ring, s, pf);
+            if (form != 1) {
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+                CK(cudaMemcpyAsync(z.stop, &ring, 4, cudaMemcpyHostToDevice, o));
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            while (cudaStreamQuery(s) == cudaErrorNotReady && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(2))
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            ++cases;
+            if (cudaStreamQuery(s) != cudaSuccess) {
+                std::printf("  l2_ahead form %d: the launch has not ended after 2 s\n", form);
+                std::exit(1);
+            }
+            CK(cudaDeviceSynchronize());
+        }
+        CK(cudaStreamDestroy(o));
         CK(cudaFree(wbuf)); CK(cudaFree(ids)); CK(cudaFree(ptab));
     }
     std::printf("dec_commit lazy (n_keep 1..8, %d cases, launch forms, stop words, epochs, read-ahead): %s; GPU vs CPU max rel diff %.2e\n",
@@ -1004,7 +1032,32 @@ void lazy_bench(cudaStream_t s) {
         }, 20);
         std::printf("bench lazy read-ahead of %.1f MB (L2 cold, the combine waiting): %.1f us (%.0f GB/s incl. launch)\n",
                     WB / 1e6, ra, WB / 1e9 / (ra * 1e-6));
-        CK(cudaFree(wbuf)); CK(cudaFree(ids)); CK(cudaFree(ptab)); CK(cudaFree(flush));
+        const double la = timed([&] {
+            CK(cudaMemsetAsync(flush, 0, (size_t) 256 << 20, s));
+            CK(cudaEventRecord(e0, s));
+            gdn_l2_ahead(z.stop, 5u, s, pf);
+        }, 20);
+        // what lands in L2: a copy reading the buffer right after each read-ahead, against the same copy from L2 cold
+        char* dst = nullptr;
+        CK(cudaMalloc(&dst, WB));
+        auto copy_after = [&](auto&& ahead) {
+            return timed([&] {
+                CK(cudaMemsetAsync(flush, 0, (size_t) 256 << 20, s));
+                ahead();
+                CK(cudaEventRecord(e0, s));
+                CK(cudaMemcpyAsync(dst, wbuf, WB, cudaMemcpyDeviceToDevice, s));
+            }, 20);
+        };
+        const double c_cold = copy_after([] {});
+        const double c_lazy = copy_after([&] { gdn_commit_lazy(lazy_args(z), z.ctl, 0, z.stop, 5u, s, 170, &pf); });
+        const double c_l2a = copy_after([&] { gdn_l2_ahead(z.stop, 5u, s, pf); });
+        const uint32_t before = 4u;   // the combine never marks: the bounded wait
+        CK(cudaMemcpy(z.stop, &before, 4, cudaMemcpyHostToDevice));
+        const double unmarked = timed([&] { gdn_l2_ahead(z.stop, 5u, s, pf); }, 20);
+        std::printf("bench l2_ahead read-ahead of %.1f MB (L2 cold, the combine waiting): %.1f us (%.0f GB/s incl. launch); "
+                    "never marked %.1f us; a copy of the buffer after it %.1f us (after the lazy read-ahead %.1f, cold %.1f)\n",
+                    WB / 1e6, la, WB / 1e9 / (la * 1e-6), unmarked, c_l2a, c_lazy, c_cold);
+        CK(cudaFree(wbuf)); CK(cudaFree(ids)); CK(cudaFree(ptab)); CK(cudaFree(flush)); CK(cudaFree(dst));
     }
 }
 
