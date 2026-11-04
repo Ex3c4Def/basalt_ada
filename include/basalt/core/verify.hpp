@@ -630,6 +630,10 @@ private:
     cudaStream_t lz_s_ = nullptr;
     cudaEvent_t lz_fork_ = nullptr, lz_join_ = nullptr;
     bool lz_pending_ = false;                       ///< a commit whose lazy layers no window has applied yet
+    // Without lz_s_ (below compute capability 9.0): the same read-ahead alone on l2a_s_, forked after each layer's MoE
+    // grid, beside its combine, and joined at the window's end.
+    cudaStream_t l2a_s_ = nullptr;
+    cudaEvent_t l2a_fork_ = nullptr, l2a_join_ = nullptr;
     bool finisher_on() const;                        ///< solo windows start with the finisher
     bool lazy_on() const;                            ///< the GDN layers after the first are committed lazily
     bool commit_begun() const;                       ///< the begin kernel of the last async commit has run

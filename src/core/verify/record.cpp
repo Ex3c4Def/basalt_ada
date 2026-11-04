@@ -42,6 +42,7 @@ bool Verifier::WindowRecorder::run() {
         if (l + 1 < v_.le_ && !pre(l + 1)) return false;
     }
     if (lz_open) cudaStreamWaitEvent(cs, v_.lz_join_, 0);
+    if (l2a_open) cudaStreamWaitEvent(cs, v_.l2a_join_, 0);
     if (v_.le_ < g.n_layers) {   // a layer split's earlier stage: hand the residual on, no head
         float* hout = v_.hand_out_ + (size_t) hrow0 * HB;
         copy_from_mapped(hout, v_.R_, (int64_t) T * HC * N, cs);

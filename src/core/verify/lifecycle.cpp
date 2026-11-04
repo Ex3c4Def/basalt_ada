@@ -77,6 +77,9 @@ Verifier::~Verifier() {
     if (lz_s_) cudaStreamDestroy(lz_s_);
     if (lz_fork_) cudaEventDestroy(lz_fork_);
     if (lz_join_) cudaEventDestroy(lz_join_);
+    if (l2a_s_) cudaStreamDestroy(l2a_s_);
+    if (l2a_fork_) cudaEventDestroy(l2a_fork_);
+    if (l2a_join_) cudaEventDestroy(l2a_join_);
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
     if (sh_hi_) cudaStreamDestroy(sh_hi_);
     if (sh_hi2_) cudaStreamDestroy(sh_hi2_);
@@ -314,7 +317,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     // Below compute capability 9.0 the lazy commit stays off (no lz_s_, so lazy_on() is false): its read-ahead blocks
     // wait on the stop word beside the MoE tail, whose grids fill the card and wait across blocks, and the window
     // deadlocks; its commit alone, or a read-ahead that does not wait, competes with the MoE tail and costs more than it
-    // saves.
+    // saves.  The read-ahead runs alone instead, launched after the MoE grid (l2a_s_).
     bool lazy_dev = true;
     {
         int sms = 0, major = 0;
@@ -323,13 +326,21 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         fin_blocks_ = sms;
         mid_max_t_ = sms < 160 ? basalt::kernels::kMidChainMaxT : 4;
         lazy_dev = major >= 9;
-        if (!lazy_dev) basalt::log::info("basalt verify", "lazy GDN commit off: compute capability %d.x", major);
+        if (!lazy_dev)
+            basalt::log::info("basalt verify", "lazy GDN commit off, L2 read-ahead after the MoE grid: compute capability %d.x",
+                              major);
     }
     if (!basalt::kernels::gdn_commit_lazy_none(commit_ctl_) ||
         (lazy_dev && cudaStreamCreateWithPriority(&lz_s_, cudaStreamNonBlocking, cs_prio) != cudaSuccess) ||
         cudaEventCreateWithFlags(&lz_fork_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&lz_join_, cudaEventDisableTiming) != cudaSuccess) {
         err = "verify: lazy commit stream create failed";
+        return false;
+    }
+    if (!lazy_dev && (cudaStreamCreateWithPriority(&l2a_s_, cudaStreamNonBlocking, cs_prio) != cudaSuccess ||
+                      cudaEventCreateWithFlags(&l2a_fork_, cudaEventDisableTiming) != cudaSuccess ||
+                      cudaEventCreateWithFlags(&l2a_join_, cudaEventDisableTiming) != cudaSuccess)) {
+        err = "verify: L2 read-ahead stream create failed";
         return false;
     }
     *(volatile uint32_t*) h_pend_ = 0;

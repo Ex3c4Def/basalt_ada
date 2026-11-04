@@ -36,8 +36,13 @@ the fallback so the trap is never launched.
 ## How the fallbacks are chosen on the 4090
 - GDN recurrence: `dec_gdnf_mode()` (dec_gdn_rec.cu, now a runtime function) returns 0 below sm_90, so
   `record_gdn.cpp` uses the unfused kernels (gdn_conv_l2_multi, gdn_ab_multi, gdn_step_norm_multi).
-- Dense projections: `dense_tc_mask()`, `dense_tc_supported()`, `dense_tc_pair_supported()` return 0/false below sm_90
-  (dense_tc.cu), so `dense_proj()` (projection.cpp) uses `native_mmvq`.
+- Dense projections: the persistent `dense_tc` kernel (cp.async, int8 `mma.sync`) runs on sm_89; its bulk-copy variants
+  (tile, one-tile, pair) stay off through `tc_bulk_ok()` (dense_tc.cu), and so does `qsa_qproj_half` (qsa_mid.cu).
+- Lazy GDN commit: off below sm_90 (lifecycle.cpp): its read-ahead blocks wait beside the MoE grid and deadlock without
+  PDL. The read-ahead itself (the next layer's projections and FFN read matrices into L2) runs alone instead, launched
+  after each layer's MoE grid beside the combine (`gdn_l2_ahead`, `l2_ahead` in record_moe.cpp); `--exp l2_ahead=0`
+  turns it off. Development A/Bs at 450 W: +0.7% and +1.5% decode (token-weighted), 21 of 24 paired runs faster;
+  greedy output unchanged.
 - Fused HC read and the mid chain: already off unless the device major is 12 (hc_fused.cu `hc_fused_supported`).
 - NVFP4 prefill: `fp4_tensor_cores()` (layout.cpp) is true only for major >= 12. `fp4_pack()`, `fp4_every_layer()` and
   `fp4_l` (experts.hpp) depend on it, so NVFP4 experts take the MMQ path (src/prefill/mmq, mmq_nvfp4) and the MMQ

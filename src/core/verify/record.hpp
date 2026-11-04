@@ -25,6 +25,7 @@ struct Verifier::WindowRecorder {
     bool gdn(int64_t l, const LayerView& v, bool read_q8, bool gs_split);
     bool qsa(int64_t l, const LayerView& v, bool read_q8);
     bool post(int64_t l);
+    void l2_ahead(int64_t l);
     bool head();
     float* Rt(int t) const { return v_.R_ + (size_t) t * HC * N; }
     void stamp(int64_t l, int i) const {
@@ -70,6 +71,7 @@ struct Verifier::WindowRecorder {
     bool lazy = false;
     kernels::GdnCommitLayers lazy_args{};
     bool lz_open = false;   // a lazy launch not joined yet
+    bool l2a_open = false;   // an l2_ahead launch not joined yet
     bool ring_fork = false;   // the group's ring stream is joined in post
     int mid_ord = 0;   // the mid chain's launches so far in this graph
     bool glue_on = false;   // post's gate/up launch plans the group's VRAM share
