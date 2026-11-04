@@ -39,9 +39,9 @@ with its own `mid_yq_` buffer. `--exp mid_ada=2` is its reference in the engine:
 dense_tc's order. Greedy, 400 tokens, conv / struct / prose: mid_ada=1 identical to 2 on all three; mid_ada=0 (z on
 native_mmvq) diverges at tokens 238 and 157 on conv and prose.
 
-The L2 read-ahead is not joined before the kernel. A join there (first cut) made the layer's MoE wait: in an Nsight
-Systems trace the gap from the grouped gate/up kernel to its SwiGLU grew from 3 to 36 us in 95 % of GDN layers, and
-prose lost 3.7 %. Without it the kernel starts right after the hc read in every layer; the read-ahead ends on its own.
+The L2 read-ahead is joined before the kernel, so the kernel has every SM. In Nsight Systems traces the read-ahead ends
+a median 31 us (prose) and 285 us (struct) before the kernel starts and never later, so the join adds no wait; the
+gate/up to SwiGLU gap is 0.06 us with and without it.
 
 basalt-bench A/B, 450 W, 3 rounds x 2 repetitions, modes rotated (development A/B, tok/s):
 

@@ -70,8 +70,8 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
         cudaEventRecord(v_.ev_join_, v_.sh_cs_);
     };
     // compute capability 8.9 (--exp mid_ada=1): the unfused sequence below as one persistent kernel (mid_chain.hpp),
-    // its z projection in dense_tc's order.  It needs every SM: the L2 read-ahead beside the previous combine ends on its
-    // own, and is not joined here (a join before this kernel holds back the layer's later MoE kernels)
+    // its z projection in dense_tc's order.  It needs every SM, so the L2 read-ahead beside the previous combine is
+    // joined first
     if (gdnf == 0 && !v_.batch_rec_ && !v_.prof_on_ && !read_q8 && !ple_open && !lz_open && n <= kMidChainMaxT &&
         v_.mid_yq_ != nullptr) {
         MidChainArgs ma;
@@ -89,6 +89,10 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
         ma.bo = v_.bo_;
         if (mid_chain_supported(ma)) {
             ma.ord = mid_ord++;
+            if (l2a_open) {
+                cudaStreamWaitEvent(cs, v_.l2a_join_, 0);
+                l2a_open = false;
+            }
             mid_chain(ma, cs);
             goto gdn_done;
         }
