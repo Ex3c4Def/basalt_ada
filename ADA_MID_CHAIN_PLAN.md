@@ -43,7 +43,8 @@ The L2 read-ahead is joined before the kernel, so the kernel has every SM. In Ns
 a median 31 us (prose) and 285 us (struct) before the kernel starts and never later, so the join adds no wait; the
 gate/up to SwiGLU gap is 0.06 us with and without it.
 
-basalt-bench A/B, 450 W, 3 rounds x 2 repetitions, modes rotated (development A/B, tok/s):
+basalt-bench A/B, 450 W, 3 rounds x 2 repetitions, modes rotated (development A/B, tok/s; measured while the grouped
+chain still had programmatic edges, see below):
 
 | prompt | mid_ada=0 (today) | mid_ada=2 (reference) | mid_ada=1 (kernel) | 1 vs 2 | 1 vs 0 |
 |---|---|---|---|---|---|
@@ -56,8 +57,10 @@ Acceptance varies between repetitions of one mode (sampling at temperature 0.6),
 (98 % acceptance) is the steady one. Conv is faster on today's path in both A/Bs; whether that is z's numerics
 (acceptance) or the z kernel's speed is open.
 
-Found on the way: every QSA layer, in every mode, has the same 35 to 38 us gap from the grouped gate/up kernel to its
-SwiGLU (3 us after GDN layers), about 0.4 ms per window over 12 QSA layers. Not part of this port.
+Found on the way: `launch_dependent` gave the grouped chain's SwiGLU and down the programmatic attribute although sm_89
+has no griddepcontrol. Each edge waited 3 us, and 25 to 42 us once a fork/join had moved the chain to another of the
+graph's internal streams (every QSA layer, layer 1, and the read-ahead join above). It now launches plain below 9.0:
++3.25 % decode with mid_ada=0 (450 W, development A/B). The mid_ada A/B above is not re-run since.
 
 ## Numerics on integration
 The engine's Ada path runs the z projection on native_mmvq (dense_tc_mask has no bit 2); the mid chain runs it in

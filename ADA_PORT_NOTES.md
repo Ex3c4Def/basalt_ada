@@ -48,7 +48,9 @@ the fallback so the trap is never launched.
   `fp4_l` (experts.hpp) depend on it, so NVFP4 experts take the MMQ path (src/prefill/mmq, mmq_nvfp4) and the MMQ
   buffers are sized for every chunk length. If a buffer overflow or wrong-size error shows up in prefill, look at
   `moe_bufs` / `group_rows_cap` in layout.cpp first.
-- Sampler / qsa_select cluster kernels and PDL launches already check the device major.
+- Sampler / qsa_select cluster kernels check the device major. PDL launches (`launch_pdl`, `launch_dependent`) check
+  `pdl_kernel_ok` and launch plain below 9.0: a programmatic edge without griddepcontrol only adds latency, 25 to 42 us
+  once a fork/join has moved the chain to another of the graph's internal streams.
 - The VRAM TMA expert kernel (`dec_moe_vram` kind 1) is never selected by default.
 
 ## Known gaps (not touched)
