@@ -2,8 +2,10 @@
 #include "record.hpp"
 #include "expert_plan.hpp"
 #include "basalt/core/verify.hpp"
+#include "basalt/core/diag.hpp"
 #include "basalt/kernels/dec_gdn.hpp"
 #include "basalt/kernels/dense_tc.hpp"
+#include "basalt/kernels/mid_chain.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/verify_kernels.hpp"
@@ -67,6 +69,30 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
         dense_proj(2, wg->native_type, wg->native_data, v_.xq_, v_.z_, (int) N, (int) ZV, n, v_.sh_cs_);
         cudaEventRecord(v_.ev_join_, v_.sh_cs_);
     };
+    // compute capability 8.9 (--exp mid_ada=1): the unfused sequence below as one persistent kernel (mid_chain.hpp),
+    // its z projection in dense_tc's order.  It needs every SM: the L2 read-ahead beside the previous combine ends on its
+    // own, and is not joined here (a join before this kernel holds back the layer's later MoE kernels)
+    if (gdnf == 0 && !v_.batch_rec_ && !v_.prof_on_ && !read_q8 && !ple_open && !lz_open && n <= kMidChainMaxT &&
+        v_.mid_yq_ != nullptr) {
+        MidChainArgs ma;
+        ma.T = n;
+        ma.xq = v_.xq_;
+        ma.wq = wqkv->native_data; ma.wz = wg->native_data; ma.wo = wout->native_data;
+        ma.type_q = wqkv->native_type; ma.type_z = wg->native_type; ma.type_o = wout->native_type;
+        DecRecArgs& ra = ma.rec;
+        ra.state = state; ra.qkv = qkv; ra.conv_w = (const float*) wc->data; ra.x = xm;
+        ra.w_alpha = (const uint16_t*) wa->data; ra.w_beta = (const uint16_t*) wb->data;
+        ra.dt = (const float*) wdt->data; ra.ssm_a = (const float*) wsa->data; ra.z = v_.z_;
+        ra.gamma = (const float*) wnm->data; ra.h = hb; ra.gate = gate; ra.beta = beta; ra.y = v_.y_;
+        ra.yq = v_.mid_yq_;
+        ra.C = (int) C; ra.n_embd = (int) N; ra.h_k = (int) HK; ra.h_v = (int) HV; ra.eps = EPS;
+        ma.bo = v_.bo_;
+        if (mid_chain_supported(ma)) {
+            ma.ord = mid_ord++;
+            mid_chain(ma, cs);
+            goto gdn_done;
+        }
+    }
     if (!read_q8) native_quantize_q8_1(xm, v_.xq_, (int) N, n, cs);
     // qkv and z in one dense_tc_pair launch for every window width, then the
     // one-launch recurrence with the gated norm
@@ -163,7 +189,10 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
                  (const float*) wsa->data, gate, beta, (int) N, (int) HV,
                  n, cs);
     stamp(l, 4);
-    dense_proj(2, wg->native_type, wg->native_data, v_.xq_, v_.z_, (int) N, (int) ZV, n, cs);
+    if (exp_flag("mid_ada", 0) == 2)
+        kernels::dense_tc(wg->native_type, wg->native_data, v_.xq_, v_.z_, (int) N, (int) ZV, n, cs);
+    else
+        dense_proj(2, wg->native_type, wg->native_data, v_.xq_, v_.z_, (int) N, (int) ZV, n, cs);
     stamp(l, 5);
     // the recurrence from the untouched state over tokens [0, T); outputs only for this group's
     if (v_.batch_rec_) {   // each segment's recurrence from its own slot's state
