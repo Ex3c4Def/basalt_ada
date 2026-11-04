@@ -397,6 +397,13 @@ __global__ void __launch_bounds__(256) swiglu_q8_1_entries_pdl_kernel(const floa
 
 template<typename... KArgs, typename... Args>
 void launch_dependent(void (*kernel)(KArgs...), dim3 grid, cudaStream_t s, Args... args) {
+#if defined(PDL_LAUNCH)
+    // without griddepcontrol the programmatic edge only adds scheduling latency
+    if (!pdl_kernel_ok((const void*) kernel)) {
+        kernel<<<grid, 256, 0, s>>>(args...);
+        return;
+    }
+#endif
     cudaLaunchAttribute at[1];
     at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     at[0].val.programmaticStreamSerializationAllowed = 1;
