@@ -247,6 +247,7 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_ge
                         src/kernels/cuda/dec_gdn_rec.cu
                         src/kernels/cuda/dense_tc.cu
                         src/kernels/cuda/mid_chain.cu
+                        src/kernels/cuda/mid_chain_ada.cu
                         src/kernels/cuda/qsa_mid.cu
                         src/kernels/cuda/wait_abort.cu
                         src/kernels/cuda/iq_kernels.cu

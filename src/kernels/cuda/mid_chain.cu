@@ -568,7 +568,14 @@ MFn mid_pick(int T, int q, int z, int o, bool st = false) {
 }
 }  // namespace
 
+// the compute capability 8.9 kernel (mid_chain_ada.cu)
+bool mid_ada_device();
+void mid_ada_init();
+bool mid_ada_supported(const MidChainArgs& a);
+void mid_ada(const MidChainArgs& a, void* stream);
+
 void mid_chain_init() {
+    if (mid_ada_device()) { mid_ada_init(); return; }
     MidDev& d = mid_dev();
     if (d.checked) return;
     d.checked = true;
@@ -607,6 +614,7 @@ void mid_chain_init() {
 int mid_chain_ring_slots(int type_q, int type_z, int type_o) { return make_geo(type_q, type_z, type_o, 4).ns; }
 
 bool mid_chain_supported(const MidChainArgs& a) {
+    if (mid_ada_device()) return mid_ada_supported(a);
     const MidDev& d = mid_dev();
     return d.ok && a.ctas >= 0 && a.ctas <= d.ctas && (a.ctas == 0 || a.ctas >= kMidMinCtas) && a.T >= 1 && a.T <= kMidChainMaxT && types_ok(a) &&
            a.xq != nullptr && a.bo != nullptr && a.rec.yq != nullptr && a.rec.qkv != nullptr && a.rec.z != nullptr &&
@@ -616,6 +624,7 @@ bool mid_chain_supported(const MidChainArgs& a) {
 }
 
 void mid_chain(const MidChainArgs& a, void* stream) {
+    if (mid_ada_device()) { mid_ada(a, stream); return; }
     MidDev& d = mid_dev();
     if (!mid_chain_supported(a)) {
         basalt::log::error("basalt", "mid_chain: unsupported arguments or device");
