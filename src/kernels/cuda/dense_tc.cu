@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <type_traits>
 #include "basalt/log.hpp"
 
 namespace basalt::kernels {
@@ -354,16 +355,20 @@ __device__ __forceinline__ void half_sb_terms(float (&acc)[4], const uint8_t* co
 #endif
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-// block blk of nblk; smem: smem_bytes<TYPE, S, MT, KS>() bytes, 128-byte aligned
-template<int TYPE, int S, int MT, int KS>
+struct DtcSyncBlock {
+    __device__ __forceinline__ void operator()() const { __syncthreads(); }
+};
+// block blk of nblk; smem: smem_bytes<TYPE, S, MT, KS>() bytes, 128-byte aligned.  tid: the thread's index in the block
+// of MT * KS * 128 threads, sync: their barrier (a persistent kernel runs several such blocks side by side)
+template<int TYPE, int S, int MT, int KS, class Sync = DtcSyncBlock>
 __device__ __forceinline__ void dense_tc_block(int blk, int nblk, uint8_t* smem, const uint8_t* __restrict__ w,
                                                const uint8_t* __restrict__ x, float* __restrict__ y, int n_in,
-                                               int n_out, int ncols) {
+                                               int n_out, int ncols, int tid_in, Sync sync = {}) {
     constexpr int SB = Fmt<TYPE>::SB, CB = 2 * KS * SB, RS = row_stride(KS * SB), R = 16 * MT, SLOT = R * RS;
     constexpr int NU = RS / 16, NT = MT * KS * 128;
     uint8_t* ring = smem;
     float* red = reinterpret_cast<float*>(smem + S * SLOT);   // [warp][row][column]
-    const int tid = threadIdx.x, wp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+    const int tid = std::is_same<Sync, DtcSyncBlock>::value ? threadIdx.x : tid_in, wp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
     const int mt = (wp >> 2) % MT, ks = wp / (4 * MT), hb = wp & 3, sbi = 2 * ks + (hb >> 1), n = hb & 1;
     const int nchunk = n_in / (512 * KS), nb32 = n_in / 32;
     const size_t row_bytes = (size_t) (n_in / 256) * SB;
@@ -416,7 +421,7 @@ __device__ __forceinline__ void dense_tc_block(int blk, int nblk, uint8_t* smem,
             }
         }
         asm volatile("cp.async.wait_group %0;\n" ::"n"(S - 2) : "memory");
-        __syncthreads();   // unit u is in for every thread; the slot of unit u - 1 is free
+        sync();   // unit u is in for every thread; the slot of unit u - 1 is free
         if (u + S - 1 < nunits) issue(u + S - 1);
         commit();
         const int row0 = tile * R;
@@ -435,7 +440,7 @@ __device__ __forceinline__ void dense_tc_block(int blk, int nblk, uint8_t* smem,
             rw[(g + 8) * kMaxCols + 2 * t + 1] = acc[3];
             acc[0] = acc[1] = acc[2] = acc[3] = 0.0f;
             if (u == nunits - 1) pdl_launch_dependents();
-            __syncthreads();
+            sync();
             const int row = tid / kMaxCols, col = tid % kMaxCols;   // R * kMaxCols threads
             if (tid < R * kMaxCols && col < ncols && row0 + row < n_out) {
                 float v = 0.0f;
@@ -459,7 +464,8 @@ __global__ void __launch_bounds__(MT * KS * 128) dense_tc_kernel(const uint8_t* 
                                                                  int n_in, int n_out, int ncols) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     extern __shared__ __align__(128) uint8_t smem[];
-    dense_tc_block<TYPE, S, MT, KS>((int) blockIdx.x, (int) gridDim.x, smem, w, x, y, n_in, n_out, ncols);
+    dense_tc_block<TYPE, S, MT, KS>((int) blockIdx.x, (int) gridDim.x, smem, w, x, y, n_in, n_out, ncols,
+                                    (int) threadIdx.x);
 #elif defined(__CUDA_ARCH__)
     __trap();
 #endif
