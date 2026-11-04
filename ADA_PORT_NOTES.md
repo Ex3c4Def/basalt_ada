@@ -35,7 +35,10 @@ the fallback so the trap is never launched.
 
 ## How the fallbacks are chosen on the 4090
 - GDN recurrence: `dec_gdnf_mode()` (dec_gdn_rec.cu, now a runtime function) returns 0 below sm_90, so
-  `record_gdn.cpp` uses the unfused kernels (gdn_conv_l2_multi, gdn_ab_multi, gdn_step_norm_multi).
+  `record_gdn.cpp` takes the unfused sequence. On 8.9 it runs as one persistent kernel, `k_mid_ada` (mid_chain_ada.cu),
+  with the unfused kernels' own bodies and z in dense_tc's order, after a join on the L2 read-ahead. `--exp mid_ada=0`
+  runs the separate kernels (gdn_conv_l2_multi, gdn_ab_multi, gdn_step_norm_multi, z on native_mmvq), `=2` the same
+  with z on dense_tc. Development A/B at 450 W: +1.1% decode (token-weighted) over `mid_ada=0`, conv -5.1%.
 - Dense projections: the persistent `dense_tc` kernel (cp.async, int8 `mma.sync`) runs on sm_89; its bulk-copy variants
   (tile, one-tile, pair) stay off through `tc_bulk_ok()` (dense_tc.cu), and so does `qsa_qproj_half` (qsa_mid.cu).
 - Lazy GDN commit: off below sm_90 (lifecycle.cpp): its read-ahead blocks wait beside the MoE grid and deadlock without
@@ -43,7 +46,7 @@ the fallback so the trap is never launched.
   after each layer's MoE grid beside the combine (`gdn_l2_ahead`, `l2_ahead` in record_moe.cpp); `--exp l2_ahead=0`
   turns it off. Development A/Bs at 450 W: +0.7% and +1.5% decode (token-weighted), 21 of 24 paired runs faster;
   greedy output unchanged.
-- Fused HC read and the mid chain: already off unless the device major is 12 (hc_fused.cu `hc_fused_supported`).
+- Fused HC read and the sm_120 mid chain: already off unless the device major is 12 (hc_fused.cu `hc_fused_supported`).
 - NVFP4 prefill: `fp4_tensor_cores()` (layout.cpp) is true only for major >= 12. `fp4_pack()`, `fp4_every_layer()` and
   `fp4_l` (experts.hpp) depend on it, so NVFP4 experts take the MMQ path (src/prefill/mmq, mmq_nvfp4) and the MMQ
   buffers are sized for every chunk length. If a buffer overflow or wrong-size error shows up in prefill, look at

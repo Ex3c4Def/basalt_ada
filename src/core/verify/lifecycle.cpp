@@ -117,7 +117,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     basalt::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
     basalt::kernels::hc_fused_init();
     basalt::kernels::wait_abort_init();
-    basalt::kernels::mid_chain_ada_enable(exp_flag("mid_ada", 0) == 1);
+    basalt::kernels::mid_chain_ada_enable(exp_flag("mid_ada", 1) == 1);
     basalt::kernels::mid_chain_init();
     wt_ = &wt;
     g_ = &g;
