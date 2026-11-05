@@ -2,7 +2,6 @@
 #include "record.hpp"
 #include "expert_plan.hpp"
 #include "basalt/core/verify.hpp"
-#include "basalt/core/diag.hpp"
 #include "basalt/kernels/dec_gdn.hpp"
 #include "basalt/kernels/dense_tc.hpp"
 #include "basalt/kernels/mid_chain.hpp"
@@ -69,9 +68,9 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
         dense_proj(2, wg->native_type, wg->native_data, v_.xq_, v_.z_, (int) N, (int) ZV, n, v_.sh_cs_);
         cudaEventRecord(v_.ev_join_, v_.sh_cs_);
     };
-    // compute capability 8.9 (--exp mid_ada=0 leaves it out): the unfused sequence below as one persistent kernel
-    // (mid_chain.hpp), its z projection in dense_tc's order.  It needs every SM, so the L2 read-ahead beside the
-    // previous combine is joined first
+    // compute capability 8.9 (--exp mid_ada=0 leaves it out, mid_ada=2 takes z on dense_tc): the unfused sequence
+    // below as one persistent kernel with its bits (mid_chain.hpp).  It needs every SM, so the L2 read-ahead beside
+    // the previous combine is joined first
     if (gdnf == 0 && !v_.batch_rec_ && !v_.prof_on_ && !read_q8 && !ple_open && !lz_open && n <= kMidChainMaxT &&
         v_.mid_yq_ != nullptr) {
         MidChainArgs ma;
@@ -193,10 +192,7 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
                  (const float*) wsa->data, gate, beta, (int) N, (int) HV,
                  n, cs);
     stamp(l, 4);
-    if (exp_flag("mid_ada", 1) == 2)
-        kernels::dense_tc(wg->native_type, wg->native_data, v_.xq_, v_.z_, (int) N, (int) ZV, n, cs);
-    else
-        dense_proj(2, wg->native_type, wg->native_data, v_.xq_, v_.z_, (int) N, (int) ZV, n, cs);
+    dense_proj(2, wg->native_type, wg->native_data, v_.xq_, v_.z_, (int) N, (int) ZV, n, cs);
     stamp(l, 5);
     // the recurrence from the untouched state over tokens [0, T); outputs only for this group's
     if (v_.batch_rec_) {   // each segment's recurrence from its own slot's state

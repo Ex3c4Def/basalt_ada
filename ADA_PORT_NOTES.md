@@ -36,9 +36,10 @@ the fallback so the trap is never launched.
 ## How the fallbacks are chosen on the 4090
 - GDN recurrence: `dec_gdnf_mode()` (dec_gdn_rec.cu, now a runtime function) returns 0 below sm_90, so
   `record_gdn.cpp` takes the unfused sequence. On 8.9 it runs as one persistent kernel, `k_mid_ada` (mid_chain_ada.cu),
-  with the unfused kernels' own bodies and z in dense_tc's order, after a join on the L2 read-ahead. `--exp mid_ada=0`
-  runs the separate kernels (gdn_conv_l2_multi, gdn_ab_multi, gdn_step_norm_multi, z on native_mmvq), `=2` the same
-  with z on dense_tc. Development A/B at 450 W: +1.1% decode (token-weighted) over `mid_ada=0`, conv -5.1%.
+  bitwise equal to the separate kernels, after a join on the L2 read-ahead. `--exp mid_ada=0` runs the separate kernels
+  (gdn_conv_l2_multi, gdn_ab_multi, gdn_step_norm_multi, z on native_mmvq), `--exp mid_ada=2` the kernel with z on
+  dense_tc (other bits). Development A/B at 450 W: +2.2% decode (token-weighted) over `mid_ada=0`, faster on conv,
+  struct and prose (ADA_MID_CHAIN_PLAN.md).
 - Dense projections: the persistent `dense_tc` kernel (cp.async, int8 `mma.sync`) runs on sm_89; its bulk-copy variants
   (tile, one-tile, pair) stay off through `tc_bulk_ok()` (dense_tc.cu), and so does `qsa_qproj_half` (qsa_mid.cu).
 - Lazy GDN commit: off below sm_90 (lifecycle.cpp): its read-ahead blocks wait beside the MoE grid and deadlock without
