@@ -1,12 +1,14 @@
 // src/kernels/cuda/mid_chain_ada.cu - the mid chain on compute capability 8.9 (see include/basalt/kernels/mid_chain.hpp).
 //
 // One persistent kernel, one CTA of four 128-thread groups per SM, runs the unfused sequence of a GDN layer's middle on
-// such a card (native_quantize_q8_1 of the read's rows, dense_tc qkv and z, gdn_ab_multi, gdn_conv_l2_multi,
+// such a card (native_quantize_q8_1 of the read's rows, dense_tc qkv, native_mmvq z, gdn_ab_multi, gdn_conv_l2_multi,
 // gdn_step_norm_multi, native_quantize_q8_1 of its output, dense_tc out) through those kernels' own bodies
-// (dense_tc_block, gdn_unfused.cuh), so every output has their bits.  The phases hand over through grid barriers in
-// global memory; a wait past its bound sets the abort word and falls through (wait_abort.hpp).  The kernel needs every
-// CTA resident, and the output's q8_1 rows (rec.yq) apart from the read's (xq).  Its own translation unit, built
-// without fast math like dense_tc.cu and verify_kernels.cu.
+// (dense_tc_block, gdn_unfused.cuh) or their arithmetic (the q8_1 blocks, z's rows), so every output has their bits.
+// With z_dtc, z runs through dense_tc_block after qkv: the bits of that sequence with z on dense_tc.
+// The phases hand over through grid barriers in global memory; a wait past its bound sets the abort word and falls
+// through (wait_abort.hpp).  The kernel needs every CTA resident, and the output's q8_1 rows (rec.yq) apart from the
+// read's (xq).  Its own translation unit, built without fast math like dense_tc.cu and verify_kernels.cu; the parts
+// from native_mmvq.cu (built with fast math) use its flush-to-zero operations explicitly.
 #define FZ_DEV_ONLY
 #include "dense_tc.cu"
 #include "gdn_unfused.cuh"
@@ -42,6 +44,7 @@ struct AdaArgs {
     unsigned* bar;                   // [0] arrivals, [1] generation
     unsigned long long* word;        // the abort word
     int pair_only;
+    int z_dtc;                       // z through dense_tc's blocks after qkv
 };
 
 struct BarGroup {   // the barrier of a 128-thread group (ids 1..4; __syncthreads is 0)
@@ -64,6 +67,12 @@ __device__ __forceinline__ float abs_ftz(float a) { float r; asm("abs.ftz.f32 %0
 __device__ __forceinline__ float max_ftz(float a, float b) { float r; asm("max.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
 __device__ __forceinline__ float add_ftz(float a, float b) { float r; asm("add.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
 __device__ __forceinline__ float div_ftz(float a, float b) { float r; asm("div.approx.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
+__device__ __forceinline__ float mul_ftz(float a, float b) { float r; asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
+__device__ __forceinline__ float fma_ftz(float a, float b, float c) {
+    float r;
+    asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(a), "f"(b), "f"(c));
+    return r;
+}
 
 // the q8_1 block of 32 values (one warp): native_quantize_q8_1_kernel's
 __device__ __forceinline__ void q81_block(const float* src, uint8_t* dst, int lane) {
@@ -81,6 +90,124 @@ __device__ __forceinline__ void q81_block(const float* src, uint8_t* dst, int la
     }
     dst[4 + lane] = (uint8_t) q;
     if (lane == 0) *reinterpret_cast<half2*>(dst) = q8_1_ds(d, sum);
+}
+
+// ======== z through native_mmvq's per-row arithmetic (its one-column kernels and its exact multi-column layout give
+// every (row, column) the same bits).  The activations are written earlier in this launch and read only after a grid
+// barrier, so cached loads see them.
+__device__ __forceinline__ int ld_b2(const uint8_t* p, int i32) {   // native_mmvq.cu's load_int_b2
+    const uint16_t* x = reinterpret_cast<const uint16_t*>(p);
+    return (int) ((unsigned) x[2 * i32] | ((unsigned) x[2 * i32 + 1] << 16));
+}
+template <int TYPE> struct ZqFmt;
+template <> struct ZqFmt<8> {   // Q8_0: 34-byte blocks of 32 values, four threads a block, 32 blocks an iteration
+    static constexpr int DIV = 32, TPB = 4, BPI = 32, KBY = 1, BB = 34;
+    struct W { int v0, v1; float d; };
+    struct X { int u0, u1; float d; };
+    __device__ static int kqs(int t) { return 2 * (t % 4); }
+    __device__ static W load(const uint8_t* b, int q) {
+        return W{ld_b2(b + 2, q), ld_b2(b + 2, q + 1), __half2float(*reinterpret_cast<const __half*>(b))};
+    }
+    __device__ static X xload(const uint8_t* xb, int q, const W&) {
+        const int* u = reinterpret_cast<const int*>(xb + 4);
+        return X{__ldca(u + q), __ldca(u + q + 1), __low2float(__ldca(reinterpret_cast<const __half2*>(xb)))};
+    }
+    __device__ static float apply(const W& r, const X& x, float acc) {   // small_q8_dot, accumulated
+        return fma_ftz(mul_ftz(r.d, x.d), (float) __dp4a(r.v1, x.u1, __dp4a(r.v0, x.u0, 0)), acc);
+    }
+};
+template <> struct ZqFmt<14> {   // Q6_K: 210-byte blocks of 256 values, a warp a block, four blocks an iteration
+    static constexpr int DIV = 256, TPB = 32, BPI = 4, KBY = 8, BB = 210;
+    struct W { int vl, vh, sc0, sc1, bq8; float d; };
+    struct X { int u[2]; float d8[2]; };
+    __device__ static int kqs(int t) { return t % 32; }
+    __device__ static W load(const uint8_t* b, int q) {
+        W r;
+        r.bq8 = 4 * (q / 16) + (q % 16) / 8;
+        const int8_t* sc = reinterpret_cast<const int8_t*>(b + 192) + 8 * (q / 16) + (q % 16) / 4;
+        r.vl = ld_b2(b, q);
+        r.vh = ld_b2(b + 128, 8 * (q / 16) + q % 8) >> (2 * ((q % 16) / 8));
+        r.sc0 = sc[0];
+        r.sc1 = sc[4];
+        r.d = __half2float(*reinterpret_cast<const __half*>(b + 208));
+        return r;
+    }
+    __device__ static X xload(const uint8_t* xb, int q, const W& r) {   // r.bq8 depends only on q
+        X x;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const uint8_t* xi = xb + (size_t) (r.bq8 + 2 * i) * kQ81;
+            x.u[i] = __ldca(reinterpret_cast<const int*>(xi + 4) + q % 8);
+            x.d8[i] = __low2float(__ldca(reinterpret_cast<const __half2*>(xi)));
+        }
+        return x;
+    }
+    __device__ static float apply(const W& r, const X& x, float acc) {   // q6_q8_dot_impl, accumulated
+        float sumf = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int vi = __vsubss4(((r.vl >> (4 * i)) & 0x0f0f0f0f) | (((r.vh >> (4 * i)) << 4) & 0x30303030), 0x20202020);
+            sumf = fma_ftz(x.d8[i], (float) (__dp4a(vi, x.u[i], 0) * (i == 0 ? r.sc0 : r.sc1)), sumf);
+        }
+        return fma_ftz(r.d, sumf, acc);
+    }
+};
+constexpr int kZqIn = 32 * 8 * kAbNJ;   // the row width (n_embd)
+
+// row pairs k, k + kstep, ... (rows 2k and 2k + 1) of y[NC][n_out], one warp a pair: lane l does the work of thread l
+// of each of the four warps of a native_mmvq block in turn (the same blocks in the same order), the activation loads
+// shared by the two rows, adds their sums in that block's order, then its butterfly.  No shared memory and no barrier.
+template <int TYPE, int NC>
+__device__ __forceinline__ void zq_rows(int k, int kstep, const uint8_t* __restrict__ w, const uint8_t* x, float* y,
+                                        int n_out, int lane) {
+    using F = ZqFmt<TYPE>;
+    constexpr int bpr = kZqIn / F::DIV, xs = kZqIn / 32, NIT = (bpr + F::BPI - 1) / F::BPI;
+    for (; 2 * k < n_out; k += kstep) {
+        const int r0 = 2 * k;
+        const bool two = r0 + 1 < n_out;
+        const uint8_t* wr0 = w + (size_t) r0 * bpr * F::BB;
+        const uint8_t* wr1 = wr0 + (two ? (size_t) bpr * F::BB : 0);
+        float v0[NC], v1[NC];
+#pragma unroll
+        for (int vw = 0; vw < 4; ++vw) {
+            const int t = 32 * vw + lane, q = F::kqs(t);
+            float a0[NC], a1[NC];
+#pragma unroll
+            for (int j = 0; j < NC; ++j) a0[j] = a1[j] = 0.0f;
+#pragma unroll
+            for (int it = 0; it < NIT; ++it) {
+                const int kbx = t / F::TPB + it * F::BPI;
+                if (kbx < bpr) {
+                    const typename F::W w0 = F::load(wr0 + (size_t) kbx * F::BB, q);
+                    const typename F::W w1 = F::load(wr1 + (size_t) kbx * F::BB, q);
+#pragma unroll
+                    for (int j = 0; j < NC; ++j) {
+                        const typename F::X xv = F::xload(x + ((size_t) j * xs + (size_t) kbx * F::KBY) * kQ81, q, w0);
+                        a0[j] = F::apply(w0, xv, a0[j]);
+                        a1[j] = F::apply(w1, xv, a1[j]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < NC; ++j) {
+                v0[j] = vw == 0 ? a0[j] : add_ftz(v0[j], a0[j]);
+                v1[j] = vw == 0 ? a1[j] : add_ftz(v1[j], a1[j]);
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < NC; ++j) {
+            float s0 = v0[j], s1 = v1[j];
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                s0 = add_ftz(s0, __shfl_xor_sync(0xffffffffu, s0, o, 32));
+                s1 = add_ftz(s1, __shfl_xor_sync(0xffffffffu, s1, o, 32));
+            }
+            if (lane == 0) {
+                y[(size_t) j * n_out + r0] = s0;
+                if (two) y[(size_t) j * n_out + r0 + 1] = s1;
+            }
+        }
+    }
 }
 
 // every CTA's writes before it are visible to every CTA after it
@@ -113,8 +240,8 @@ __global__ void __launch_bounds__(kAdaThreads, 1) k_mid_ada(const __grid_constan
     namespace gu = gdn_unfused;
     extern __shared__ __align__(128) uint8_t sm_ada[];
     __shared__ float conv_part[4][gu::S / 32];
-    constexpr int GS = dtc_smem<TQ>() > dtc_smem<TZ>() ? (dtc_smem<TQ>() > dtc_smem<TO>() ? dtc_smem<TQ>() : dtc_smem<TO>())
-                                                       : (dtc_smem<TZ>() > dtc_smem<TO>() ? dtc_smem<TZ>() : dtc_smem<TO>());
+    constexpr int GS0 = dtc_smem<TQ>() > dtc_smem<TZ>() ? dtc_smem<TQ>() : dtc_smem<TZ>();
+    constexpr int GS = GS0 > dtc_smem<TO>() ? GS0 : dtc_smem<TO>();
     const int tid = threadIdx.x, b = blockIdx.x, G = gridDim.x, grp = tid >> 7, gt = tid & 127;
     const int T = p.T;
     const DecRecArgs& a = p.rec;
@@ -128,16 +255,31 @@ __global__ void __launch_bounds__(kAdaThreads, 1) k_mid_ada(const __grid_constan
         for (int k = (tid >> 5) * G + b; k < nblk; k += G * 16) q81_block(p.x + (size_t) k * 32, p.xq + (size_t) k * kQ81, lane);
     }
     grid_sync(p.bar, p.word, __LINE__);
-    // ======== qkv and z (dense_tc's persistent blocks, kAdaDtc per CTA); alpha/beta on the fourth group
+    // ======== qkv (dense_tc's persistent blocks, kAdaDtc per CTA), alpha/beta on the fourth group; then z in
+    // native_mmvq's arithmetic, row pairs dealt over every warp (z_dtc: z in the same blocks after qkv)
     if (grp < kAdaDtc) {
-        const int vb = grp * G + b, nv = G * kAdaDtc;
-        dense_tc_block<TQ, 3, 1, 1>(vb, nv, gsm, p.wq, p.xq, p.qkv, a.n_embd, a.C, T, gt, gsync);
-        dense_tc_block<TZ, 3, 1, 1>(vb, nv, gsm, p.wz, p.xq, p.z, a.n_embd, ZV, T, gt, gsync);
+        dense_tc_block<TQ, 3, 1, 1>(grp * G + b, G * kAdaDtc, gsm, p.wq, p.xq, p.qkv, a.n_embd, a.C, T, gt, gsync);
+        if (p.z_dtc != 0)
+            dense_tc_block<TZ, 3, 1, 1>(grp * G + b, G * kAdaDtc, gsm, p.wz, p.xq, p.z, a.n_embd, ZV, T, gt, gsync);
     } else {
         const int nab = (2 * a.h_v + 1) / 2;
         for (int k = (gt >> 6) * G + b; k < nab; k += 2 * G)
             gu::ab_rows_unrolled<kVerifyMaxT, kAbNJ>(k, gt & 63, a.x, a.w_alpha, a.w_beta, a.dt, a.ssm_a, a.gate, a.beta,
                                                      a.n_embd, a.h_v, T);
+    }
+    if (p.z_dtc == 0) {
+        // dealt from the last warp down: the second pass falls on the fourth group (alpha/beta ends early) and the third
+        const int k0 = (kAdaThreads / 32 - 1 - (tid >> 5)) * G + b, ks = (kAdaThreads / 32) * G, lane = tid & 31;
+        switch (T) {
+            case 1: zq_rows<TZ, 1>(k0, ks, p.wz, p.xq, p.z, ZV, lane); break;
+            case 2: zq_rows<TZ, 2>(k0, ks, p.wz, p.xq, p.z, ZV, lane); break;
+            case 3: zq_rows<TZ, 3>(k0, ks, p.wz, p.xq, p.z, ZV, lane); break;
+            case 4: zq_rows<TZ, 4>(k0, ks, p.wz, p.xq, p.z, ZV, lane); break;
+            case 5: zq_rows<TZ, 5>(k0, ks, p.wz, p.xq, p.z, ZV, lane); break;
+            case 6: zq_rows<TZ, 6>(k0, ks, p.wz, p.xq, p.z, ZV, lane); break;
+            case 7: zq_rows<TZ, 7>(k0, ks, p.wz, p.xq, p.z, ZV, lane); break;
+            default: zq_rows<TZ, 8>(k0, ks, p.wz, p.xq, p.z, ZV, lane); break;
+        }
     }
     grid_sync(p.bar, p.word, __LINE__);
     if (p.pair_only != 0) return;
@@ -186,6 +328,7 @@ struct AdaDev {
 };
 AdaDev g_ada[16];
 bool g_ada_on = false;
+bool g_ada_z_dtc = false;
 AdaDev& ada_dev() {
     int dev = 0;
     cudaGetDevice(&dev);
@@ -204,7 +347,10 @@ AdaDev& ada_dev() {
 
 }  // namespace
 
-void mid_chain_ada_enable(bool on) { g_ada_on = on; }
+void mid_chain_ada_enable(bool on, bool z_dense_tc) {
+    g_ada_on = on;
+    g_ada_z_dtc = z_dense_tc;
+}
 
 bool mid_ada_device() { return g_ada_on && ada_dev().ada; }
 
@@ -279,6 +425,7 @@ void mid_ada(const MidChainArgs& a, void* stream) {
     p.bar = d.bar;
     p.word = wait_abort_device_word();
     p.pair_only = a.pair_only ? 1 : 0;
+    p.z_dtc = g_ada_z_dtc ? 1 : 0;
     // the first launch of a graph clears the barrier (a launch that gave up a wait leaves it mid-count)
     if (a.ord == 0) cudaMemsetAsync(d.bar, 0, 8, (cudaStream_t) stream);
     const int g = a.ctas > 0 ? a.ctas : d.ctas;

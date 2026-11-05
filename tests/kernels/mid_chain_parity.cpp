@@ -127,13 +127,14 @@ struct Bufs {
     int32_t* ids;
 };
 
-// Compute capability 8.9: the mid chain's kernel there against the unfused sequence it runs (native_quantize_q8_1,
-// dense_tc qkv and z, gdn_conv_l2_multi, gdn_ab_multi, gdn_step_norm_multi, native_quantize_q8_1, dense_tc out), bit
-// for bit on every output, with real geometry, random inputs, the all-Q8_0 and all-Q6_K triples, the device's grid and
-// smaller ones; then the time per layer in a graph of 48 layers (cold: 8 distinct layers in turn; hot: one) next to that
-// sequence, to the engine's (its z projection on native_mmvq), and the pair phase next to its four kernels.
+// Compute capability 8.9: the mid chain's kernel there against the engine's unfused sequence it runs
+// (native_quantize_q8_1, dense_tc qkv, native_mmvq z, gdn_conv_l2_multi, gdn_ab_multi, gdn_step_norm_multi,
+// native_quantize_q8_1, dense_tc out), bit for bit on every output, with real geometry, random inputs, the all-Q8_0 and
+// all-Q6_K triples, the device's grid and smaller ones, and its z_dense_tc form against that sequence with z on
+// dense_tc; then the time per layer in a graph of 48 layers (cold: 8 distinct layers in turn; hot: one) next to the
+// engine's sequence, and the pair phase next to its four kernels.
 int ada_main(int iters) {
-    K::mid_chain_ada_enable(true);
+    K::mid_chain_ada_enable(true, false);
     K::mid_chain_init();
     std::mt19937 rng(23);
     auto zf = [&](size_t n) { return upload(std::vector<float>(n)); };
@@ -165,15 +166,15 @@ int ada_main(int iters) {
         a.C = C; a.n_embd = N; a.h_k = HK; a.h_v = HV; a.eps = 1e-6f;
         return w;
     };
-    // the unfused sequence (z_mmvq: the engine's z projection); pair: its first four kernels
-    auto seq = [&](const AL& w, int T, bool z_mmvq, bool pair, cudaStream_t s) {
+    // the unfused sequence; pair: its first four kernels; zd: z on dense_tc
+    auto seq = [&](const AL& w, int T, bool pair, bool zd, cudaStream_t s) {
         const K::DecRecArgs& a = w.rec;
         K::native_quantize_q8_1(x, xq, N, T, s);
         K::dense_tc(w.t, w.wq, xq, qkv, N, C, T, s);
         if (!pair) K::gdn_conv_l2_multi(a.state + (size_t) S * HV * S, qkv, a.conv_w, hh, C, 2 * HK, a.eps, T, s, 0);
         K::gdn_ab_multi(x, a.w_alpha, a.w_beta, a.dt, a.ssm_a, gate, beta, N, HV, T, s);
-        if (z_mmvq) K::native_mmvq(w.t, w.wz, xq, z, N, ZV, T, s);
-        else K::dense_tc(w.t, w.wz, xq, z, N, ZV, T, s);
+        if (zd) K::dense_tc(w.t, w.wz, xq, z, N, ZV, T, s);
+        else K::native_mmvq(w.t, w.wz, xq, z, N, ZV, T, s);
         if (pair) return;
         K::gdn_step_norm_multi(const_cast<float*>(a.state), hh, C, gate, beta, z, a.gamma, a.eps, y, HK, HV, T, nullptr, s, 0);
         K::native_quantize_q8_1(y, yq, ZV, T, s);
@@ -217,13 +218,14 @@ int ada_main(int iters) {
         m.rec.yq = xq;
         if (K::mid_chain_supported(m)) { std::printf("sm_89: yq in xq accepted\n"); ++bad; }
     }
-    for (const int gr : {0, 64, 20}) for (const AL& w : layers) {
+    for (const bool zd : {false, true}) for (const int gr : {0, 64, 20}) for (const AL& w : layers) {
+        K::mid_chain_ada_enable(true, zd);
         grid = gr;
         if (!K::mid_chain_supported(margs(w, 1))) { std::printf("sm_89 grid %d types %d: not supported\n", gr, w.t); ++bad; continue; }
         size_t tot = 0;
         std::vector<size_t> perk(9, 0);
         for (int T = 1; T <= TM; ++T) {
-            reset(); seq(w, T, false, false, s); CK(cudaStreamSynchronize(s));
+            reset(); seq(w, T, false, zd, s); CK(cudaStreamSynchronize(s));
             const auto ref = snap(T);
             for (int it = 0; it < iters; ++it) {
                 reset(); mid(w, T, false, 0, s); CK(cudaStreamSynchronize(s));
@@ -232,11 +234,13 @@ int ada_main(int iters) {
                     for (size_t j = 0; j < ref[k].size(); ++j) { const size_t d = ref[k][j] != g[k][j]; tot += d; perk[k] += d; }
             }
         }
-        std::printf("sm_89 grid %3d types %2d/%2d/%2d: T1-T%d x%d vs the unfused sequence %zu differing bytes\n", gr, w.t, w.t, w.t, TM, iters, tot);
+        std::printf("sm_89 grid %3d types %2d/%2d/%2d z on %s: T1-T%d x%d vs the unfused sequence %zu differing bytes\n", gr,
+                    w.t, w.t, w.t, zd ? "dense_tc   " : "native_mmvq", TM, iters, tot);
         if (tot) { std::printf("  differing bytes by output:"); for (size_t k = 0; k < perk.size(); ++k) std::printf(" %s %zu", names[k], perk[k]); std::printf("\n"); }
         bad += (int) tot;
     }
     grid = 0;
+    K::mid_chain_ada_enable(true, false);
     if (K::wait_abort_code() != 0) { std::printf("sm_89: abort word %s\n", K::wait_abort_text(K::wait_abort_code()).c_str()); ++bad; }
 
     // time per layer in a graph of 48 layers
@@ -248,17 +252,17 @@ int ada_main(int iters) {
         const AL& hot = tt == 8 ? layers[0] : layers[1];
         const double bytes = ((double) NQ * 10 + (double) NZ * 10 + 2560.0 * (NO_IN / 256)) * sb_bytes(tt);
         for (const int T : {1, 2, 4, 8}) for (int cold_run = 1; cold_run >= 0; --cold_run) {
-            enum { kEngine, kSeq, kMid, kSeqPair, kMidPair, kModes };
+            enum { kEngine, kMid, kMidZd, kSeqPair, kMidPair, kModes };
             double us[kModes] = {};
             for (int m = 0; m < kModes; ++m) {
                 reset();
+                K::mid_chain_ada_enable(true, m == kMidZd);
                 cudaGraph_t g; cudaGraphExec_t ge;
                 CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal));
                 for (int i = 0; i < 48; ++i) {
                     const AL& w = cold_run ? cold[(size_t) i % cold.size()] : hot;
-                    if (m == kEngine) seq(w, T, true, false, s);
-                    else if (m == kSeq) seq(w, T, false, false, s);
-                    else if (m == kSeqPair) seq(w, T, false, true, s);
+                    if (m == kEngine) seq(w, T, false, false, s);
+                    else if (m == kSeqPair) seq(w, T, true, false, s);
                     else mid(w, T, m == kMidPair, i, s);
                 }
                 CK(cudaStreamEndCapture(s, &g));
@@ -275,14 +279,16 @@ int ada_main(int iters) {
                 us[m] = 1e3 * ms / reps / 48;
                 CK(cudaGraphExecDestroy(ge)); CK(cudaGraphDestroy(g));
             }
-            std::printf("sm_89 %s T=%d %s (us per layer, graph of 48): engine sequence %.2f, its dense_tc form %.2f, mid_chain %.2f "
-                        "(%.1f%% of the engine's, %.0f GB/s of %.1f MB); pair: 4 kernels %.2f, mid_chain %.2f (%.1f%%)\n",
-                        tt == 8 ? "Q8_0" : "Q6_K", T, cold_run ? "cold" : "hot ", us[kEngine], us[kSeq], us[kMid],
-                        100.0 * us[kMid] / us[kEngine], bytes / us[kMid] / 1e3, bytes / 1e6, us[kSeqPair], us[kMidPair],
-                        100.0 * us[kMidPair] / us[kSeqPair]);
+            std::printf("sm_89 %s T=%d %s (us per layer, graph of 48): engine sequence %.2f, mid_chain %.2f "
+                        "(%.1f%% of the engine's, %.0f GB/s of %.1f MB), z on dense_tc %.2f (%.1f%%); pair: 4 kernels %.2f, "
+                        "mid_chain %.2f (%.1f%%)\n",
+                        tt == 8 ? "Q8_0" : "Q6_K", T, cold_run ? "cold" : "hot ", us[kEngine], us[kMid],
+                        100.0 * us[kMid] / us[kEngine], bytes / us[kMid] / 1e3, bytes / 1e6, us[kMidZd],
+                        100.0 * us[kMidZd] / us[kEngine], us[kSeqPair], us[kMidPair], 100.0 * us[kMidPair] / us[kSeqPair]);
         }
     }
     if (K::wait_abort_code() != 0) { std::printf("sm_89: abort word %s\n", K::wait_abort_text(K::wait_abort_code()).c_str()); ++bad; }
+    K::mid_chain_ada_enable(true, false);
     std::printf(bad == 0 ? "mid_chain_parity (sm_89): bitwise\n" : "mid_chain_parity (sm_89): %d differing\n", bad);
     return bad != 0;
 }

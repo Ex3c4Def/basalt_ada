@@ -34,8 +34,9 @@ constexpr int kMidStampCtas = 170, kMidStampPts = 24;
 /// Compute capability 8.9 takes the mid chain's own kernel (mid_chain_ada.cu) once enabled, before mid_chain_init:
 /// one launch of the unfused sequence of the layer's middle, bitwise.  Its input is the read's fp32 rows (rec.x), which
 /// it quantizes into xq; it writes rec.y, and rec.yq must lie apart from xq.  Only the all-Q8_0 and all-Q6_K
-/// projection triples.
-void mid_chain_ada_enable(bool on);
+/// projection triples.  z_dense_tc: z through dense_tc's blocks instead of native_mmvq's arithmetic (the bits of the
+/// sequence with z on dense_tc).
+void mid_chain_ada_enable(bool on, bool z_dense_tc);
 /// Allocate the kernel's scratch on the current device (outside a stream capture, once).
 void mid_chain_init();
 /// The current device and these arguments run the kernel (device, row count, projection types, alignment).
