@@ -47,7 +47,8 @@ add_library(model_qwen4exp_kernels STATIC
   src/models/qwen4exp/kernels/qsa_mid.cu
   src/models/qwen4exp/kernels/hc_fused.cu
   src/models/qwen4exp/kernels/hc8_gr.cu
-  src/models/qwen4exp/kernels/hc_read_ada.cu)
+  src/models/qwen4exp/kernels/hc_read_ada.cu
+  src/models/qwen4exp/kernels/hc_fused_ada.cu)
 target_link_libraries(model_qwen4exp_kernels PUBLIC kernels)
 
 # The composed layer: layer and session, the verify windows, the MTP drafter, the conversation state.

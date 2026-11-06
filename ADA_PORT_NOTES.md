@@ -80,6 +80,18 @@ the fallback so the trap is never launched.
 - DeepSeek-V4.1 on 8.9: its code has no architecture guards, and it uses no clusters, bulk copies, griddepcontrol or FP4
   tensor cores; DSpark decodes MXFP4 in software. Its `ds41_*` parity tests (`-DBUILD_TESTING=ON`) pass on a 4090 at 450 W,
   the peer test only with one card. No pack has been run, so end-to-end output, quality and speed are unmeasured.
+- Draft reads: on 8.9 the draft graphs' hyper-connection reads, their router and q8_1 rows run as one kernel,
+  `hc_fused_ada` (hc_fused_ada.cu), where `hc_fused` does not run. Verify stays on `k_hc_ada`, and `--exp hc_fused_ada=0`
+  keeps the separate kernels. A one-row read now takes fused_gr_read_multi's bits instead of gr_read's, which only the
+  drafts see: greedy and sampled output with swaps off, and the gate's rows at equal slots, are identical.
+  `hc_fused_ada_parity`: 0 differing cases at T 1..8, 0 of 208 stress reads, 0 stuck with 100 SMs held. Microbench at
+  450 W, T = 1, hot / cold: read 24.4 / 32.7 -> 12.5 / 26.3 us; with the router 38.1 / 44.2 -> 17.0 / 33.4 us. The same
+  binary on against off at 450 W, development only: struct +0.15 % (10 pairs), conv +0.7 % and prose +1.8 % pooled over 8
+  seeds; on identical text conv +0.5 %, prose about +1.3 %. The traces suggested about 1.4 % on struct; the GDN commit
+  running beside the draft may be why it does not show. Struct runs near 199 tok/s were seen with it, but in the same-binary
+  A/B the worst dip (203) was with it off.
+- Measuring conv and prose: their text path moves them more than most changes do, so use several seeds. Seed 7 alone
+  showed this kernel at +4.4 % on conv.
 - NVFP4 prefill: `fp4_tensor_cores()` (layout.cpp) is true only for major >= 12. `fp4_pack()`, `fp4_every_layer()` and
   `fp4_l` (experts.hpp) depend on it, so NVFP4 experts take the MMQ path (src/prefill/mmq, mmq_nvfp4) and the MMQ
   buffers are sized for every chunk length. If a buffer overflow or wrong-size error shows up in prefill, look at

@@ -1,3 +1,4 @@
+#include "basalt/models/qwen4exp/kernels/hc_fused_ada.hpp"
 #include "common.hpp"
 
 namespace basalt::core {
@@ -256,6 +257,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
         return false;
     }
     basalt::kernels::hc_fused_init();
+    basalt::kernels::hc_fused_ada_init();
     if (cudaStreamCreateWithPriority(&cs3_, cudaStreamNonBlocking, prio) != cudaSuccess ||
         cudaEventCreateWithFlags(&ev_pf_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&ev_pfj_, cudaEventDisableTiming) != cudaSuccess) {

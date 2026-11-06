@@ -1,4 +1,6 @@
 #include "common.hpp"
+#include "basalt/core/diag.hpp"
+#include "basalt/models/qwen4exp/kernels/hc_fused_ada.hpp"
 #include "basalt/models/qwen4exp/kernels/q80_vhead.hpp"
 
 namespace basalt::core {
@@ -13,9 +15,18 @@ namespace {
 constexpr bool dec_draft_par() { return true; }
 // Every hyper-connection read of those graphs (and the MLP read's router) as the one-kernel read, whose bits are
 // fused_gr_read_multi's.
-bool dec_draft_hcf() {
-    static const bool on = basalt::kernels::hc_fused_supported();
+bool dec_draft_ada() {   // `--exp hc_fused_ada=0` keeps the three-kernel reads on 8.9
+    static const bool on = !basalt::kernels::hc_fused_supported() && basalt::kernels::hc_fused_ada_supported() &&
+                           basalt::core::exp_flag("hc_fused_ada", 1) != 0;
     return on;
+}
+bool dec_draft_hcf() {
+    static const bool on = basalt::kernels::hc_fused_supported() || dec_draft_ada();
+    return on;
+}
+void draft_hc_read(const basalt::kernels::HcFusedArgs& a, void* stream) {
+    if (dec_draft_ada()) basalt::kernels::hc_fused_ada_read(a, stream);
+    else basalt::kernels::hc_fused_read(a, stream);
 }
 
 // The one-kernel hyper-connection read of the rows fa[0..T) (rows at the layer's fixed strides)
@@ -130,7 +141,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                     HcFusedArgs h = hcf_args(fa, T, xn_);
                     if (hc_fused_q8_rows_ok()) { h.xq = xq_; q8_done = true; }   // mixed's q8_1 rows from the read
                     h.next_early = pdl_ok && q8_done;   // the query projection's blocks start with the read
-                    hc_fused_read(h, cs);
+                    draft_hc_read(h, cs);
                 } else if (T == 1)   // one row: the per-row read (its own rounding)
                     gr_read(R_, fa[0].w_norm, fa[0].w_down, fa[0].w_up, fa[0].w_inject, EPS, gs, ss.block.gr, mixed_, inj_,
                             cs);
@@ -236,7 +247,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                     h.w_router = bf16("mlp.gate.weight"); h.logits = logits_; h.ids = ids_; h.weights = w_;
                     routed = true;
                 }
-                hc_fused_read(h, cs);
+                draft_hc_read(h, cs);
             } else if (T == 1) {   // one row: the write, then the per-row read (its own rounding)
                 gr_write(R_, bo_, inj_, gs, R_, cs);
                 gr_read(R_, fa[0].w_norm, fa[0].w_down, fa[0].w_up, fa[0].w_inject, EPS, gs, ss.block.gr, mixed_, inj2_, cs);
@@ -306,7 +317,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             HcFusedArgs h = hcf_args(fa, 1, xn_);
             if (hc_fused_q8_rows_ok()) { h.xq = xq_; mixer_q8 = true; }
             h.next_early = head_pdl;   // the head's blocks start with the read
-            hc_fused_read(h, cs);
+            draft_hc_read(h, cs);
             pscope_off();
         } else {
             for (int t = 0; t < T; ++t)
