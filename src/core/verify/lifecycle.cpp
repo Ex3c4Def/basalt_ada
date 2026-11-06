@@ -12,6 +12,7 @@
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/fused_gr.hpp"
 #include "basalt/kernels/mid_chain.hpp"
+#include "basalt/kernels/hc_read_ada.hpp"
 #include "basalt/kernels/hc_fused.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/pdl.hpp"
@@ -120,6 +121,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     const int mid_ada = exp_flag("mid_ada", 1);   // 0 the separate kernels, 2 the mid chain with z on dense_tc
     basalt::kernels::mid_chain_ada_enable(mid_ada == 1 || mid_ada == 2, mid_ada == 2);
     basalt::kernels::mid_chain_init();
+    basalt::kernels::hc_read_ada_enable(exp_flag("hc_ada", 1) != 0);   // 0 hc8_gr's three kernels on 8.9
+    basalt::kernels::hc_read_ada_init();
     wt_ = &wt;
     g_ = &g;
     ss_ = &ss;

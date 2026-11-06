@@ -6,6 +6,7 @@
 #include "basalt/core/on_device.hpp"
 #include "basalt/kernels/fused_gr.hpp"
 #include "basalt/kernels/hc_fused.hpp"
+#include "basalt/kernels/hc_read_ada.hpp"
 #include "basalt/kernels/cvec.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/q5k_head.hpp"
@@ -49,6 +50,8 @@ bool Verifier::WindowRecorder::head() {
                 h.w_norm = (const float*) hn->data; h.w_down = (const uint16_t*) hd->data; h.w_up = (const uint16_t*) hu->data;
                 h.eps = EPS; h.lo = v_.lo_; h.rs = v_.rs_; h.mixed = v_.head_mixed_; h.xn = v_.xn_;
                 hc_fused_read(h, cs);
+            } else if (!v_.prof_on_ && !v_.batch_rec_ && !ple_open && !lz_open && !l2a_open && hc_read_ada_supported(fa, T)) {
+                hc_read_ada(fa, T, cs);
             } else {
                 fused_gr_read_multi(fa, T, v_.xn_, cs);
             }

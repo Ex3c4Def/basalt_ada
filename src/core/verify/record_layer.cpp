@@ -12,6 +12,7 @@
 #include "basalt/kernels/fused_gr.hpp"
 #include "basalt/kernels/mid_chain.hpp"
 #include "basalt/kernels/hc_fused.hpp"
+#include "basalt/kernels/hc_read_ada.hpp"
 #include "basalt/kernels/cvec.hpp"
 #include "basalt/kernels/dec_gdn.hpp"
 #include "basalt/kernels/dense_tc.hpp"
@@ -104,6 +105,15 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
             a.w_up = (const uint16_t*) wu[half]->data; a.w_inject = (const uint16_t*) wi[half]->data;
             a.eps = EPS; a.lo = v_.lo_ + t * g.hc_lr; a.rs = v_.rs_ + t * HC;
             a.inject_out = inj_out + t * HC; a.mixed = v_.mixed_ + t * N;
+        }
+        // compute capability 8.9: one persistent kernel with these bits; it needs every SM, so no side branch beside it
+        if (!v_.prof_on_ && !v_.batch_rec_ && !ple_open && !lz_open && hc_read_ada_supported(fa, n)) {
+            if (l2a_open) {
+                cudaStreamWaitEvent(cs, v_.l2a_join_, 0);
+                l2a_open = false;
+            }
+            hc_read_ada(fa, n, cs);
+            return;
         }
         fused_gr_read_multi(fa, n, v_.xn_, cs, v_.prof_on_ ? v_.prof_ : nullptr,
                             (int) (l * kProfPer + (half == 0 ? 27 : 30)));
