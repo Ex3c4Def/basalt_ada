@@ -13,6 +13,7 @@
 #include "basalt/kernels/fused_gr.hpp"
 #include "basalt/kernels/mid_chain.hpp"
 #include "basalt/kernels/hc_read_ada.hpp"
+#include "basalt/kernels/dec_moe.hpp"
 #include "basalt/kernels/hc_fused.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/pdl.hpp"
@@ -123,6 +124,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     basalt::kernels::mid_chain_init();
     basalt::kernels::hc_read_ada_enable(exp_flag("hc_ada", 1) != 0);   // 0 hc8_gr's three kernels on 8.9
     basalt::kernels::hc_read_ada_init();
+    basalt::kernels::dec_moe_route_ada_enable(exp_flag("dm_route_ada", 1) != 0);   // 0 the route's one kernel on 8.9
     wt_ = &wt;
     g_ = &g;
     ss_ = &ss;

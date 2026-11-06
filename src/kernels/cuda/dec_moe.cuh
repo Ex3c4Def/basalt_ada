@@ -473,6 +473,106 @@ __global__ void dm_wait_kernel(const DmPlan* plan, const volatile uint32_t* peer
 }
 
 // ---------------------------------------------------------------- DEC_GLUE & 1: the route inside gate/up
+// dm_route_kernel's modes 1 and 2 for a card with no peer, no staged share and no shared gate (dm_ada_args): the same plan,
+// rows, ring and doorbells.  Without peers an entry's tier is CUDA0's or the CPU pool's, the plan needs the tiers only in
+// block 0, and the host reads only the ring's header and x before the doorbell.
+__device__ __forceinline__ void dm_ada_tiers(const DmRouteArgs& a, int32_t* s_ids, int32_t* s_kind, int n, int tid) {
+    if (tid < n) s_ids[tid] = a.ids[tid];
+    __syncthreads();
+    if (tid < n) {
+        const int32_t e = s_ids[tid];
+        bool ok = e >= 0 && e < a.n_expert;
+        for (int j = tid - tid % a.k; ok && j < tid; ++j) ok = s_ids[j] != e;
+        s_kind[tid] = ok && a.res0[e] >= 0 ? 0 : -1;
+    }
+    __syncthreads();
+}
+
+// Mode 1: block 0 plans CUDA0's groups, the other blocks go straight to the q8_1 rows.
+__global__ void __launch_bounds__(kDmThreads) dm_plan_ada_kernel(DmRouteArgs a) {
+    const int tid = threadIdx.x;
+    if (blockIdx.x != 0) {
+        const long long i = (long long) (blockIdx.x - 1) * kDmThreads + tid;
+        q8_1_store(a.x[i], (block_q8_1*) a.xq, i);
+        return;
+    }
+    __shared__ int32_t s_ids[kDmCap], s_kind[kDmCap], s_first[kDmCap], s_cnt[kDmCap], s_gstart[kDmCap];
+    __shared__ int32_t s_gidx[kDmCap], s_pos[kDmCap];
+    __shared__ int32_t s_ng, s_ne;
+    const int n = a.n_tok * a.k;
+    dm_ada_tiers(a, s_ids, s_kind, n, tid);
+    DmPlan* p = a.plan;
+    dm_group(s_ids, s_kind, n, 0, tid, s_first, s_cnt, s_gstart, s_gidx, s_pos, p->start, &s_ng, &s_ne);
+    if (tid < n) {
+        const int32_t kd = s_kind[tid];
+        p->kind[tid] = kd;
+        if (kd == 0) {
+            p->dst[s_pos[tid]] = tid;
+            p->tok[s_pos[tid]] = tid / a.k;
+            if (s_first[tid]) {
+                const int32_t slot = a.res0[s_ids[tid]];
+                p->ptr[s_gidx[tid]] = (unsigned long long) (a.cache_base + (a.slot_off ? (size_t) a.slot_off[slot]
+                                                                                          : (size_t) slot * (size_t) a.blob));
+            }
+        }
+    }
+    if (tid == 0) {
+        p->counts[0] = s_ng;
+        p->counts[1] = s_ne;
+        p->counts[2] = 0;
+        p->counts[3] = n - s_ne;
+    }
+}
+
+// Mode 2: block 0 publishes the header and x and rings the doorbells; the other blocks, launched only for `rows`, publish
+// the q8_1 rows for the warm-up's prediction, which may read them late without changing any output.
+__global__ void __launch_bounds__(kDmThreads) dm_ring_ada_kernel(DmRouteArgs a) {
+    const int tid = threadIdx.x;
+    if (blockIdx.x != 0) {
+        __shared__ __align__(16) block_q8_1 s_rows[kDmThreads / 32];
+        const long long i = (long long) (blockIdx.x - 1) * kDmThreads + tid;
+        q8_1_store(a.x[i], s_rows, tid);
+        __syncthreads();
+        const int nv = (int) (sizeof(s_rows) / sizeof(uint4));   // whole 16-byte stores: the blocks' size divides by it
+        if (tid < nv)
+            reinterpret_cast<uint4*>((block_q8_1*) a.xq_m + (blockIdx.x - 1) * (kDmThreads / 32))[tid] =
+                reinterpret_cast<const uint4*>(s_rows)[tid];
+        return;
+    }
+    __shared__ int32_t s_ids[kDmCap], s_kind[kDmCap];
+    __shared__ int32_t s_ne;
+    const int n = a.n_tok * a.k;
+    dm_ada_tiers(a, s_ids, s_kind, n, tid);
+    DmRing* r = a.ring_m;
+    if (tid < n) {
+        r->ids[tid] = s_ids[tid];
+        r->kind[tid] = s_kind[tid];
+    }
+    if (tid == 0) {
+        int ne = 0;
+        for (int j = 0; j < n; ++j) ne += s_kind[j] == 0;
+        s_ne = ne;
+        r->n_tok = a.n_tok;
+        r->layer = a.layer;
+        r->n_vram = ne;
+        r->n_peer = 0;
+        r->n_cpu = n - ne;
+    }
+    __syncthreads();
+    if (s_ne < n)
+        for (int i = tid; i < a.n_tok * (a.n_embd / 4); i += kDmThreads)
+            reinterpret_cast<float4*>(a.x_m)[i] = reinterpret_cast<const float4*>(a.x)[i];
+    __threadfence_system();
+    __syncthreads();
+    if (tid == 0) {
+        if (a.stats != nullptr) a.stats[0] = dm_clock();
+        __threadfence_system();
+        *(volatile uint32_t*) a.peer_seq_m = a.ring | (uint32_t) a.n_tok << 16 | (a.rows ? 1u << 29 : 0u);
+        *(volatile uint32_t*) a.host_seq_m = a.ring;
+        __threadfence_system();
+    }
+}
+
 // dm_route_kernel's mode 2 kinds (with the peer's cap) for the ring's entries r_ids (shared memory) from the
 // residency rows res0 / res1 (dm_tier_rows), the counts into r_cnt (zeroed: CPU, peer, VRAM, then each further
 // peer's), then the ring's header and every entry's kind (mapped, the further peers' rings, and the plan's with
@@ -2161,13 +2261,48 @@ __global__ void __launch_bounds__(kDmThreads) dm_test_kernel(NativeExpertLayout 
 
 int dec_moe_route_blocks(int n_tok, int n_embd) { return 1 + (n_tok * n_embd + kDmThreads - 1) / kDmThreads; }
 
+namespace {
+bool g_dm_ada_on = false;
+
+bool dm_ada_device() {
+    static signed char known[16] = {};   // 0: not asked yet, 1: compute capability 8.9, -1: another
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 16) return false;
+    if (known[dev] == 0) {
+        int major = 0, minor = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        known[dev] = major == 8 && minor == 9 ? 1 : -1;
+    }
+    return known[dev] > 0;
+}
+
+// the two kernels' case: no peer, no staged share, no shared gate, x in 16-byte units
+bool dm_ada_args(const DmRouteArgs& a) {
+    auto al16 = [](const void* p) { return p != nullptr && ((uintptr_t) p & 15u) == 0; };
+    return g_dm_ada_on && (a.mode == 1 || a.mode == 2) && a.res1 == nullptr && a.n_x == 0 && a.peer_cap == 0 &&
+           a.stage_src == nullptr && a.sh_gw == nullptr && !a.kinds && a.pub_ctr == nullptr && al16(a.x) && al16(a.x_m) &&
+           (!a.rows || al16(a.xq_m)) && dm_ada_device();
+}
+}  // namespace
+
+void dec_moe_route_ada_enable(bool on) { g_dm_ada_on = on; }
+
+bool dec_moe_route_ada(const DmRouteArgs& a) { return dm_ada_args(a); }
+
 void dec_moe_route(const DmRouteArgs& a, void* stream) {
     if (a.n_tok * a.k > kDmCap || a.n_embd % kDmThreads != 0) {
         basalt::log::error("basalt", "dec_moe_route: %d entries / n_embd %d", a.n_tok * a.k, a.n_embd);
         std::exit(1);
     }
     const dim3 grid((unsigned) dec_moe_route_blocks(a.n_tok, a.n_embd));
-    dm_route_kernel<<<grid, kDmThreads, 0, (cudaStream_t) stream>>>(a);
+    if (dm_ada_args(a)) {
+        if (a.mode == 1) dm_plan_ada_kernel<<<grid, kDmThreads, 0, (cudaStream_t) stream>>>(a);
+        else dm_ring_ada_kernel<<<a.rows ? grid : dim3(1), kDmThreads, 0, (cudaStream_t) stream>>>(a);
+    } else {
+        dm_route_kernel<<<grid, kDmThreads, 0, (cudaStream_t) stream>>>(a);
+    }
     check("dec_moe_route");
 }
 

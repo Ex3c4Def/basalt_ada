@@ -52,6 +52,28 @@ the fallback so the trap is never launched.
   side branch is open, after a join on the L2 read-ahead. `--exp hc_ada=0` runs the three kernels. The router, the q8_1
   rows and the draft graphs stay outside it. Development A/B at 450 W, per-window log on, a download running: +3.17%
   decode (token-weighted) over `hc_ada=0`, faster on conv, struct and prose (HC_READ_ADA_PLAN.md).
+- Route: without a peer, staged share or shared gate, `dec_moe_route` on 8.9 takes `dm_plan_ada_kernel` (block 0 plans, the
+  others go straight to the q8_1 rows) and `dm_ring_ada_kernel` (one block publishes the header and x in 16-byte stores and
+  rings; blocks for the warm-up's rows do not hold the doorbell back, so those rows may land after it, which changes no
+  output). `--exp dm_route_ada=0` runs `dm_route_kernel`, which is unchanged. `dm_route_ada_parity`: 0 differing bytes in
+  2560 cases against `dm_route_kernel`; greedy identical on conv, struct and prose. All numbers at 450 W, development only.
+  Traces: chain 8-10 -> 5 us at T=1, 18-21 -> 7-9 us at T=8; ring 12-14 -> 8 us at T=1, 17-21 -> 12-14 us at T=8; prose's
+  route busy time 7.6 -> 4.3 % of the cycle. Microbench, to the doorbell: 4.7 -> 3.3 us at T=1, 15.4 -> 6.2 us at T=8.
+  A/B, 4 rounds x 2 repetitions with the video decoder idle throughout: conv -0.1 %, struct -0.7 %, prose +2.5 % (7 of 8
+  faster), token-weighted +0.05 %. All three A/Bs pooled, 20 pairs each, paired median: conv +0.3 %, struct +0.5 %, prose
+  +2.8 %, with prose's window time -3.3 %. So only prose gains beyond the spread; expert hit rates are unchanged. Other
+  load on the machine moves these numbers: in an A/B during which a video played at some time, one conv run lost 21.5 %
+  across every window width. Log `utilization.decoder` beside an A/B to see this.
+- HC read and route together, against the build without them: `local_bench/engine_bench.py --tests community`, a fresh
+  server from `basalt_config.json`, 450 W, DDR5-4400, 4 rotated pairs, development only. conv / struct / prose /
+  decode_tps 111.2 / 200.3 / 120.4 / 170.2 -> 118.7 / 212.3 / 127.3 / 180.1, +5.8 %, faster in every pair. decode_tps
+  ranges 163.1 to 175.2 and 178.0 to 182.5. Same builds, plain basalt-bench with the log on, 14 pairs: +5.53 %; the hc
+  read alone +3.53 % and the route on top +1.40 %, 6 pairs each. Text differs between runs on conv and prose (adaptive
+  swaps), so struct, greedy, is the cleanest figure.
+- Those builds' output: the quality gate's rows (100 chunks, T 3) are byte-identical; greedy, and with `--adapt-swaps 0`
+  sampled conv and prose, are identical.
+- Measuring: plain basalt-bench asks for the per-window log unless `--no-windows`, about 2 % slower, so compare its tok/s
+  only with its own. It keeps the last of a repeated engine flag, so two experiment gates go in one `--exp a=0,b=0`.
 - NVFP4 prefill: `fp4_tensor_cores()` (layout.cpp) is true only for major >= 12. `fp4_pack()`, `fp4_every_layer()` and
   `fp4_l` (experts.hpp) depend on it, so NVFP4 experts take the MMQ path (src/prefill/mmq, mmq_nvfp4) and the MMQ
   buffers are sized for every chunk length. If a buffer overflow or wrong-size error shows up in prefill, look at
