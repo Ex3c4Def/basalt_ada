@@ -5,7 +5,7 @@ A/B at 450 W: +2.2 % decode (token-weighted) over `mid_ada=0`, faster on all thr
 with z on dense_tc (its first version, other bits than `mid_ada=0`).
 
 ## The kernel
-`src/kernels/cuda/mid_chain_ada.cu`: one persistent kernel, one CTA of four 128-thread groups per SM (128 CTAs on
+`src/models/qwen4exp/kernels/mid_chain_ada.cu`: one persistent kernel, one CTA of four 128-thread groups per SM (128 CTAs on
 the 4090), runs record_gdn.cpp's unfused sequence of a GDN layer's middle with those kernels' bodies or arithmetic:
 - q8_1 of the read's rows (native_quantize_q8_1's arithmetic);
 - qkv through `dense_tc_block` (three groups), alpha/beta on the fourth;

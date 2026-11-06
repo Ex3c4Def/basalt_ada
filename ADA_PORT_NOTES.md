@@ -11,9 +11,9 @@ The source edits are already applied (14 files, listed below). They were written
 nothing has been built or run yet. The first job is to get it to compile and then to run.
 
 Changed files:
-CMakeLists.txt, include/basalt/kernels/dec_gdn.hpp, src/core/device.cu, src/kernels/cuda/dec_gdn_rec.cu,
-src/kernels/cuda/dec_moe.cuh, src/kernels/cuda/dense_tc.cu, src/kernels/cuda/gu2.cuh, src/kernels/cuda/hc_fused.cu,
-src/kernels/cuda/verify_kernels.cu, src/prefill/experts.hpp, src/prefill/layout.cpp, src/prefill/layout.hpp,
+CMakeLists.txt, include/basalt/models/qwen4exp/kernels/dec_gdn.hpp, src/core/device.cu, src/models/qwen4exp/kernels/dec_gdn_rec.cu,
+src/models/qwen4exp/kernels/dec_moe.cuh, src/models/qwen4exp/kernels/dense_tc.cu, src/kernels/cuda/gu2.cuh, src/models/qwen4exp/kernels/hc_fused.cu,
+src/models/qwen4exp/kernels/verify_kernels.cu, src/models/qwen4exp/prefill/experts.hpp, src/models/qwen4exp/prefill/layout.cpp, src/models/qwen4exp/prefill/layout.hpp,
 src/prefill/mmq/mmq_common.cuh, src/program/gpu_select.cpp. (`git diff` shows all of them.)
 
 ## Build (Windows, docs/platforms.md has the details)
@@ -74,6 +74,12 @@ the fallback so the trap is never launched.
   sampled conv and prose, are identical.
 - Measuring: plain basalt-bench asks for the per-window log unless `--no-windows`, about 2 % slower, so compare its tok/s
   only with its own. It keeps the last of a repeated engine flag, so two experiment gates go in one `--exp a=0,b=0`.
+- Comparing the quality gate across builds: its rows follow the GPU slots, and a bigger binary leaves less VRAM (6491 slots
+  against 6515 changed nearly every row, KLD 0.0620 against 0.0619). Fix `--expert-cache` when comparing; with it equal the
+  rows are byte-identical.
+- DeepSeek-V4.1 on 8.9: its code has no architecture guards, and it uses no clusters, bulk copies, griddepcontrol or FP4
+  tensor cores; DSpark decodes MXFP4 in software. Its `ds41_*` parity tests (`-DBUILD_TESTING=ON`) pass on a 4090 at 450 W,
+  the peer test only with one card. No pack has been run, so end-to-end output, quality and speed are unmeasured.
 - NVFP4 prefill: `fp4_tensor_cores()` (layout.cpp) is true only for major >= 12. `fp4_pack()`, `fp4_every_layer()` and
   `fp4_l` (experts.hpp) depend on it, so NVFP4 experts take the MMQ path (src/prefill/mmq, mmq_nvfp4) and the MMQ
   buffers are sized for every chunk length. If a buffer overflow or wrong-size error shows up in prefill, look at
@@ -85,7 +91,7 @@ the fallback so the trap is never launched.
 
 ## Known gaps (not touched)
 Multi-GPU `gs_split` (record_gdn.cpp calls `dec_gdn_rec` unconditionally), the peer-tier FP4 prefill (peer.cpp,
-peer_experts.cpp), and `src/prefill/fp4/moe_fp4.cu`, which CMake always builds for `120a-real` (it should never launch on
+peer_experts.cpp), and `src/models/qwen4exp/prefill/fp4/moe_fp4.cu`, which CMake always builds for `120a-real` (it should never launch on
 the 4090). Error strings in gpu_select.cpp changed ("not sm_120 or sm_89"); check serve/ does not parse them.
 
 ## Test once it builds

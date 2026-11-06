@@ -14,7 +14,7 @@ Numbers at 450 W, GPU otherwise idle, development only.
 - A floor remains: the read's weights are 7.1 MB (codes and scales of down, inject and up), about 5 to 7 us.
 
 ## The kernel
-`src/kernels/cuda/hc_read_ada.cu`: one persistent kernel, one CTA of 512 threads per SM, 128 CTAs on the 4090. The first
+`src/models/qwen4exp/kernels/hc_read_ada.cu`: one persistent kernel, one CTA of 512 threads per SM, 128 CTAs on the 4090. The first
 256 threads serve the down rows, the other 256 the norm, the staging and the sums. hc8_gr's arithmetic and reduction tree
 are kept exactly.
 
