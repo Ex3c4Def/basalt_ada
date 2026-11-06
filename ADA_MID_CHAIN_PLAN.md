@@ -71,10 +71,47 @@ land at timing-dependent moments and CPU and GPU experts are not bitwise equal, 
 with identical kernels: compare modes within one run, per window width where acceptance differs. With swaps off decode
 is CPU-bound (struct 63 tok/s) and hides GPU changes.
 
+## The hc read's methods, tried
+The hc read kernel (HC_READ_ADA_PLAN.md) gained from staging, tagged hand-offs and fewer barriers. On this kernel they did
+not pay, so it stays as it is. Numbers at 450 W, development only.
+
+Where the time goes (Q6_K, T = 2, us after the first CTA's start, median CTA; timer ticks 1 us):
+
+| | q81 + barrier | qkv + z | barrier | conv + barrier | rec + barrier | out |
+|---|---|---|---|---|---|---|
+| hot, 38 us | 2 to 3 | to 17 | to 20 | to 22.5 | to 27.5 | to 37 |
+| cold, 67 us | 2 | to 39 | to 42 | to 45 | to 52 | to 66.6 |
+
+The weights are 47 MB, and they set the time. Hot, qkv + z move 34 MB at about 2 TB/s, near the card's read limit. Cold, the
+whole kernel runs at the DRAM's limit of about 0.93 TB/s. The output projection is the slowest part when hot, about 1.3 TB/s,
+since only 160 of its 384 groups have tiles. The barriers cost 1 to 2 us each.
+
+Each candidate on its own, keeping the bits, us per layer (T = 2, cold / hot; base 67.1 / 38.0):
+
+| candidate | result | |
+|---|---|---|
+| barrier as a count alone, no generation word | 65.4 / 36.4 | -2 us at every T |
+| + qkv's first slots issued before q81 | 66.4 / 36.9 | worse: threads stall on `cp.async`, so q81 ends later |
+| + out's first slots issued before conv | 65.9 / 36.8 | no gain |
+| + out's ring of 6 slots | 66.9 / 36.1 | cold worse, hot about equal |
+| + out's ring of 6 slots issued before conv | 67.5 / 36.8 | out 4 us faster cold, conv 6 us slower |
+
+Issuing early moves the stall onto the critical path. A `cp.async` stalls its thread while the queue is full, and every
+thread is needed next. This agrees with the earlier in-layer prefetch measurement under Risks.
+
+The count barrier passed `mid_chain_parity` (0 differing bytes) but gave no gain in the engine. basalt-bench A/B against the
+current barrier, 4 rounds x 2 repetitions, video decoder idle throughout: conv -0.6 %, struct -0.8 %, prose -0.3 %,
+token-weighted -0.6 %, 8 of 24 paired runs faster, window time -0.5 / +0.8 / -0.2 %. That is within the spread, and 2 us
+per layer is at most a few tenths of a percent of a window. So it was not kept.
+
+What matters more in the engine is whether the read-ahead finished. Traces, kernel median by T = 1 / 2 / 4 / 8: 39.5 / 42.5 /
+47 / 60 us after a completed read-ahead, 69 / 72 / 77 / 87 us after none. Layers with less than 40 us of read-ahead: prose 48
+%, conv 24 %, struct 12 %. Their time over the hot median is 2.3 / 0.8 / 0.2 % of the cycle, which bounds what a perfect
+read-ahead could gain. Most of them have little or no CPU wait, so the read-ahead has no slack to run in, and the 47 MB then
+pass through DRAM on the critical path.
+
 ## Next steps
-1. Finer hand-offs instead of grid barriers (per-head counters; each rec CTA computing its heads' conv itself; out tiles
-   starting as heads finish), only if a trace shows the barriers' cost.
-2. Remove the `--exp mid_ada` switch once A/Bs against the separate kernels are no longer needed.
+1. Remove the `--exp mid_ada` switch once A/Bs against the separate kernels are no longer needed.
 
 ## Risks
 A CTA that is not resident stalls the chain until its waits give up (200 ms bound, abort word, the window fails). The

@@ -49,8 +49,18 @@ Adaptive swaps must be **off** for any of this to mean anything: with them on, o
 tokens between runs, because the tier exchanges experts while it decodes.
 
 The quality gate is the check that decides whether such a divergence is acceptable, and it needs a KL-divergence base
-built by llama.cpp from the BF16 model ([quality.md](quality.md#the-bf16-reference)). No such base has been built on
-the machine these numbers were taken from, so the gate has not been run on the Windows build.
+built by llama.cpp from the BF16 model ([quality.md](quality.md#the-bf16-reference)). A base built under MSVC (same
+llama.cpp commit, unsloth's BF16 GGUF) reads PPL 3.2771, 3.2759 on the scored rows, against the reference's 3.2749 and
+3.2733. Against it, `basalt-bench --quality 100 --kld-base flashnext-bf16-base.kld -- --kv int8` on the Windows build
+scores as follows, next to the card's closest pack:
+
+| run | PPL | KLD mean | same top-1 |
+| --- | --- | --- | --- |
+| Windows, RTX 4090 at 450 W, `Qwen3.8-FN-NVFP4` (122.6 GiB) | 3.3119 | 0.0619 | 91.79% |
+| [card](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt#quality), RTX 5090 at 400 W + RTX 5060 Ti at 180 W, NVFP4-DQ6_K (122.0 GiB) | 3.304 | 0.0624 | 91.65% |
+
+KLD agrees within 1% and top-1 within 0.2 points. The two runs differ in GPU, base and pack file as well as in compiler,
+so this does not isolate the compiler.
 
 Both programs read a flat expert section: 512 blobs of 1,382,400 bytes, the Q2_0 layout they were written for. A pack
 carries one in its `mtp/experts` section, which copies out unmodified, so the same bytes run on either build:
