@@ -16,6 +16,10 @@
 // device table of segments (1, 2, 5 or 8 segments, mixed tokens per segment, windows past kDecMaxT rows) against the
 // current kernels called once per segment (bitwise) and a CPU reference (tolerance).
 //
+// Below compute capability 9.0 (no thread-block clusters, so no dec_gdn_rec or dec_gdn_rec_seg) modes 2 and 3 and the
+// segment kernels the batch window runs there (conv_l2, the verify recurrence, the commit) are checked, and --bench
+// is not run.
+//
 // --bench: the reference and the three modes timed as CUDA graphs over enough layers' distinct weights that the L2
 // holds none of them, per stage and whole, in microseconds per layer and GB/s over the bytes each must move.
 #include "basalt/models/qwen4exp/kernels/dec_gdn.hpp"
@@ -198,6 +202,7 @@ void run_ref(const Layer& L, const float* x, Bufs& b, int T, cudaStream_t s, int
 cudaStream_t g_side = nullptr;
 cudaEvent_t g_fork = nullptr, g_join = nullptr;
 int g_gdnf = 1;
+bool g_cluster = true;   // thread-block clusters (compute capability 9.0 or up): dec_gdn_rec and dec_gdn_rec_seg run
 void run_gdnf(const Layer& L, const float* x, Bufs& b, int T, cudaStream_t s, int stages = 7,
               unsigned long long* = nullptr) {
     const bool fork = g_gdnf >= 2 && stages == 7;
@@ -266,7 +271,7 @@ long long cmp_b(const char* what, const void* a, const void* b, size_t n) {
 
 bool parity_gdnf(cudaStream_t s) {
   bool ok = true;
-  for (g_gdnf = 1; g_gdnf <= 3; ++g_gdnf) {
+  for (g_gdnf = g_cluster ? 1 : 2; g_gdnf <= 3; ++g_gdnf) {
     std::mt19937 rng(43);
     const int combos[5][3] = {{14, 23, 14}, {23, 21, 13}, {12, 14, 21}, {13, 12, 23}, {14, 13, 12}};
     Bufs r = make_bufs(), n = make_bufs(), w8 = make_bufs();
@@ -466,7 +471,7 @@ bool parity_seg(cudaStream_t s) {
                 a.w_beta = L.wb; a.dt = L.dt; a.ssm_a = L.ssm_a; a.z = d_z + r0 * ZV; a.gamma = L.gamma;
                 a.h = h_f1 + r0 * C; a.gate = g_f1 + r0 * HV; a.beta = b_f1 + r0 * HV; a.y = y_f1 + r0 * ZV;
                 a.yq = (char*) yq_r + r0 * (ZV / 32) * 36; a.C = C; a.n_embd = N; a.h_k = HK; a.h_v = HV; a.eps = EPS;
-                dec_gdn_rec(a, T[k], s);
+                if (g_cluster) dec_gdn_rec(a, T[k], s);
             }
             // the segment kernels
             float *h_s = fbuf((size_t) R * C), *y_s = fbuf((size_t) R * ZV);
@@ -475,7 +480,7 @@ bool parity_seg(cudaStream_t s) {
             CK(cudaDeviceSynchronize());   // the fills above, before the segment kernels write these
             gdn_conv_l2_seg(d_rows, layer * SF + (size_t) S * HV * S, d_qkv, L.conv_w, h_s, C, 2 * HK, EPS, R, s);
             gdn_step_norm_seg(d_rows, layer * SF, h_r, C, g_r, b_r, d_z, L.gamma, EPS, y_s, HK, HV, R, s);
-            {
+            if (g_cluster) {
                 DecRecArgs a;
                 a.qkv = d_qkv; a.conv_w = L.conv_w; a.x = d_x; a.w_alpha = L.wa; a.w_beta = L.wb; a.dt = L.dt;
                 a.ssm_a = L.ssm_a; a.z = d_z; a.gamma = L.gamma; a.h = h_f; a.gate = g_f; a.beta = b_f; a.y = y_f;
@@ -487,11 +492,13 @@ bool parity_seg(cudaStream_t s) {
             double ma = 0;
             d += cmp_f("conv seg", h_r, h_s, (size_t) R * C, ma);
             d += cmp_f("step_norm seg", y_r, y_s, (size_t) R * ZV, ma);
-            d += cmp_f("rec seg h", h_f1, h_f, (size_t) R * C, ma);
-            d += cmp_f("rec seg gate", g_f1, g_f, (size_t) R * HV, ma);
-            d += cmp_f("rec seg beta", b_f1, b_f, (size_t) R * HV, ma);
-            d += cmp_f("rec seg y", y_f1, y_f, (size_t) R * ZV, ma);
-            d += cmp_b("rec seg yq", yq_r, yq_f, (size_t) R * (ZV / 32) * 36);
+            if (g_cluster) {
+                d += cmp_f("rec seg h", h_f1, h_f, (size_t) R * C, ma);
+                d += cmp_f("rec seg gate", g_f1, g_f, (size_t) R * HV, ma);
+                d += cmp_f("rec seg beta", b_f1, b_f, (size_t) R * HV, ma);
+                d += cmp_f("rec seg y", y_f1, y_f, (size_t) R * ZV, ma);
+                d += cmp_b("rec seg yq", yq_r, yq_f, (size_t) R * (ZV / 32) * 36);
+            }
             // the CPU reference, per segment
             double ec = 0, ey = 0;
             for (int k = 0; k < nseg; ++k) {
@@ -761,12 +768,17 @@ int main(int argc, char** argv) {
     int dev = 0;
     cudaDeviceProp p{};
     CK(cudaGetDeviceProperties(&p, dev));
-    if (p.major < 9) { std::printf("dec_gdn_parity: needs thread-block clusters (compute capability %d.%d)\n", p.major, p.minor); return 77; }
-    std::printf("%s: %d SMs, L2 %d MB, smem/block opt-in %zu KB\n", p.name, p.multiProcessorCount, p.l2CacheSize >> 20,
-                p.sharedMemPerBlockOptin >> 10);
+    g_cluster = p.major >= 9;
+    const std::string mode = argc > 1 ? argv[1] : "";
+    std::printf("%s: %d SMs, L2 %d MB, smem/block opt-in %zu KB%s\n", p.name, p.multiProcessorCount, p.l2CacheSize >> 20,
+                p.sharedMemPerBlockOptin >> 10,
+                g_cluster ? "" : "; no thread-block clusters: modes 2 and 3 and the segment kernels only");
+    if (!g_cluster && (mode == "--bench" || mode == "--bench-only")) {
+        std::printf("dec_gdn_parity: --bench times dec_gdn_rec, which needs thread-block clusters\n");
+        return 77;
+    }
     cudaStream_t s;
     CK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
-    const std::string mode = argc > 1 ? argv[1] : "";
     CK(cudaStreamCreateWithFlags(&g_side, cudaStreamNonBlocking));
     CK(cudaEventCreateWithFlags(&g_fork, cudaEventDisableTiming));
     CK(cudaEventCreateWithFlags(&g_join, cudaEventDisableTiming));

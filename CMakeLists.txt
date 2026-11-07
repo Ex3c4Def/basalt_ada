@@ -591,6 +591,9 @@ target_compile_definitions(basalt-probe PRIVATE
   BASALT_BENCH_ENGINE="$<TARGET_FILE:basalt>"
   BASALT_BENCH_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/data/bench")
 
+# the model-pack tests below and the i-quant fixtures need python3; looked up before the first of them
+find_package(Python3 COMPONENTS Interpreter QUIET)
+
 # closing the engine's stdin mid-request stops it (runs the real engine on a model pack:
 # -DBASALT_STDIN_STOP_MODEL=<pack>, with python3)
 if(BASALT_STDIN_STOP_MODEL AND Python3_Interpreter_FOUND)
@@ -629,8 +632,8 @@ basalt_embed_manifest(iq_parity)
 # the i-quant fixtures are generated, not shipped.  tools/iq_fixture.py needs python3 + numpy
 # and the repository's vendored gguf-py (no pip installs); it writes deterministic fixtures into the
 # BUILD directory (the source tree is not touched).  The CTest fixture makes generation-to-test order
-# explicit even under parallel execution; a fixture-generation failure fails iq_parity with it.
-find_package(Python3 COMPONENTS Interpreter QUIET)
+# explicit even under parallel execution; a fixture-generation failure fails iq_parity with it (python3 is looked up
+# above, before the model-pack tests).
 
 # appending a community row to docs/community/benchmarks.json: formatting cases, and a byte comparison with
 # tools/check_benchmarks.py --fix (python3)
@@ -820,6 +823,7 @@ add_executable(hc_fused_parity tests/models/qwen4exp/kernels/hc_fused_parity.cpp
 target_include_directories(hc_fused_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(hc_fused_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME hc_fused_parity COMMAND hc_fused_parity 20 1 8 --check-only --stress 200)
+set_tests_properties(hc_fused_parity PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(dm_route_ada_parity tests/models/qwen4exp/kernels/dm_route_ada_parity.cpp)
 target_include_directories(dm_route_ada_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(dm_route_ada_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})

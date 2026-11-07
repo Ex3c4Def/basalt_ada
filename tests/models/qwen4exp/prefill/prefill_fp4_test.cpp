@@ -1128,6 +1128,12 @@ int main(int argc, char** argv) {
         std::printf("no CUDA device: skipped\n");
         return 77;
     }
+    int major = 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0) == cudaSuccess && major < 12) {
+        // the FP4 kernels are built for sm_120a only; below it NVFP4 prompt experts take MMQ (layout.cpp fp4_tensor_cores)
+        std::printf("no FP4 tensor cores (compute capability %d.x): skipped\n", major);
+        return 77;
+    }
     bool do_bench = true;
     for (int i = 1; i < argc; ++i) if (std::strcmp(argv[i], "--no-bench") == 0) do_bench = false;
     try {

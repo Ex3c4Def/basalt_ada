@@ -2,7 +2,7 @@
 // same experts on the main card's MMQ products and a double-precision CPU reference, at the routed-expert geometry of a
 // large MoE (4096 x 2048, six experts a token). Half the experts sit in the second card's memory, half in pinned host
 // memory. Checks every row, the rows' independence from how the share cuts its launches, and prints the products' rates
-// on each card. Exit 77 without two GPUs.
+// on each card. With one GPU the share's card is the main card itself (its kernels and bookkeeping, no second link).
 #include "basalt/core/device.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/ggml/ggml.h"
@@ -205,10 +205,12 @@ Err compare(const std::vector<float>& a, const std::vector<float>& b, const Rout
 
 int main() {
     int n_dev = 0;
-    if (cudaGetDeviceCount(&n_dev) != cudaSuccess || n_dev < 2) {
-        std::printf("peer_share_parity: needs two GPUs, skipped\n");
+    if (cudaGetDeviceCount(&n_dev) != cudaSuccess || n_dev < 1) {
+        std::printf("peer_share_parity: no CUDA device, skipped\n");
         return 77;
     }
+    const int peer_dev = n_dev > 1 ? 1 : 0;
+    std::printf("peer_share_parity: the share on card %d (%d cards)\n", peer_dev, n_dev);
     try {
         std::mt19937 rng(7);
         const Geo g;
@@ -271,7 +273,7 @@ int main() {
         // the second card's copy of the first half; the second half in pinned host memory
         std::vector<uint8_t*> peer_blob(E, nullptr);
         {
-            const basalt::core::OnDevice od(1);
+            const basalt::core::OnDevice od(peer_dev);
             for (int e = 0; e < E / 2; ++e) {
                 ck(cudaMalloc(&peer_blob[(size_t) e], g.stride), "peer blob");
                 cudaMemcpy(peer_blob[(size_t) e], blobs[(size_t) e].data(), g.bytes, cudaMemcpyHostToDevice);
@@ -325,7 +327,7 @@ int main() {
             d.launch_rows = c.rows;
             basalt::prefill::PeerShare share;
             std::string err;
-            if (!share.open(0, 1, d, err)) throw std::runtime_error(err);
+            if (!share.open(0, peer_dev, d, err)) throw std::runtime_error(err);
             cudaEvent_t a, b;
             cudaEventCreate(&a);
             cudaEventCreate(&b);

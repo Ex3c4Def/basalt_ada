@@ -69,8 +69,8 @@ int main(int argc, char** argv) {
     const int iters = pos.size() > 0 ? std::atoi(pos[0].c_str()) : 200;
     const int t_lo = pos.size() > 1 ? std::atoi(pos[1].c_str()) : 1, t_hi = pos.size() > 2 ? std::atoi(pos[2].c_str()) : 8;
     if (!K::hc_fused_ada_supported()) {
-        std::printf("hc_fused_ada_parity: the fused read does not run on this device\n");
-        return 1;
+        std::printf("hc_fused_ada_parity: the fused read does not run on this device (skipped)\n");
+        return 77;
     }
     K::fused_gr_check();
     const int N = 2560, HC = 4, D = N * HC, LR = 320, NE = 512, KT = 10, TM = 8;
