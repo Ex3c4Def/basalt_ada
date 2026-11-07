@@ -13,7 +13,8 @@
 // CPU.  Each rank's heads also run in place on card 0 through dec_gdn_rec's head map (the layer's state and weights,
 // packed qkv/z rows in, h, gates and raw qkv at the full layout, y packed; one-launch and split recurrence): every
 // output equals the whole layer's bit for bit.  Real geometry, random weights (random bytes, sane fp16 scales), random activations and state.  With one
-// card both ranks run on it.
+// card both ranks run on it.  Below compute capability 9.0 (no thread-block clusters) the recurrence is the split one
+// (dec_gdn_rec_split + dec_gdn_rec_norm, the same bits as dec_gdn_rec) wherever dec_gdn_rec would run.
 //
 // --bench: per card, the whole layer and each share's slice as CUDA graphs over eight layers' distinct weights, in
 // microseconds per layer.
@@ -45,6 +46,7 @@ namespace {
 constexpr int N = 2560, HK = 16, HV = 48, S = 128, C = 2 * HK * S + HV * S, ZV = HV * S, HIST = 3;
 constexpr float EPS = 1e-6f;
 constexpr size_t Q81 = 36;   // bytes per 32 q8_1 values
+bool g_cluster = true;       // card 0 has thread-block clusters (compute capability 9.0 or up): dec_gdn_rec runs
 
 #define CK(x)                                                                                    \
     do {                                                                                         \
@@ -179,6 +181,7 @@ struct Card {
     int tq = 0, tz = 0, to = 0;
     void *wqkv = nullptr, *wz = nullptr, *wo = nullptr, *xq = nullptr, *yq = nullptr;
     float *conv_w, *dt, *ssm_a, *gamma, *state, *x, *qkv, *z, *h, *gate, *beta, *out;
+    float* o = nullptr;   // the split recurrence's raw output (below compute capability 9.0)
     uint16_t *wa, *wb;
     size_t state_n = 0;
 };
@@ -198,6 +201,7 @@ Card make_card(int dev, const HostLayer& L, int hk, const std::vector<float>& x)
     CK(cudaMalloc(&k.gate, sizeof(float) * kDecMaxT * k.hv));
     CK(cudaMalloc(&k.beta, sizeof(float) * kDecMaxT * k.hv));
     CK(cudaMalloc(&k.out, sizeof(float) * kDecMaxT * N));
+    CK(cudaMalloc(&k.o, sizeof(float) * kDecMaxT * k.zv));
     CK(cudaMalloc(&k.xq, native_q8_1_bytes(N, kDecMaxT)));
     CK(cudaMalloc(&k.yq, native_q8_1_bytes(k.zv, kDecMaxT)));
     CK(cudaDeviceSynchronize());
@@ -207,7 +211,7 @@ void free_card(Card& k) {
     CK(cudaSetDevice(k.dev));
     for (void* p : {k.wqkv, k.wz, k.wo, k.xq, k.yq, (void*) k.conv_w, (void*) k.dt, (void*) k.ssm_a, (void*) k.gamma,
                     (void*) k.state, (void*) k.x, (void*) k.qkv, (void*) k.z, (void*) k.h, (void*) k.gate, (void*) k.beta,
-                    (void*) k.out, (void*) k.wa, (void*) k.wb})
+                    (void*) k.out, (void*) k.o, (void*) k.wa, (void*) k.wb})
         CK(cudaFree(p));
 }
 
@@ -221,7 +225,13 @@ void run_card(const Card& k, int T, cudaStream_t s) {
     a.state = k.state; a.qkv = k.qkv; a.conv_w = k.conv_w; a.x = k.x; a.w_alpha = k.wa; a.w_beta = k.wb;
     a.dt = k.dt; a.ssm_a = k.ssm_a; a.z = k.z; a.gamma = k.gamma; a.h = k.h; a.gate = k.gate; a.beta = k.beta;
     a.yq = k.yq; a.C = k.c; a.n_embd = N; a.h_k = k.hk; a.h_v = k.hv; a.eps = EPS; a.early_trigger = false;
-    dec_gdn_rec(a, T, s);
+    if (g_cluster) {
+        dec_gdn_rec(a, T, s);
+    } else {
+        a.o = k.o;
+        dec_gdn_rec_split(a, T, s);
+        dec_gdn_rec_norm(a, T, s);
+    }
     native_mmvq(k.to, k.wo, k.yq, k.out, k.zv, N, T, s);
 }
 void clear_card(const Card& k, cudaStream_t s) {
@@ -306,7 +316,7 @@ long long check_mapped(const Card& whole, const GdnHeadSlice& g, int T, const st
     CK(cudaMalloc(&ga, sizeof(float) * T * HV)); CK(cudaMalloc(&be, sizeof(float) * T * HV));
     CK(cudaMalloc(&o, sizeof(float) * T * zv)); CK(cudaMalloc(&y1, yb)); CK(cudaMalloc(&y2, yb));
     long long d = 0;
-    for (int split = 0; split < 2; ++split) {
+    for (int split = g_cluster ? 0 : 1; split < 2; ++split) {
         CK(cudaMemsetAsync(h, 0xff, sizeof(float) * T * C, s)); CK(cudaMemsetAsync(qo, 0xff, sizeof(float) * T * C, s));
         CK(cudaMemsetAsync(ga, 0xff, sizeof(float) * T * HV, s)); CK(cudaMemsetAsync(be, 0xff, sizeof(float) * T * HV, s));
         void* y = split ? y2 : y1;
@@ -634,12 +644,10 @@ int main(int argc, char** argv) {
     CK(cudaGetDeviceCount(&ndev));
     cudaDeviceProp p{};
     CK(cudaGetDeviceProperties(&p, 0));
-    if (p.major < 9) {
-        std::printf("gdn_head_split_parity: needs thread-block clusters (compute capability %d.%d)\n", p.major, p.minor);
-        return 77;
-    }
+    g_cluster = p.major >= 9;
     g_dev1 = ndev > 1 ? 1 : 0;
-    std::printf("gdn_head_split_parity: rank 0 on card 0, the peer on card %d (%d cards)\n", g_dev1, ndev);
+    std::printf("gdn_head_split_parity: rank 0 on card 0, the peer on card %d (%d cards); recurrence %s\n", g_dev1, ndev,
+                g_cluster ? "one launch and split" : "split only (no thread-block clusters)");
     const std::string mode = argc > 1 ? argv[1] : "";
     const bool ok = parity();
     std::printf("gdn_head_split_parity: %s\n", ok ? "PASS" : "FAIL");
