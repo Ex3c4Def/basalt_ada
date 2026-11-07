@@ -101,10 +101,41 @@ the fallback so the trap is never launched.
   once a fork/join has moved the chain to another of the graph's internal streams.
 - The VRAM TMA expert kernel (`dec_moe_vram` kind 1) is never selected by default.
 
-## Known gaps (not touched)
-Multi-GPU `gs_split` (record_gdn.cpp calls `dec_gdn_rec` unconditionally), the peer-tier FP4 prefill (peer.cpp,
-peer_experts.cpp), and `src/models/qwen4exp/prefill/fp4/moe_fp4.cu`, which CMake always builds for `120a-real` (it should never launch on
-the 4090). Error strings in gpu_select.cpp changed ("not sm_120 or sm_89"); check serve/ does not parse them.
+## Multi-GPU and the other upstream features on 8.9 (checked 2026-11-08, upstream 0.3.0+110)
+- Cards exchange data without GPU-to-GPU access (GeForce 40 has none), through pinned host buffers (`StagedCopy`) and
+  `cudaMemcpyPeer`, as upstream does. Every kernel choice (`dec_gdnf_mode`, `tc_bulk_ok`, `fp4_tensor_cores`,
+  `hc_fused_supported`, `pdl_kernel_ok`) is made per card, so on an all-Ada setup each card takes the same 8.9 paths as one
+  card does. `dm_->vram` is always -1, so the TMA expert kernel is never chosen on any card.
+- GDN split by key head (`gs_split`; taken when the peer has at least a quarter of the two cards' bandwidth, so also with
+  two equal cards): CUDA0's half called `dense_tc_pair`, which exits on 8.9, and the cluster `dec_gdn_rec`. On 8.9 it now
+  runs qkv and z as two `dense_proj` and `dec_gdn_rec_split` + `dec_gdn_rec_norm` (the same bits as `dec_gdn_rec`,
+  dec_gdn.hpp); sm_120 is unchanged. The peer's mixer item already used the split form.
+- `gdn_head_split_parity` runs on 8.9 (split recurrence only, both ranks on the one card): the slices, the in-place head map
+  and the peer item's q8_1 rows are bitwise. It fails one tolerance: the combined out projection's max error against the
+  CPU must stay within 2x the whole layer's, and is 2.3-3.0x in 11 of 60 cases (RMS within 1.2x). That is the rounding of
+  the two-part sum, the same arithmetic as on sm_120; the threshold was left as it is.
+- `dec_gdn_parity` runs on 8.9 (modes 2 and 3 and the segment kernels the batch window uses there): PASS, bitwise.
+  `peer_share_parity` runs with the share on the one card: ok. `ds41_peer_parity` passes with one card.
+- Not run end to end, for want of a second card: the expert tier, the layer split and its overlapped windows, the prompt
+  split, the GDN and head splits, and DeepSeek's second-card tier.
+- Mixed sm_120 + 8.9 setups need a `120;89` build, and `fp4_pack()` / `fp4_every_layer()` are decided once on the main
+  card, so a prompt split or the peer's FP4 share would hand the sm_120a-only FP4 kernels to the 4090. Not supported.
+- DeepSeek-V4.1: every `ds41_*` parity test passes on 8.9; no pack has been run (none downloaded).
+- The other Flash-Next formats (IQ1_S to Q8_0, the K-quants, Q2_0): their kernel parity tests pass on 8.9 (`iq_*`,
+  `dec_moe_parity_kq`, `prefill_mmq_*`, `native_expert_parity_*`); only the NVFP4 pack has been run end to end.
+- End to end on the NVFP4 pack, 450 W: `generate_prompt_test`, `stdin_stop_test`, `grammar_engine_test` and
+  `grammar_batch_test` (`--parallel 4`) pass; vision `dynamic`, the sidecar on GPU 0 and on the CPU each read the wordmark
+  in assets/basalt-lockup-light.png as "Basalt" (1.1 / 1.3 / 4.4 s); the router swaps two models both ways (about 25 s a
+  swap). Greedy and sampled output with swaps off is identical to fork_4090 at cab6afa3.
+- Fixed on the way, both not Ada-specific: the sidecar kept the image open until after its OK line, so the server's
+  delete failed on Windows (WinError 32) and every sidecar image request was dropped; and the model-pack ctest entries were
+  never registered, because python3 was looked up after them.
+- Left as they are, Windows only: `file_expert_repin_test` assumes a registered copy's device alias is its host address
+  (true under Linux's unified addressing), and `iq_avx512_test`'s rows differ from its frozen hashes under MSVC on Zen 5
+  (max rel error against double 4e-6).
+- sm_120-only tests skip below their compute capability: `hc_fused_parity`, `prefill_fp4_test`, `mid_chain_hold*`,
+  `qsa_mid_parity`. `src/models/qwen4exp/prefill/fp4/moe_fp4.cu` is always built for `120a-real` and never launched on
+  8.9. The server does not parse gpu_select.cpp's error strings ("not sm_120 or sm_89").
 
 ## Test once it builds
 1. Run the built `basalt` (see README.md for the command line; the binaries land in `build-ada`) on the user's NVFP4
