@@ -5,6 +5,7 @@
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/ngram/ple_reader.hpp"
+#include "basalt/models/deepseek41/vision.hpp"
 #include "basalt/vision/mmproj.hpp"
 #include "models/deepseek41/pack.hpp"
 #include "models/deepseek41/prefill_plan.hpp"
@@ -43,6 +44,9 @@ public:
     /// Fixes the context from --max-context (`set`) or the model's maximum, bounded by the free device memory. Call
     /// once after load(), before a session is made. False with `err` when the request cannot be honoured.
     bool resolve_context(int64_t requested, std::string& err);
+    /// The caches' format (--kv); set before resolve_context.
+    CacheFormat cache_format() const { return cache_format_; }
+    void set_cache_format(CacheFormat f) { cache_format_ = f; }
     model::Result make_session(std::unique_ptr<model::ModelSession>& out) override;
 
     const Pack& pack() const { return pack_; }
@@ -83,11 +87,16 @@ public:
     prefillp::Dims prompt_dims() const;
     /// Device bytes of the compressed caches of a full context.
     uint64_t context_bytes() const;
+    /// Positions a new sequence keeps backed of `backed` (prefill_plan.hpp's keep_positions with this model's caches).
+    int64_t keep_positions(int64_t backed) const;
     /// Opens the image projector: the diagnostic standalone file when set, else the pack's vision section.
     /// False with `err` set when neither exists.
     bool open_mmproj(vision::Mmproj& mp, std::string& err) const;
+    /// The image encoders' cuBLAS handle, opened by the expert tier at load when images are on.
+    VisionBlas& vision_blas() const { return vision_blas_; }
 
 private:
+    CacheFormat cache_format_ = CacheFormat::Fp8;
     Pack pack_;
     model::ModelDesc desc_;
     std::map<std::string, DevTensor> dev_;
@@ -97,6 +106,7 @@ private:
     int device_ = 0;
     model::LoadRequest tiers_;
     mutable SharedTier shared_tier_;
+    mutable VisionBlas vision_blas_;
     int64_t ctx_ = 0;
     static int64_t ctxp_default();
     int embd_fd_ = -1;

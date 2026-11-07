@@ -22,6 +22,7 @@
 // SOFTWARE.
 #include "basalt/models/deepseek41/attn_index.hpp"
 #include "basalt/models/deepseek41/prefill_index.hpp"
+#include "cache_rows.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -136,11 +137,32 @@ void check_launch(const char* what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
 }
 
+// ---- cache rows -----------------------------------------------------------------------------------------------
+
+// Value c of row r in the cache format: packed (a full warp per group, cache_rows.cuh) or fp16 as it is.
+__device__ __forceinline__ void put_win(float o, int c, uint8_t* rows0, size_t r, bool packed) {
+    if (packed) rows::put_fp8(o, c, kLatent, rows0 + r * kWinRowBytes);
+    else reinterpret_cast<__half*>(rows0)[r * kLatent + c] = __float2half(o);
+}
+__device__ __forceinline__ void put_comp(float o, int c, uint8_t* rows0, size_t r, bool packed) {
+    if (packed) rows::put_fp4(o, c, kLatent, rows0 + r * kCompRowBytes);
+    else reinterpret_cast<__half*>(rows0)[r * kLatent + c] = __float2half(o);
+}
+__device__ __forceinline__ void put_idx(float o, int c, uint8_t* rows0, size_t r, bool packed) {
+    if (!packed) {
+        reinterpret_cast<__half*>(rows0)[r * kIdxDim + c] = __float2half(o);
+        return;
+    }
+    uint8_t* dst = rows0 + r * kIdxRowBytes;
+    rows::put_fp4p(o, c, kIdxDim, dst);
+    if (c < kIdxRowBytes - kIdxDim / 2 - kIdxDim / 32) dst[kIdxDim / 2 + kIdxDim / 32 + c] = 0;   // the padding
+}
+
 // ---- window ring ----------------------------------------------------------------------------------------------
 
 __global__ void kv_window_kernel(const float* __restrict__ raw, const float* __restrict__ norm_w,
                                  const int32_t* __restrict__ pos, float eps, const float* __restrict__ freq,
-                                 float* __restrict__ kv_out, __half* __restrict__ ring) {
+                                 float* __restrict__ kv_out, uint8_t* __restrict__ ring, bool packed) {
     __shared__ float sh[kLatent];
     __shared__ float red[32];
     const int t = blockIdx.x, c = threadIdx.x;
@@ -158,7 +180,7 @@ __global__ void kv_window_kernel(const float* __restrict__ raw, const float* __r
         o = (c & 1) ? x1 : x0;
     }
     if (kv_out) kv_out[(size_t) t * kLatent + c] = o;
-    ring[(size_t) (pos[t] % kWindowSlots) * kLatent + c] = __float2half(o);
+    put_win(o, c, ring, (size_t) (pos[t] % kWindowSlots), packed);
 }
 
 // ---- compressor -----------------------------------------------------------------------------------------------
@@ -169,8 +191,8 @@ __global__ void compress_kernel(const float* __restrict__ ckv, const float* __re
                                 const int32_t* __restrict__ pos, int n_tokens, int ratio, float eps,
                                 const float* __restrict__ norm_w, const float* __restrict__ freq,
                                 float* __restrict__ state_kv, float* __restrict__ state_score,
-                                __half* __restrict__ comp_kv, float* __restrict__ comp_pre,
-                                int32_t* __restrict__ row_of) {
+                                uint8_t* __restrict__ comp_kv, float* __restrict__ comp_pre,
+                                int32_t* __restrict__ row_of, bool packed) {
     __shared__ float sh[kLatent];
     __shared__ float red[32];
     const int c = threadIdx.x;
@@ -209,7 +231,7 @@ __global__ void compress_kernel(const float* __restrict__ ckv, const float* __re
             rotate_pair(x0, x1, (float) (p + 1 - ratio), freq[pr]);
             o = (c & 1) ? x1 : x0;
         }
-        comp_kv[(size_t) (p / ratio) * kLatent + c] = __float2half(o);
+        put_comp(o, c, comp_kv, (size_t) (p / ratio), packed);
         __syncthreads();
     }
     state_kv[c] = kv[0];
@@ -224,7 +246,7 @@ __global__ void compress_kernel(const float* __restrict__ ckv, const float* __re
 __global__ void index_key_kernel(const float* __restrict__ comp_pre, const int32_t* __restrict__ row_of,
                                  const int32_t* __restrict__ pos, int ratio, float eps,
                                  const uint16_t* __restrict__ w, const float* __restrict__ norm_w,
-                                 const float* __restrict__ freq, __half* __restrict__ comp_ik) {
+                                 const float* __restrict__ freq, uint8_t* __restrict__ comp_ik, bool packed) {
     const int t = blockIdx.x;
     const int row = row_of[t];
     if (row < 0) return;
@@ -255,23 +277,26 @@ __global__ void index_key_kernel(const float* __restrict__ comp_pre, const int32
             rotate_pair(x0, x1, (float) (pos[t] + 1 - ratio), freq[p]);
             o = (c & 1) ? x1 : x0;
         }
-        comp_ik[(size_t) row * kIdxDim + c] = __float2half(o);
+        put_idx(o, c, comp_ik, (size_t) row, packed);
     }
 }
 
 // ---- indexer --------------------------------------------------------------------------------------------------
 
-// Rotates the last kRopeDim dims of every query head in place.
-__global__ void idx_rope_kernel(float* __restrict__ iq, const int32_t* __restrict__ pos, const float* __restrict__ freq) {
-    const int t = blockIdx.x;
-    for (int i = threadIdx.x; i < kIdxHeads * kRopePairs; i += blockDim.x) {
-        const int h = i / kRopePairs, p = i % kRopePairs;
-        float* base = iq + ((size_t) t * kIdxHeads + h) * kIdxDim + (kIdxDim - kRopeDim) + 2 * p;
-        float x0 = base[0], x1 = base[1];
-        rotate_pair(x0, x1, (float) pos[t], freq[p]);
-        base[0] = x0;
-        base[1] = x1;
+// Rotates the last kRopeDim dims of every query head, then (`round`) rounds the head as an index key, in place.
+// Block (token, head), a thread per dim.
+__global__ void idx_rope_round_kernel(float* __restrict__ iq, const int32_t* __restrict__ pos, const float* __restrict__ freq,
+                                      bool round) {
+    const int t = blockIdx.x, c = threadIdx.x;
+    float* v = iq + ((size_t) t * kIdxHeads + blockIdx.y) * kIdxDim;
+    float o = v[c];
+    const float other = __shfl_xor_sync(0xffffffffu, o, 1);
+    if (c >= kIdxDim - kRopeDim) {
+        float x0 = (c & 1) ? other : o, x1 = (c & 1) ? o : other;
+        rotate_pair(x0, x1, (float) pos[t], freq[(c - (kIdxDim - kRopeDim)) >> 1]);
+        o = (c & 1) ? x1 : x0;
     }
+    v[c] = round ? rows::round_fp4p(o) : o;
 }
 
 // Rows any token of the call can see: positions ascend, so the last token sees the most. `cap` bounds the buffers.
@@ -281,8 +306,9 @@ __device__ __forceinline__ int eff_rows(const int32_t* pos, int n_tokens, int ra
 
 // score[t][j] over j < n_comp (the buffer capacity; only the rows a token of the call can see are written);
 // -inf where the row is not visible to the token or its block is not a candidate.
+template <bool kPacked>
 __global__ void idx_score_kernel(const float* __restrict__ iq, const float* __restrict__ iw,
-                                 const int32_t* __restrict__ pos, const __half* __restrict__ ik, int n_comp,
+                                 const int32_t* __restrict__ pos, const uint8_t* __restrict__ ik, int n_comp,
                                  int ratio, int block_size, const uint8_t* __restrict__ blk_ok, int blk_ld,
                                  float w_scale, float* __restrict__ scores) {
     __shared__ __align__(16) float q[kIdxHeads * kIdxDim];
@@ -306,16 +332,21 @@ __global__ void idx_score_kernel(const float* __restrict__ iq, const float* __re
         float acc[kIdxHeads];
     #pragma unroll
         for (int h = 0; h < kIdxHeads; ++h) acc[h] = 0.f;
-        const uint4* row = reinterpret_cast<const uint4*>(ik + (size_t) j * kIdxDim);
+        const uint8_t* row = ik + (size_t) j * (kPacked ? kIdxRowBytes : kIdxDim * 2);
+        const uint32_t sw = kPacked ? *reinterpret_cast<const uint32_t*>(row + kIdxDim / 2) : 0u;   // the groups' scales
         for (int c = 0; c < kIdxDim / 8; ++c) {
-            const uint4 u = row[c];
-            const __half2* hp = reinterpret_cast<const __half2*>(&u);
             float k[8];
+            if (kPacked) {
+                rows::fp4p_values<8>(reinterpret_cast<const uint32_t*>(row)[c], (sw >> (8 * (c / 4))) & 0xffu, k);
+            } else {
+                const uint4 u = reinterpret_cast<const uint4*>(row)[c];
+                const __half2* hp = reinterpret_cast<const __half2*>(&u);
     #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const float2 f = __half22float2(hp[i]);
-                k[2 * i] = f.x;
-                k[2 * i + 1] = f.y;
+                for (int i = 0; i < 4; ++i) {
+                    const float2 f = __half22float2(hp[i]);
+                    k[2 * i] = f.x;
+                    k[2 * i + 1] = f.y;
+                }
             }
     #pragma unroll
             for (int h = 0; h < kIdxHeads; ++h) {
@@ -806,15 +837,17 @@ __global__ void __launch_bounds__(128) gemm_bf16_kernel(const uint16_t* __restri
     }
 }
 
+// A row of blockDim.x 16-byte words per block.
 __global__ void window_copy_kernel(const uint4* __restrict__ ring, uint4* __restrict__ stage, int stage_cap, int64_t p_lo) {
+    const int words = blockDim.x;
     const int64_t p = p_lo + blockIdx.x;
-    stage[(size_t) (p % stage_cap) * (kLatent / 8) + threadIdx.x] = ring[(size_t) (p % kWindowSlots) * (kLatent / 8) + threadIdx.x];
+    stage[(size_t) (p % stage_cap) * words + threadIdx.x] = ring[(size_t) (p % kWindowSlots) * words + threadIdx.x];
 }
 
 __global__ void kv_window_stage_kernel(const float* __restrict__ raw, const float* __restrict__ norm_w,
                                        const int32_t* __restrict__ pos, float eps, const float* __restrict__ freq,
-                                       __half* __restrict__ stage, int stage_cap, __half* __restrict__ ring,
-                                       int ring_from) {
+                                       uint8_t* __restrict__ stage, int stage_cap, uint8_t* __restrict__ ring,
+                                       int ring_from, bool packed) {
     __shared__ float sh[kLatent];
     __shared__ float red[32];
     const int t = blockIdx.x, c = threadIdx.x;
@@ -831,9 +864,8 @@ __global__ void kv_window_stage_kernel(const float* __restrict__ raw, const floa
         rotate_pair(x0, x1, (float) pos[t], freq[p]);
         o = (c & 1) ? x1 : x0;
     }
-    const __half h = __float2half(o);
-    stage[(size_t) (pos[t] % stage_cap) * kLatent + c] = h;
-    if (t >= ring_from) ring[(size_t) (pos[t] % kWindowSlots) * kLatent + c] = h;
+    put_win(o, c, stage, (size_t) (pos[t] % stage_cap), packed);
+    if (t >= ring_from) put_win(o, c, ring, (size_t) (pos[t] % kWindowSlots), packed);
 }
 
 // One block per token; a token closing a group reads its group's rows from the call, or from the carried state for
@@ -842,8 +874,8 @@ __global__ void compress_batch_kernel(const float* __restrict__ ckv, const float
                                       const int32_t* __restrict__ pos, int ratio, float eps,
                                       const float* __restrict__ norm_w, const float* __restrict__ freq,
                                       const float* __restrict__ state_kv, const float* __restrict__ state_score,
-                                      __half* __restrict__ comp_kv, float* __restrict__ comp_pre,
-                                      int32_t* __restrict__ row_of) {
+                                      uint8_t* __restrict__ comp_kv, float* __restrict__ comp_pre,
+                                      int32_t* __restrict__ row_of, bool packed) {
     __shared__ float sh[kLatent];
     __shared__ float red[32];
     const int t = blockIdx.x, c = threadIdx.x;
@@ -883,7 +915,7 @@ __global__ void compress_batch_kernel(const float* __restrict__ ckv, const float
         rotate_pair(x0, x1, (float) (p + 1 - ratio), freq[pr]);
         o = (c & 1) ? x1 : x0;
     }
-    comp_kv[(size_t) (p / ratio) * kLatent + c] = __float2half(o);
+    put_comp(o, c, comp_kv, (size_t) (p / ratio), packed);
 }
 
 // The carried state after the call: the last token of each slot.
@@ -911,10 +943,10 @@ void gemv_bf16(const uint16_t* w, const float* x, int n_tokens, int in, int out,
 }
 
 void kv_window(const float* kv_raw, const float* norm_w, const int32_t* pos, int n_tokens, float rms_eps,
-               const float* rope_freq, float* kv_out, uint16_t* ring, void* stream) {
+               const float* rope_freq, float* kv_out, uint8_t* ring, CacheFormat fmt, void* stream) {
     if (n_tokens < 1 || n_tokens > kMaxT) throw std::invalid_argument("kv_window: bad token count");
-    kv_window_kernel<<<n_tokens, kLatent, 0, as_stream(stream)>>>(kv_raw, norm_w, pos, rms_eps, rope_freq, kv_out,
-                                                                  reinterpret_cast<__half*>(ring));
+    kv_window_kernel<<<n_tokens, kLatent, 0, as_stream(stream)>>>(kv_raw, norm_w, pos, rms_eps, rope_freq, kv_out, ring,
+                                                                  fmt == CacheFormat::Fp8);
     check_launch("kv_window");
 }
 
@@ -931,11 +963,11 @@ void compress(const CompressArgs& a, const float* x, const int32_t* pos, int n_t
     if (a.ratio > 1) gemv_bf16(a.w_gate, x, n_tokens, a.n_embd, kLatent, csc, stream);
     compress_kernel<<<1, kLatent, 0, s>>>(ckv, a.ratio > 1 ? csc : nullptr, pos, n_tokens, a.ratio, a.rms_eps, a.norm_w,
                                           a.rope_freq, a.state_kv, a.state_score,
-                                          reinterpret_cast<__half*>(a.comp_kv), pre, row_of);
+                                          a.comp_kv, pre, row_of, a.format == CacheFormat::Fp8);
     check_launch("compress");
     if (a.w_idx_k && a.comp_ik) {
         index_key_kernel<<<n_tokens, 256, 0, s>>>(pre, row_of, pos, a.ratio, a.rms_eps, a.w_idx_k, a.idx_k_norm_w,
-                                                  a.rope_freq, reinterpret_cast<__half*>(a.comp_ik));
+                                                  a.rope_freq, a.comp_ik, a.format == CacheFormat::Fp8);
         check_launch("index_key");
     }
 }
@@ -952,11 +984,11 @@ void compress_window(const CompressArgs& a, const float* x, const int32_t* pos, 
     if (a.ratio > 1) gemv_bf16(a.w_gate, x, n_tokens, a.n_embd, kLatent, csc, stream);
     compress_batch_kernel<<<n_tokens, kLatent, 0, s>>>(ckv, a.ratio > 1 ? csc : nullptr, pos, a.ratio, a.rms_eps, a.norm_w,
                                                        a.rope_freq, a.state_kv, a.state_score,
-                                                       reinterpret_cast<__half*>(a.comp_kv), pre, row_of);
+                                                       a.comp_kv, pre, row_of, a.format == CacheFormat::Fp8);
     check_launch("compress_window");
     if (a.w_idx_k && a.comp_ik) {
         index_key_kernel<<<n_tokens, 256, 0, s>>>(pre, row_of, pos, a.ratio, a.rms_eps, a.w_idx_k, a.idx_k_norm_w,
-                                                  a.rope_freq, reinterpret_cast<__half*>(a.comp_ik));
+                                                  a.rope_freq, a.comp_ik, a.format == CacheFormat::Fp8);
         check_launch("index_key");
     }
 }
@@ -1043,7 +1075,7 @@ void indexer_rank(const IndexerArgs& a, const float* qr, const int32_t* pos, int
     cudaStream_t s = as_stream(stream);
     const IdxWs w = carve(workspace, a.n_comp);
     gemv_bf16(a.w_q, qr, n_tokens, 1280, kIdxHeads * kIdxDim, w.iq, stream);
-    idx_rope_kernel<<<n_tokens, 256, 0, s>>>(w.iq, pos, a.rope_freq);
+    idx_rope_round_kernel<<<dim3(n_tokens, kIdxHeads), kIdxDim, 0, s>>>(w.iq, pos, a.rope_freq, a.format == CacheFormat::Fp8);
     const int n_blk = (a.n_comp + a.block_size - 1) / a.block_size;
     const float w_scale = 1.0f / sqrtf((float) (kIdxHeads * kIdxDim));
     if (a.mode == IndexMode::Level2) {
@@ -1051,7 +1083,7 @@ void indexer_rank(const IndexerArgs& a, const float* qr, const int32_t* pos, int
                                                           a.block_size, w.blk_ok);
     }
     dim3 grid(std::min((a.n_comp + 127) / 128, kScoreBlocks), n_tokens);
-    idx_score_kernel<<<grid, 128, 0, s>>>(w.iq, w.iw, pos, reinterpret_cast<const __half*>(a.comp_ik), a.n_comp, a.ratio,
+    (a.format == CacheFormat::Fp8 ? idx_score_kernel<true> : idx_score_kernel<false>)<<<grid, 128, 0, s>>>(w.iq, w.iw, pos, a.comp_ik, a.n_comp, a.ratio,
                                           a.block_size, a.mode == IndexMode::Level2 ? w.blk_ok : nullptr, n_blk,
                                           w_scale, w.scores);
     check_launch("idx_score");
@@ -1075,19 +1107,20 @@ void gemm_bf16(const uint16_t* w, const float* x, int n_tokens, int in, int out,
     check_launch("gemm_bf16");
 }
 
-void window_stage_copy(const uint16_t* ring, uint16_t* stage, int stage_cap, int64_t p_lo, int count, void* stream) {
+void window_stage_copy(const uint8_t* ring, uint8_t* stage, int stage_cap, int64_t p_lo, int count, CacheFormat fmt,
+                       void* stream) {
     if (count <= 0) return;
-    window_copy_kernel<<<count, kLatent / 8, 0, as_stream(stream)>>>(reinterpret_cast<const uint4*>(ring),
+    window_copy_kernel<<<count, win_row_bytes(fmt) / 16, 0, as_stream(stream)>>>(reinterpret_cast<const uint4*>(ring),
                                                                     reinterpret_cast<uint4*>(stage), stage_cap, p_lo);
     check_launch("window_stage_copy");
 }
 
 void kv_window_stage(const float* kv_raw, const float* norm_w, const int32_t* pos, int n_tokens, float rms_eps,
-                     const float* rope_freq, uint16_t* stage, int stage_cap, uint16_t* ring, int ring_from, void* stream) {
+                     const float* rope_freq, uint8_t* stage, int stage_cap, uint8_t* ring, int ring_from, CacheFormat fmt,
+                     void* stream) {
     if (n_tokens < 1) throw std::invalid_argument("kv_window_stage: bad token count");
-    kv_window_stage_kernel<<<n_tokens, kLatent, 0, as_stream(stream)>>>(kv_raw, norm_w, pos, rms_eps, rope_freq,
-                                                                        reinterpret_cast<__half*>(stage), stage_cap,
-                                                                        reinterpret_cast<__half*>(ring), ring_from);
+    kv_window_stage_kernel<<<n_tokens, kLatent, 0, as_stream(stream)>>>(kv_raw, norm_w, pos, rms_eps, rope_freq, stage,
+                                                                        stage_cap, ring, ring_from, fmt == CacheFormat::Fp8);
     check_launch("kv_window_stage");
 }
 
@@ -1106,13 +1139,13 @@ void compress_batch(const CompressArgs& a, const float* x, const int32_t* pos, i
     if (a.ratio > 1) gemm_bf16(a.w_gate, x, n_tokens, a.n_embd, kLatent, csc, stream);
     const float* sc = a.ratio > 1 ? csc : nullptr;
     compress_batch_kernel<<<n_tokens, kLatent, 0, s>>>(ckv, sc, pos, a.ratio, a.rms_eps, a.norm_w, a.rope_freq, a.state_kv,
-                                                       a.state_score, reinterpret_cast<__half*>(a.comp_kv), pre, row_of);
+                                                       a.state_score, a.comp_kv, pre, row_of, a.format == CacheFormat::Fp8);
     check_launch("compress_batch");
     compress_state_kernel<<<1, kLatent, 0, s>>>(ckv, sc, pos, n_tokens, a.ratio, a.state_kv, a.state_score);
     check_launch("compress_state");
     if (a.w_idx_k && a.comp_ik) {
         index_key_kernel<<<n_tokens, 256, 0, s>>>(pre, row_of, pos, a.ratio, a.rms_eps, a.w_idx_k, a.idx_k_norm_w,
-                                                  a.rope_freq, reinterpret_cast<__half*>(a.comp_ik));
+                                                  a.rope_freq, a.comp_ik, a.format == CacheFormat::Fp8);
         check_launch("index_key");
     }
 }
@@ -1141,14 +1174,14 @@ void indexer_select_batch(const IndexerArgs& a, const float* qr, const float* x,
     cudaStream_t s = as_stream(stream);
     const IdxWs w = carve_batch(workspace, n_tokens, a.n_comp);
     gemm_bf16(a.w_q, qr, n_tokens, 1280, kIdxHeads * kIdxDim, w.iq, stream);
-    idx_rope_kernel<<<n_tokens, 256, 0, s>>>(w.iq, pos, a.rope_freq);
+    idx_rope_round_kernel<<<dim3(n_tokens, kIdxHeads), kIdxDim, 0, s>>>(w.iq, pos, a.rope_freq, a.format == CacheFormat::Fp8);
     gemm_bf16(a.w_proj, x, n_tokens, a.n_embd, kIdxHeads, w.iw, stream);
     const int n_blk = (a.n_comp + a.block_size - 1) / a.block_size;
     const float w_scale = 1.0f / sqrtf((float) (kIdxHeads * kIdxDim));
     if (a.mode == IndexMode::Level2) mark_blocks_kernel<<<n_tokens, 256, 0, s>>>(a.cand_ids, a.cand_n, n_blk, pos, a.n_comp, a.ratio,
                                                           a.block_size, w.blk_ok);
     dim3 grid(std::min((a.n_comp + 127) / 128, kScoreBlocks), n_tokens);
-    idx_score_kernel<<<grid, 128, 0, s>>>(w.iq, w.iw, pos, reinterpret_cast<const __half*>(a.comp_ik), a.n_comp, a.ratio,
+    (a.format == CacheFormat::Fp8 ? idx_score_kernel<true> : idx_score_kernel<false>)<<<grid, 128, 0, s>>>(w.iq, w.iw, pos, a.comp_ik, a.n_comp, a.ratio,
                                           a.block_size, a.mode == IndexMode::Level2 ? w.blk_ok : nullptr, n_blk,
                                           w_scale, w.scores);
     check_launch("idx_score");

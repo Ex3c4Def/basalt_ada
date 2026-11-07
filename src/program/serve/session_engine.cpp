@@ -8,6 +8,7 @@
 #include "basalt/program/community_row.hpp"
 #include "basalt/program/conv_cache.hpp"
 #include "basalt/program/probe_rates.hpp"
+#include "basalt/protocol.hpp"
 
 #include <sstream>
 
@@ -45,7 +46,7 @@ public:
         conversations.emplace((size_t) o.conversation_cache_mib << 20, (size_t) o.conversation_cache_slots);
         if (o.conversation_cache_disk_mib > 0) {
             const auto t0 = Clock::now();
-            const std::string text = "basalt conversation state " + model_.desc().arch + " mmproj " + o.vision_mmproj;
+            const std::string text = "basalt conversation state " + model_.desc().arch + " vision_in_engine " + (o.vision_in_engine ? "1" : "0");
             const uint64_t identity = basalt::core::conversation_store_hash_file(
                 o.model, basalt::core::conversation_store_hash(text.data(), text.size(), 1));
             std::string de;
@@ -97,7 +98,7 @@ public:
                 basalt::log::error("basalt serve", "%s", r.message.c_str());
                 return 1;
             }
-        start_guard(0, 0);   // the margin alone: no prompt chunk is sized to reads of the file
+        start_guard();
         std::printf("INFO %s\n", (identity_words() + sessions_[0]->info_words()).c_str());
         std::printf("READY %lld stop\n", (long long) o.max_context);
         std::fflush(stdout);
@@ -504,9 +505,8 @@ private:
 
     void progress_line(const char* tag, int64_t at_pos) {
         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
-        std::printf("%s %lld %lld %.0f %.1f\n", tag, (long long) at_pos, (long long) n, ms,
-                    ms > 0.0 ? 1000.0 * (double) (at_pos - resume) / ms : 0.0);
-        std::fflush(stdout);
+        basalt::protocol::emit("%s %lld %lld %.0f %.1f\n", tag, (long long) at_pos, (long long) n, ms,
+                               ms > 0.0 ? 1000.0 * (double) (at_pos - resume) / ms : 0.0);
     }
 
     SessionRuntime& rt_;
@@ -566,7 +566,7 @@ bool SessionRuntime::next_batch_window() {
         ++sl.produced;
         ++sl.p;
         sl.x = y;
-        std::printf("BT %d %d\n", b, (int) y);
+        basalt::protocol::emit("BT %d %d\n", b, (int) y);
         basalt::core::progress_beat();
         const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
         const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new || sl.p + 2 > o.max_context ? "length" : nullptr;
