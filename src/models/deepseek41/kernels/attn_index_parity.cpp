@@ -172,7 +172,8 @@ uint64_t fnv(uint64_t h, const void* p, size_t n) {
 // The bf16 projections and the compressor's rows, index keys and state at the real geometry hash to the bits of the
 // kernels they replaced (frozen): their sums are bitwise-neutral.
 void test_frozen(Verdict& v) {
-    constexpr uint64_t kGemv = 0xbcf5bf9e8c0478ccull, kComp = 0xf66492ac94ff28d9ull;
+    const uint64_t kGemv = frozen_for_device(0xbcf5bf9e8c0478ccull, 0x258e734e874cae57ull);
+    const uint64_t kComp = frozen_for_device(0xf66492ac94ff28d9ull, 0xd2ec8ec03dfea810ull);
     uint64_t hg = 1469598103934665603ull, hc = hg;
     const auto x = randn((size_t) kMaxT * D, 61, 1.f);
     Dev<float> dx(x);

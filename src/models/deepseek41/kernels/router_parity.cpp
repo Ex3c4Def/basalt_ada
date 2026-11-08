@@ -140,7 +140,7 @@ int main(int argc, char** argv) {
     // ---- frozen: the ids and weights of many tokens hash to the bits of the kernel the selection replaced, here and
     // with every expert twinned (ties everywhere)
     {
-        constexpr uint64_t kFrozen = 0x3634b0999cf64e2aull;
+        const uint64_t kFrozen = frozen_for_device(0x3634b0999cf64e2aull, 0xf4ec7c76f483174cull);
         uint64_t h = 1469598103934665603ull;
         const auto fnv = [&](const void* p, size_t n) {
             const uint8_t* b = static_cast<const uint8_t*>(p);

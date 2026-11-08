@@ -27,6 +27,16 @@ inline void check(cudaError_t e, const char* what) {
     }
 }
 
+// A frozen hash for the current card. `frozen` holds the replaced kernel's bits as upstream froze them (compute
+// capability 9.0 and up); `ada` holds the same replaced kernel's bits on an RTX 4090 (compute capability 8.9, CUDA 13.4),
+// which rounds differently. On either card the replacing kernel must keep the replaced kernel's bits.
+inline uint64_t frozen_for_device(uint64_t frozen, uint64_t ada) {
+    int dev = 0, major = 0;
+    check(cudaGetDevice(&dev), "cudaGetDevice");
+    check(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev), "compute capability");
+    return major >= 9 ? frozen : ada;
+}
+
 template <class T>
 struct Dev {
     T* p = nullptr;

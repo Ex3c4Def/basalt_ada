@@ -97,7 +97,7 @@ int main() {
             o_ref[(size_t) p * kOut + r] = (float) row_dot(&down[((size_t) ids[p] * kOut + r) * mxfp4_row_bytes(kFF)], &h_got[(size_t) p * kFF], kFF);
     verdict("moe down", dstest::compare(dout.down(), o_ref, 1e-2), 1e-4);
     {   // frozen: the hidden state and the outputs hash to the bits of the kernels that read one row per warp
-        constexpr uint64_t kFrozen = 0x5970ce9413f8b809ull;
+        const uint64_t kFrozen = dstest::frozen_for_device(0x5970ce9413f8b809ull, 0xc7b1acee87ad0e77ull);
         uint64_t hh = 1469598103934665603ull;
         for (const auto& v : {h_got, dout.down()}) {
             const uint8_t* b = reinterpret_cast<const uint8_t*>(v.data());

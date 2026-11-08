@@ -84,6 +84,11 @@ the fallback so the trap is never launched.
   the cluster form's bits (`block_sum`'s extra warps add zeros). sm_120a's SASS of attn_index.cu is unchanged apart from the
   added kernel. Its `ds41_*` parity tests (`-DBUILD_TESTING=ON`) pass on a 4090 at 450 W, the peer test only with one card.
   No pack has been run, so end-to-end output, quality and speed are unmeasured.
+- Frozen hashes: `ds41_router_parity`, `ds41_attn_index_parity` (gemv_bf16, compressor rows and keys) and
+  `ds41_dspark_parity` hash a kernel's output against the bits of the kernel it replaced, frozen upstream on Blackwell.
+  On the 4090 the replaced kernels (fork_4090's sources before 0.3.1+13) give other bits, and their replacements give
+  exactly those: router f4ec7c76f483174c, gemv 258e734e874cae57, compressor d2ec8ec03dfea810, DSpark MoE c7b1acee87ad0e77.
+  `frozen_for_device` (kernels/test_util.hpp) uses these below 9.0, upstream's values from 9.0 up.
 - Draft reads: on 8.9 the draft graphs' hyper-connection reads, their router and q8_1 rows run as one kernel,
   `hc_fused_ada` (hc_fused_ada.cu), where `hc_fused` does not run. Verify stays on `k_hc_ada`, and `--exp hc_fused_ada=0`
   keeps the separate kernels. A one-row read now takes fused_gr_read_multi's bits instead of gr_read's, which only the
