@@ -31,6 +31,7 @@
 #include <mma.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cfloat>
 #include <cmath>
 #include <stdexcept>
@@ -277,13 +278,51 @@ __device__ __forceinline__ float index_key_row(const uint16_t* __restrict__ w, c
     return warp_sum(acc);
 }
 
+// Stage: the key from its projection `y` (kIdxDim values), by the whole block: rms_norm, norm_w, the rotation at the
+// group's first position, the store into row `row` of the index cache. The threads past the key add zeros to the sum.
+__device__ __forceinline__ void index_key_finish(float* y, float* red, int t, int row, const int32_t* __restrict__ pos,
+                                                 int ratio, float eps, const float* __restrict__ norm_w,
+                                                 const float* __restrict__ freq, uint8_t* __restrict__ comp_ik,
+                                                 bool packed) {
+    const float v = threadIdx.x < kIdxDim ? y[threadIdx.x] : 0.f;
+    const float ss = block_sum(v * v, red);   // the threads past the key add zeros
+    const float r = 1.0f / sqrtf(ss / kIdxDim + eps);
+    if (threadIdx.x < kIdxDim) y[threadIdx.x] = v * r * norm_w[threadIdx.x];
+    __syncthreads();
+    if (threadIdx.x < kIdxDim) {
+        const int c = threadIdx.x;
+        float o = y[c];
+        if (c >= kIdxDim - kRopeDim) {
+            const int p = (c - (kIdxDim - kRopeDim)) >> 1;
+            float x0 = y[kIdxDim - kRopeDim + 2 * p], x1 = y[kIdxDim - kRopeDim + 2 * p + 1];
+            rotate_pair(x0, x1, (float) (pos[t] + 1 - ratio), freq[p]);
+            o = (c & 1) ? x1 : x0;
+        }
+        put_idx(o, c, comp_ik, (size_t) row, packed);
+    }
+}
+
+// Thread-block clusters (distributed shared memory, barrier.cluster) exist from compute capability 9.0. Below it (the
+// 8.9 build, or any device pass under 9.0) index_key_kernel has no cluster attribute and traps if it is ever launched;
+// index_keys() runs index_key_block_kernel there instead. BASALT_ARCH_BELOW_SM90 is CMake's: a build with no
+// architecture of 9.0 or up.
+#if defined(BASALT_ARCH_BELOW_SM90) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900)
+#define KEY_NO_CLUSTER 1
+#define KEY_CLUSTER_DIMS
+#else
+#define KEY_CLUSTER_DIMS __cluster_dims__(kKeyBlocks, 1, 1)
+#endif
+
 // Index key of a closed group: rms_norm(w_idx_k . comp) * norm_w, rotated at the group's first position. A cluster
 // of kKeyBlocks blocks per token splits the projection's rows; block 0 gathers them and finishes the key.
-__global__ void __cluster_dims__(kKeyBlocks, 1, 1) __launch_bounds__(32 * kKeyRows)
+__global__ void KEY_CLUSTER_DIMS __launch_bounds__(32 * kKeyRows)
 index_key_kernel(const float* __restrict__ comp_pre, const int32_t* __restrict__ row_of,
                  const int32_t* __restrict__ pos, int ratio, float eps,
                  const uint16_t* __restrict__ w, const float* __restrict__ norm_w,
                  const float* __restrict__ freq, uint8_t* __restrict__ comp_ik, bool packed) {
+#ifdef KEY_NO_CLUSTER
+    __trap();
+#else
     const int t = blockIdx.y;
     const int row = row_of[t];
     if (row < 0) return;   // the whole cluster: it is one token's
@@ -302,22 +341,32 @@ index_key_kernel(const float* __restrict__ comp_pre, const int32_t* __restrict__
     if (rank == 0 && threadIdx.x < kIdxDim) y[threadIdx.x] = cl.map_shared_rank(part, threadIdx.x / kKeyRows)[threadIdx.x % kKeyRows];
     cl.sync();   // the other blocks' rows are read: they may go
     if (rank != 0) return;
-    const float v = threadIdx.x < kIdxDim ? y[threadIdx.x] : 0.f;
-    const float ss = block_sum(v * v, red);   // the threads past the key add zeros
-    const float r = 1.0f / sqrtf(ss / kIdxDim + eps);
-    if (threadIdx.x < kIdxDim) y[threadIdx.x] = v * r * norm_w[threadIdx.x];
+    index_key_finish(y, red, t, row, pos, ratio, eps, norm_w, freq, comp_ik, packed);
+#endif
+}
+
+// index_key_kernel without a cluster, for compute capability under 9.0: a block per token whose warps take the
+// projection's rows in turn (index_key_row), then the same finish. Each row is one warp's sum in the same order, and
+// block_sum's extra warps add zeros, so the key has the cluster form's bits.
+__global__ void __launch_bounds__(256)
+index_key_block_kernel(const float* __restrict__ comp_pre, const int32_t* __restrict__ row_of,
+                       const int32_t* __restrict__ pos, int ratio, float eps,
+                       const uint16_t* __restrict__ w, const float* __restrict__ norm_w,
+                       const float* __restrict__ freq, uint8_t* __restrict__ comp_ik, bool packed) {
+    const int t = blockIdx.x;
+    const int row = row_of[t];
+    if (row < 0) return;
+    __shared__ float x[kLatent];
+    __shared__ float y[kIdxDim];
+    __shared__ float red[32];
+    for (int i = threadIdx.x; i < kLatent; i += blockDim.x) x[i] = comp_pre[(size_t) t * kLatent + i];
     __syncthreads();
-    if (threadIdx.x < kIdxDim) {
-        const int c = threadIdx.x;
-        float o = y[c];
-        if (c >= kIdxDim - kRopeDim) {
-            const int p = (c - (kIdxDim - kRopeDim)) >> 1;
-            float x0 = y[kIdxDim - kRopeDim + 2 * p], x1 = y[kIdxDim - kRopeDim + 2 * p + 1];
-            rotate_pair(x0, x1, (float) (pos[t] + 1 - ratio), freq[p]);
-            o = (c & 1) ? x1 : x0;
-        }
-        put_idx(o, c, comp_ik, (size_t) row, packed);
+    for (int o = threadIdx.x >> 5; o < kIdxDim; o += blockDim.x >> 5) {
+        const float p = index_key_row(w, x, o);
+        if ((threadIdx.x & 31) == 0) y[o] = p;
     }
+    __syncthreads();
+    index_key_finish(y, red, t, row, pos, ratio, eps, norm_w, freq, comp_ik, packed);
 }
 
 // ---- indexer --------------------------------------------------------------------------------------------------
@@ -1011,9 +1060,41 @@ void kv_window(const float* kv_raw, const float* norm_w, const int32_t* pos, int
 }
 
 namespace {
+// Whether the current device runs index_key_kernel's cluster form: compute capability 9.0 or up, in a build with code
+// for it. Otherwise index_key_block_kernel computes the same key.
+bool key_clusters() {
+#ifdef BASALT_ARCH_BELOW_SM90
+    return false;
+#else
+    static std::atomic<signed char> known[64];   // per device: 0 unknown, 1 no, 2 yes
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    signed char k = known[dev].load(std::memory_order_acquire);
+    if (k == 0) {
+        int major = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        k = major >= 9 ? 2 : 1;
+        known[dev].store(k, std::memory_order_release);
+    }
+    return k == 2;
+#endif
+}
+
 // The index keys of the groups the call closed.
 void index_keys(const CompressArgs& a, const float* pre, const int32_t* row_of, const int32_t* pos, int n_tokens,
                 cudaStream_t s) {
+    if (!key_clusters()) {
+        index_key_block_kernel<<<n_tokens, 256, 0, s>>>(pre, row_of, pos, a.ratio, a.rms_eps, a.w_idx_k, a.idx_k_norm_w,
+                                                        a.rope_freq, a.comp_ik, a.format == CacheFormat::Fp8);
+        check_launch("index_key");
+        return;
+    }
     index_key_kernel<<<dim3(kKeyBlocks, n_tokens), 32 * kKeyRows, 0, s>>>(pre, row_of, pos, a.ratio, a.rms_eps, a.w_idx_k,
                                                                           a.idx_k_norm_w, a.rope_freq, a.comp_ik,
                                                                           a.format == CacheFormat::Fp8);

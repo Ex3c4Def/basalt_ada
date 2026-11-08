@@ -77,9 +77,13 @@ the fallback so the trap is never launched.
 - Comparing the quality gate across builds: its rows follow the GPU slots, and a bigger binary leaves less VRAM (6491 slots
   against 6515 changed nearly every row, KLD 0.0620 against 0.0619). Fix `--expert-cache` when comparing; with it equal the
   rows are byte-identical.
-- DeepSeek-V4.1 on 8.9: its code has no architecture guards, and it uses no clusters, bulk copies, griddepcontrol or FP4
-  tensor cores; DSpark decodes MXFP4 in software. Its `ds41_*` parity tests (`-DBUILD_TESTING=ON`) pass on a 4090 at 450 W,
-  the peer test only with one card. No pack has been run, so end-to-end output, quality and speed are unmeasured.
+- DeepSeek-V4.1 on 8.9: its code uses no bulk copies, griddepcontrol or FP4 tensor cores; DSpark decodes MXFP4 in
+  software. Since upstream 0.3.1+13 one kernel uses a cluster: the index key (`index_key_kernel`, attn_index.cu, eight
+  blocks a token). Below 9.0 it compiles without its cluster and traps, and `index_keys()` runs `index_key_block_kernel`
+  instead: a block a token, the same row sums (`index_key_row`) and the same finish (`index_key_finish`), so the keys keep
+  the cluster form's bits (`block_sum`'s extra warps add zeros). sm_120a's SASS of attn_index.cu is unchanged apart from the
+  added kernel. Its `ds41_*` parity tests (`-DBUILD_TESTING=ON`) pass on a 4090 at 450 W, the peer test only with one card.
+  No pack has been run, so end-to-end output, quality and speed are unmeasured.
 - Draft reads: on 8.9 the draft graphs' hyper-connection reads, their router and q8_1 rows run as one kernel,
   `hc_fused_ada` (hc_fused_ada.cu), where `hc_fused` does not run. Verify stays on `k_hc_ada`, and `--exp hc_fused_ada=0`
   keeps the separate kernels. A one-row read now takes fused_gr_read_multi's bits instead of gr_read's, which only the
