@@ -1,6 +1,7 @@
 // tests/program/gpu_select_test.cpp - the gpu setting over fake card tables: parsing, the card choice, the roles.
 #include "basalt/program/gpu_select.hpp"
 
+#include "basalt/build_archs.hpp"
 #include "basalt/platform/process.hpp"
 
 #include <cstdio>
@@ -191,6 +192,17 @@ int main() {
         const std::vector<int> o4 = spread_experts(mixed, {{16, 448}, {16, 448}, {16, 448}, {200, 1792}});
         CHECK_STR(owners(o4), "012333333333");
         CHECK_STR(owners(spread_experts(eq, {{0, 1}, {0, 1}, {0, 1}})), "--------");
+    }
+    // The architecture list a build holds device code for (build_archs.hpp): a Blackwell main card with an Ada tier
+    // card needs both entries; suffixes after the number do not count.
+    {
+        CHECK(basalt::arch_list_has("120,89", 12, 0) && basalt::arch_list_has("120,89", 8, 9));
+        CHECK(basalt::arch_list_has("89", 8, 9) && !basalt::arch_list_has("89", 12, 0));
+        CHECK(basalt::arch_list_has("120", 12, 0) && !basalt::arch_list_has("120", 8, 9));
+        CHECK(basalt::arch_list_has("120a-real,89-real", 12, 0) && basalt::arch_list_has("120a-real,89-real", 8, 9));
+        CHECK(!basalt::arch_list_has("120,89", 8, 6) && !basalt::arch_list_has("120,89", 9, 0));
+        CHECK(!basalt::arch_list_has("", 12, 0) && !basalt::arch_list_has("1200", 12, 0));
+        CHECK(basalt::build_has_arch(12, 0) == basalt::arch_list_has(basalt::build_archs(), 12, 0));
     }
     if (g_fail) { std::printf("gpu_select_test: %d failures\n", g_fail); return 1; }
     std::printf("gpu_select_test: ok\n");

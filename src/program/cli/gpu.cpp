@@ -1,5 +1,6 @@
 #include "gpu.hpp"
 
+#include "basalt/build_archs.hpp"
 #include "basalt/log.hpp"
 #include "basalt/program/options.hpp"
 
@@ -39,6 +40,22 @@ std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_ca
         basalt::log::error("basalt", "gpu %s: CUDA sees %d of the %zu GPUs chosen", o.gpu.empty() ? "0" : o.gpu.c_str(),
                            seen, choice.cards.size());
         return 2;
+    }
+    // every chosen card needs device code of its own architecture in this build (build_archs.hpp)
+    for (int d = 0; d < (int) choice.cards.size(); ++d) {
+        int major = 0, minor = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, d) != cudaSuccess ||
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, d) != cudaSuccess) {
+            (void) cudaGetLastError();
+            continue;   // device_info's own check stops the start then
+        }
+        if (!basalt::build_has_arch(major, minor)) {
+            const int i = choice.cards[(size_t) d];
+            basalt::log::error("basalt", "gpu: %s is sm_%d%d and this build has device code for %s only; build with "
+                                         "-DCMAKE_CUDA_ARCHITECTURES=\"120;89\" for Blackwell and Ada cards together",
+                               bp::gpu_label(visible, i).c_str(), major, minor, basalt::build_archs());
+            return 2;
+        }
     }
     bp::RoleInputs ri;
     for (int i : choice.cards) ri.cards.push_back((size_t) i < visible.size() ? visible[(size_t) i] : bp::GpuCard{});

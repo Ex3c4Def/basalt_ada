@@ -1,5 +1,6 @@
 // src/core/device.cu - the CUDA side of the runtime core.
 #include "basalt/core/device.hpp"
+#include "basalt/build_archs.hpp"
 #include "basalt/platform/dynlib.hpp"
 
 #include <cuda_runtime.h>
@@ -182,6 +183,14 @@ DeviceInfo device_info(int ordinal) {
     if (!cc_ok) {
         throw CudaError("device " + d.name + " reports compute capability " + std::to_string(d.cc_major) + "." +
                             std::to_string(d.cc_minor) + "; basalt needs an NVIDIA GPU of compute capability 12.0 or 8.9",
+                        -1);
+    }
+    // and only for the architectures it was built for (build_archs.hpp): another one would run lower PTX with the
+    // code its paths need compiled out
+    if (!basalt::build_has_arch(d.cc_major, d.cc_minor)) {
+        throw CudaError("device " + d.name + " is sm_" + std::to_string(d.cc_major) + std::to_string(d.cc_minor) +
+                            " and this build has device code for " + basalt::build_archs() +
+                            " only; build with -DCMAKE_CUDA_ARCHITECTURES=\"120;89\" for Blackwell and Ada cards together",
                         -1);
     }
     return d;

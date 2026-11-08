@@ -23,7 +23,6 @@
 #include "basalt/log.hpp"
 #include <cuda_runtime.h>
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <string>
@@ -155,21 +154,25 @@ bool fused_layout(size_t T, bool src) {
 struct MoeBufs { size_t gu, h, xq, hq; };
 // An NVFP4 pack's prompt experts run on the FP4 tensor cores: the activation planes, token scales and tile tables sit
 // in Xq (the layer's rows) and Hq (one group's H, a group of up to MMQ_GROUP experts).
+// Only when every card the engine uses has them (compute capability 12.x). The process sees only its own cards
+// (gpu_select's CUDA_VISIBLE_DEVICES), so a Blackwell main card with an Ada tier card reads every prompt chunk through
+// MMQ on both: the buffers, the chunk plan, the peer's share and each row's rounding then do not depend on which card
+// reads a layer, and the decisions made once on the main card (fp4_pack, fp4_every_layer) hold on every card.
 bool fp4_tensor_cores() {
-    static std::atomic<signed char> known[64];   // per device: 0 unknown, 1 yes, -1 no
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { (void) cudaGetLastError(); return false; }
-    signed char k = known[dev].load(std::memory_order_acquire);
-    if (k == 0) {
-        int major = 0;
-        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
-            (void) cudaGetLastError();
-            return false;
+    static const bool every = [] {
+        int n = 0;
+        if (cudaGetDeviceCount(&n) != cudaSuccess || n < 1) { (void) cudaGetLastError(); return false; }
+        for (int dev = 0; dev < n; ++dev) {
+            int major = 0;
+            if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+                (void) cudaGetLastError();
+                return false;
+            }
+            if (major < 12) return false;
         }
-        k = major >= 12 ? 1 : -1;
-        known[dev].store(k, std::memory_order_release);
-    }
-    return k > 0;
+        return true;
+    }();
+    return every;
 }
 bool fp4_pack() {
     static const bool any = [] {

@@ -54,6 +54,10 @@ if(NOT _basalt_has_sm90)
   # Nothing in the build has thread-block clusters (dec_gdn_rec.cu drops __cluster_dims__ in every compile pass).
   add_compile_definitions($<$<COMPILE_LANGUAGE:CUDA>:BASALT_ARCH_BELOW_SM90=1>)
 endif()
+# The architectures the build holds device code for (include/basalt/build_archs.hpp): the engine refuses a card of
+# another one at start. A Blackwell main card with an Ada tier card needs both: -DCMAKE_CUDA_ARCHITECTURES="120;89".
+string(REPLACE ";" "," _basalt_arch_list "${CMAKE_CUDA_ARCHITECTURES}")
+add_compile_definitions(BASALT_CUDA_ARCHS="${_basalt_arch_list}")
 if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
   message(FATAL_ERROR "CUDA ${CMAKE_CUDA_COMPILER_VERSION}: basalt needs CUDA 13.0 or newer")
 endif()
