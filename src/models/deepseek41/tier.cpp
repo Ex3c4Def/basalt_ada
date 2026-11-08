@@ -49,14 +49,12 @@ ExpertTier::~ExpertTier() {
         worker_.join();
     }
     report("final");
+    flush_queue();
     if (peer_ && !peer_moves_.empty()) {
         std::string e;
         peer_->read_wait(e);
     }
-    if (copy_stream_) {
-        flush_queue();
-        cudaStreamSynchronize(copy_stream_);
-    }
+    if (copy_stream_) cudaStreamSynchronize(copy_stream_);
     if (fetch_stream_) cudaStreamSynchronize(fetch_stream_);
     for (cudaEvent_t e : events_) cudaEventDestroy(e);
     if (fetch_ev_) cudaEventDestroy(fetch_ev_);
@@ -276,7 +274,7 @@ public:
         for (int64_t e = 0; e < env.n_expert && (int) ids_.size() < 8; ++e)
             if (peer_.slot_ptr(0, e) != nullptr) ids_.push_back((int32_t) e);
         if (ids_.empty()) { why = "no_experts_on_peer"; return false; }
-        if (!x_.alloc((size_t) f.n_embd * sizeof(float), cudaHostAllocPortable)) { why = "alloc_failed"; return false; }
+        if (!x_.alloc((size_t) f.n_embd * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped)) { why = "alloc_failed"; return false; }
         std::mt19937 rng(5);
         std::normal_distribution<float> nd(0.f, 1.f);
         for (int64_t i = 0; i < f.n_embd; ++i) ((float*) x_.p)[i] = nd(rng);
@@ -528,6 +526,7 @@ void ExpertTier::drain() {
     }
     pending_.clear();
     if (peer_moves_.empty()) return;
+    pump_peer(kAllPieces);
     std::string err;
     peer_->read_wait(err);
     for (const PeerMove& m : peer_moves_) {
@@ -770,11 +769,13 @@ bool ExpertTier::move_to_peer(int layer, int e, const uint8_t* src) {
     }
     uint64_t on_main = ~0ull;
     oldest_slot(layer, /*homes_too=*/true, on_main);
-    if (slot < 0 || oldest >= on_main) return false;
+    // the second card computes an expert ~3.6x slower than the main card: a promotion goes there only when what it
+    // replaces has gone unused well longer than the main card's oldest
+    if (slot < 0 || oldest + policy::kPeerMoveAge >= on_main) return false;
     const int32_t place = spare_[(size_t) layer];
     spare_[(size_t) layer] = -1;
     const uint64_t bytes = m_.pack().experts[(size_t) layer].blob_bytes;
-    peer_->exchange_slot(slot, ram_[(size_t) layer] + (size_t) place * bytes, src, bytes);
+    peer_queue_.push_back({slot, ram_[(size_t) layer] + (size_t) place * bytes, src, bytes});
     peer_moves_.push_back({layer, e, peer_owner_[(size_t) slot], slot, place});
     peer_owner_[(size_t) slot] = e;
     ++promoted_;
@@ -823,12 +824,30 @@ int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t str
 }
 
 void ExpertTier::mark_gap(cudaStream_t main) {
-    gap_marked_ = !queue_.empty() && cudaEventRecord(gap_ev_, main) == cudaSuccess;
+    gap_marked_ = (!queue_.empty() || !peer_queue_.empty()) && cudaEventRecord(gap_ev_, main) == cudaSuccess;
+}
+
+void ExpertTier::pump_peer(int pieces) {
+    size_t done = 0;
+    for (; done < peer_queue_.size() && pieces > 0; ++done) {
+        PeerQueued& q = peer_queue_[done];
+        for (; q.out_off < q.bytes && pieces > 0; q.out_off += policy::kPieceBytes, --pieces)
+            peer_->slot_out(q.slot, q.to, q.out_off, std::min(policy::kPieceBytes, q.bytes - q.out_off));
+        for (; q.out_off >= q.bytes && q.in_off < q.bytes && pieces > 0; q.in_off += policy::kPieceBytes, --pieces)
+            peer_->slot_in(q.slot, q.from, q.in_off, std::min(policy::kPieceBytes, q.bytes - q.in_off));
+        if (q.in_off < q.bytes) break;
+    }
+    peer_queue_.erase(peer_queue_.begin(), peer_queue_.begin() + (std::ptrdiff_t) done);
 }
 
 void ExpertTier::pump(int pieces) {
-    if (gap_marked_) cudaStreamWaitEvent(copy_stream_, gap_ev_, 0);
+    if (gap_marked_) {
+        cudaStreamWaitEvent(copy_stream_, gap_ev_, 0);
+        if (!peer_queue_.empty()) peer_->copies_after(gap_ev_);
+    }
     gap_marked_ = false;
+    // the second card's own bus: what one head leaves it (the rest at the window's end)
+    if (!peer_queue_.empty()) pump_peer(pieces == kAllPieces ? pieces : std::min(pieces, policy::kPeerGapPieces));
     if (queue_.empty()) return;
     size_t done = 0;
     for (; done < queue_.size() && pieces > 0; ++done) {

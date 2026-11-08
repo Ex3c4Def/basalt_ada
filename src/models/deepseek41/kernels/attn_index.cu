@@ -27,6 +27,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cooperative_groups.h>
 #include <mma.h>
 
 #include <algorithm>
@@ -62,6 +63,8 @@ void rope_freq_table(const RopeParams& p, float* out) {
 
 namespace {
 
+namespace cg = cooperative_groups;
+
 constexpr int kNoRow = -1;
 
 __device__ __forceinline__ float warp_sum(float v) {
@@ -96,38 +99,55 @@ __device__ __forceinline__ void rotate_pair(float& x0, float& x1, float pos, flo
 
 // ---- gemv -----------------------------------------------------------------------------------------------------
 
-// One warp per output row; the weights are read once for all tokens.
-__global__ void gemv_bf16_kernel(const uint16_t* __restrict__ w, const float* __restrict__ x, int n_tokens, int in,
-                                 int out, float* __restrict__ y) {
-    const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
-    const int lane = threadIdx.x & 31;
-    if (row >= out) return;
-    float acc[kMaxT] = {};
+constexpr int kGemvWarps = 4;   // warps per block
+constexpr int kGemvAhead = 4;   // weight chunks a lane loads before it sums them
+
+// Stage: output `row` of token `t`, one warp. Lane l sums the 8-wide chunks l, l + 32, ... in order and the warp then
+// sums the lanes, so a (row, token) pair has the same sum whichever warp computes it.
+__device__ __forceinline__ void gemv_bf16_row(const uint16_t* __restrict__ w, const float* __restrict__ x, int in,
+                                              int out, int row, int t, float* __restrict__ y) {
+    const int lane = threadIdx.x & 31, n8 = in / 8;
     const uint4* wr = reinterpret_cast<const uint4*>(w + (size_t) row * in);
-    for (int c = lane; c < in / 8; c += 32) {
-        const uint4 q = wr[c];
-        const uint32_t u[4] = {q.x, q.y, q.z, q.w};
-        float wf[8];
+    const float* xt = x + (size_t) t * in;
+    float acc = 0.f;
+    for (int c0 = lane; c0 < n8; c0 += 32 * kGemvAhead) {
+        uint4 q[kGemvAhead];
+        float4 a[kGemvAhead], b[kGemvAhead];
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            wf[2 * i] = __uint_as_float(u[i] << 16);
-            wf[2 * i + 1] = __uint_as_float(u[i] & 0xffff0000u);
-        }
-#pragma unroll
-        for (int t = 0; t < kMaxT; ++t) {
-            if (t < n_tokens) {
-                const float4 a = *reinterpret_cast<const float4*>(x + (size_t) t * in + c * 8);
-                const float4 b = *reinterpret_cast<const float4*>(x + (size_t) t * in + c * 8 + 4);
-                acc[t] += wf[0] * a.x + wf[1] * a.y + wf[2] * a.z + wf[3] * a.w + wf[4] * b.x + wf[5] * b.y +
-                          wf[6] * b.z + wf[7] * b.w;
+        for (int k = 0; k < kGemvAhead; ++k) {
+            const int c = c0 + 32 * k;
+            if (c < n8) {
+                q[k] = wr[c];
+                a[k] = *reinterpret_cast<const float4*>(xt + c * 8);
+                b[k] = *reinterpret_cast<const float4*>(xt + c * 8 + 4);
             }
         }
-    }
 #pragma unroll
-    for (int t = 0; t < kMaxT; ++t) {
-        const float s = warp_sum(acc[t]);
-        if (lane == 0 && t < n_tokens) y[(size_t) t * out + row] = s;
+        for (int k = 0; k < kGemvAhead; ++k) {
+            if (c0 + 32 * k >= n8) break;
+            const uint32_t u[4] = {q[k].x, q[k].y, q[k].z, q[k].w};
+            float wf[8];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                wf[2 * i] = __uint_as_float(u[i] << 16);
+                wf[2 * i + 1] = __uint_as_float(u[i] & 0xffff0000u);
+            }
+            acc += wf[0] * a[k].x + wf[1] * a[k].y + wf[2] * a[k].z + wf[3] * a[k].w + wf[4] * b[k].x +
+                   wf[5] * b[k].y + wf[6] * b[k].z + wf[7] * b[k].w;
+        }
     }
+    const float s = warp_sum(acc);
+    if (lane == 0) y[(size_t) t * out + row] = s;
+}
+
+// A warp per (output row, token): the tokens of a row run on neighbouring warps and share its weight reads in cache.
+__global__ void __launch_bounds__(32 * kGemvWarps)
+gemv_bf16_kernel(const uint16_t* __restrict__ w, const float* __restrict__ x, int n_tokens, int in, int out,
+                 float* __restrict__ y) {
+    const int g = blockIdx.x * kGemvWarps + (threadIdx.x >> 5);
+    const int row = g / n_tokens;
+    if (row >= out) return;
+    gemv_bf16_row(w, x, in, out, row, g - row * n_tokens, y);
 }
 
 inline cudaStream_t as_stream(void* s) { return static_cast<cudaStream_t>(s); }
@@ -242,29 +262,48 @@ __global__ void compress_kernel(const float* __restrict__ ckv, const float* __re
     }
 }
 
-// Index key of a closed group: rms_norm(w_idx_k . comp) * norm_w, rotated at the group's first position.
-__global__ void index_key_kernel(const float* __restrict__ comp_pre, const int32_t* __restrict__ row_of,
-                                 const int32_t* __restrict__ pos, int ratio, float eps,
-                                 const uint16_t* __restrict__ w, const float* __restrict__ norm_w,
-                                 const float* __restrict__ freq, uint8_t* __restrict__ comp_ik, bool packed) {
-    const int t = blockIdx.x;
+constexpr int kKeyBlocks = 8;                     // a cluster per token
+constexpr int kKeyRows = kIdxDim / kKeyBlocks;     // rows of the key per block, a warp each
+
+// Stage: row `o` of the key's projection, one warp; lane l sums the inputs l, l + 32, ... in order.
+__device__ __forceinline__ float index_key_row(const uint16_t* __restrict__ w, const float* x, int o) {
+    const int lane = threadIdx.x & 31;
+    uint16_t q[kLatent / 32];
+#pragma unroll
+    for (int k = 0; k < kLatent / 32; ++k) q[k] = w[(size_t) o * kLatent + lane + 32 * k];
+    float acc = 0.f;
+#pragma unroll
+    for (int k = 0; k < kLatent / 32; ++k) acc += bf16_to_f32(q[k]) * x[lane + 32 * k];
+    return warp_sum(acc);
+}
+
+// Index key of a closed group: rms_norm(w_idx_k . comp) * norm_w, rotated at the group's first position. A cluster
+// of kKeyBlocks blocks per token splits the projection's rows; block 0 gathers them and finishes the key.
+__global__ void __cluster_dims__(kKeyBlocks, 1, 1) __launch_bounds__(32 * kKeyRows)
+index_key_kernel(const float* __restrict__ comp_pre, const int32_t* __restrict__ row_of,
+                 const int32_t* __restrict__ pos, int ratio, float eps,
+                 const uint16_t* __restrict__ w, const float* __restrict__ norm_w,
+                 const float* __restrict__ freq, uint8_t* __restrict__ comp_ik, bool packed) {
+    const int t = blockIdx.y;
     const int row = row_of[t];
-    if (row < 0) return;
+    if (row < 0) return;   // the whole cluster: it is one token's
+    cg::cluster_group cl = cg::this_cluster();
+    const int rank = (int) cl.block_rank();
     __shared__ float x[kLatent];
+    __shared__ float part[kKeyRows];
     __shared__ float y[kIdxDim];
     __shared__ float red[32];
     for (int i = threadIdx.x; i < kLatent; i += blockDim.x) x[i] = comp_pre[(size_t) t * kLatent + i];
     __syncthreads();
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
-    for (int o = warp; o < kIdxDim; o += nw) {
-        float acc = 0.f;
-        for (int i = lane; i < kLatent; i += 32) acc += bf16_to_f32(w[(size_t) o * kLatent + i]) * x[i];
-        acc = warp_sum(acc);
-        if (lane == 0) y[o] = acc;
-    }
-    __syncthreads();
+    const int warp = threadIdx.x >> 5;
+    const float p = index_key_row(w, x, rank * kKeyRows + warp);
+    if ((threadIdx.x & 31) == 0) part[warp] = p;
+    cl.sync();
+    if (rank == 0 && threadIdx.x < kIdxDim) y[threadIdx.x] = cl.map_shared_rank(part, threadIdx.x / kKeyRows)[threadIdx.x % kKeyRows];
+    cl.sync();   // the other blocks' rows are read: they may go
+    if (rank != 0) return;
     const float v = threadIdx.x < kIdxDim ? y[threadIdx.x] : 0.f;
-    const float ss = block_sum(v * v, red);
+    const float ss = block_sum(v * v, red);   // the threads past the key add zeros
     const float r = 1.0f / sqrtf(ss / kIdxDim + eps);
     if (threadIdx.x < kIdxDim) y[threadIdx.x] = v * r * norm_w[threadIdx.x];
     __syncthreads();
@@ -958,7 +997,8 @@ __global__ void compress_state_kernel(const float* __restrict__ ckv, const float
 
 void gemv_bf16(const uint16_t* w, const float* x, int n_tokens, int in, int out, float* y, void* stream) {
     if (n_tokens < 1 || n_tokens > kMaxT || in % 8) throw std::invalid_argument("gemv_bf16: bad shape");
-    gemv_bf16_kernel<<<(out + 7) / 8, 256, 0, as_stream(stream)>>>(w, x, n_tokens, in, out, y);
+    gemv_bf16_kernel<<<(out * n_tokens + kGemvWarps - 1) / kGemvWarps, 32 * kGemvWarps, 0, as_stream(stream)>>>(
+        w, x, n_tokens, in, out, y);
     check_launch("gemv_bf16");
 }
 
@@ -969,6 +1009,17 @@ void kv_window(const float* kv_raw, const float* norm_w, const int32_t* pos, int
                                                                   fmt == CacheFormat::Fp8);
     check_launch("kv_window");
 }
+
+namespace {
+// The index keys of the groups the call closed.
+void index_keys(const CompressArgs& a, const float* pre, const int32_t* row_of, const int32_t* pos, int n_tokens,
+                cudaStream_t s) {
+    index_key_kernel<<<dim3(kKeyBlocks, n_tokens), 32 * kKeyRows, 0, s>>>(pre, row_of, pos, a.ratio, a.rms_eps, a.w_idx_k,
+                                                                          a.idx_k_norm_w, a.rope_freq, a.comp_ik,
+                                                                          a.format == CacheFormat::Fp8);
+    check_launch("index_key");
+}
+}  // namespace
 
 size_t compress_workspace_bytes() { return (size_t) kMaxT * (3 * kLatent * sizeof(float) + sizeof(int32_t)) + 256; }
 
@@ -986,9 +1037,7 @@ void compress(const CompressArgs& a, const float* x, const int32_t* pos, int n_t
                                           a.comp_kv, pre, row_of, a.format == CacheFormat::Fp8);
     check_launch("compress");
     if (a.w_idx_k && a.comp_ik) {
-        index_key_kernel<<<n_tokens, 256, 0, s>>>(pre, row_of, pos, a.ratio, a.rms_eps, a.w_idx_k, a.idx_k_norm_w,
-                                                  a.rope_freq, a.comp_ik, a.format == CacheFormat::Fp8);
-        check_launch("index_key");
+        index_keys(a, pre, row_of, pos, n_tokens, s);
     }
 }
 
@@ -1007,9 +1056,7 @@ void compress_window(const CompressArgs& a, const float* x, const int32_t* pos, 
                                                        a.comp_kv, pre, row_of, a.format == CacheFormat::Fp8);
     check_launch("compress_window");
     if (a.w_idx_k && a.comp_ik) {
-        index_key_kernel<<<n_tokens, 256, 0, s>>>(pre, row_of, pos, a.ratio, a.rms_eps, a.w_idx_k, a.idx_k_norm_w,
-                                                  a.rope_freq, a.comp_ik, a.format == CacheFormat::Fp8);
-        check_launch("index_key");
+        index_keys(a, pre, row_of, pos, n_tokens, s);
     }
 }
 
@@ -1150,7 +1197,7 @@ size_t compress_batch_workspace_bytes(int max_tokens) {
 }
 
 void compress_batch(const CompressArgs& a, const float* x, const int32_t* pos, int n_tokens, void* workspace, void* stream) {
-    if (n_tokens < 1 || (a.ratio != 1 && a.ratio != 2)) throw std::invalid_argument("compress_batch: bad args");
+    if (n_tokens < 1 || n_tokens > 65535 || (a.ratio != 1 && a.ratio != 2)) throw std::invalid_argument("compress_batch: bad args");
     cudaStream_t s = as_stream(stream);
     float* ckv = static_cast<float*>(workspace);
     float* csc = ckv + (size_t) n_tokens * kLatent;
@@ -1165,9 +1212,7 @@ void compress_batch(const CompressArgs& a, const float* x, const int32_t* pos, i
     compress_state_kernel<<<1, kLatent, 0, s>>>(ckv, sc, pos, n_tokens, a.ratio, a.state_kv, a.state_score);
     check_launch("compress_state");
     if (a.w_idx_k && a.comp_ik) {
-        index_key_kernel<<<n_tokens, 256, 0, s>>>(pre, row_of, pos, a.ratio, a.rms_eps, a.w_idx_k, a.idx_k_norm_w,
-                                                  a.rope_freq, a.comp_ik, a.format == CacheFormat::Fp8);
-        check_launch("index_key");
+        index_keys(a, pre, row_of, pos, n_tokens, s);
     }
 }
 
