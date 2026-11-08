@@ -103,9 +103,10 @@ the fallback so the trap is never launched.
 
 ## Multi-GPU and the other upstream features on 8.9 (checked 2026-11-08, upstream 0.3.0+110)
 - Cards exchange data without GPU-to-GPU access (GeForce 40 has none), through pinned host buffers (`StagedCopy`) and
-  `cudaMemcpyPeer`, as upstream does. Every kernel choice (`dec_gdnf_mode`, `tc_bulk_ok`, `fp4_tensor_cores`,
-  `hc_fused_supported`, `pdl_kernel_ok`) is made per card, so on an all-Ada setup each card takes the same 8.9 paths as one
-  card does. `dm_->vram` is always -1, so the TMA expert kernel is never chosen on any card.
+  `cudaMemcpyPeer`, as upstream does. Every kernel choice (`dec_gdnf_mode`, `tc_bulk_ok`, `hc_fused_supported`,
+  `pdl_kernel_ok`) is made per card, so on an all-Ada setup each card takes the same 8.9 paths as one card does;
+  `fp4_tensor_cores` covers the whole card set (below). `dm_->vram` is always -1, so the TMA expert kernel is never chosen
+  on any card.
 - GDN split by key head (`gs_split`; taken when the peer has at least a quarter of the two cards' bandwidth, so also with
   two equal cards): CUDA0's half called `dense_tc_pair`, which exits on 8.9, and the cluster `dec_gdn_rec`. On 8.9 it now
   runs qkv and z as two `dense_proj` and `dec_gdn_rec_split` + `dec_gdn_rec_norm` (the same bits as `dec_gdn_rec`,
@@ -118,8 +119,18 @@ the fallback so the trap is never launched.
   `peer_share_parity` runs with the share on the one card: ok. `ds41_peer_parity` passes with one card.
 - Not run end to end, for want of a second card: the expert tier, the layer split and its overlapped windows, the prompt
   split, the GDN and head splits, and DeepSeek's second-card tier.
-- Mixed sm_120 + 8.9 setups need a `120;89` build, and `fp4_pack()` / `fp4_every_layer()` are decided once on the main
-  card, so a prompt split or the peer's FP4 share would hand the sm_120a-only FP4 kernels to the 4090. Not supported.
+- Mixed Blackwell + Ada setups (a 5090 main card with a 4090 tier, or the other way round): build with
+  `cmake -S . -B build-mixed -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="120;89"` (ada_build.bat builds
+  89 only). The engine refuses at start a card its build has no device code for (`build_archs.hpp`, checked in
+  cli/gpu.cpp and device.cu), since a 5090 would otherwise run the 8.9 PTX with its sm_90 paths trapping. FP4 prompt
+  kernels run only when every engine card is 12.x (`fp4_tensor_cores`; the process sees only its own cards), so on a mixed
+  set every card reads NVFP4 prompts through MMQ: the buffers, chunk plan, peer share and row rounding are the same on
+  every card, and `fp4_pack()` / `fp4_every_layer()`, decided once on the main card, hold on all of them. The price is
+  the 5090's FP4 prompt speed; decode does not use FP4 tensor cores. Everything else already chooses per card (decode's
+  expert rows use the same arithmetic on both, so a tier's rows still do not depend on where an expert sits). Checked on
+  the 4090 with the 120;89 binary only (it holds 99 sm_89 and 99 sm_120 images plus the sm_120a FP4 module): GPU suite
+  116 of 124 pass, 6 skip, 2 fail (`file_expert_repin_test`, `gdn_head_split_parity`'s tolerance, both as above); output
+  identical to fork_4090's 89-only build. Never run with a Blackwell card: its half of the binary is compiled, not run.
 - DeepSeek-V4.1: every `ds41_*` parity test passes on 8.9; no pack has been run (none downloaded).
 - The other Flash-Next formats (IQ1_S to Q8_0, the K-quants, Q2_0): their kernel parity tests pass on 8.9 (`iq_*`,
   `dec_moe_parity_kq`, `prefill_mmq_*`, `native_expert_parity_*`); only the NVFP4 pack has been run end to end.
