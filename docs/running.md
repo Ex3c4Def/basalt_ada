@@ -15,6 +15,15 @@ is refused with a 400 that names the length. `--slot-full-context` gives every s
 
 Each slot keeps two checkpoints (end of the system prompt, last turn), so requests that share a long system prompt read it once.
 
+### Session affinity
+
+With `--parallel`, a request that names its session goes to the slot that session last used, so the next turn continues the K/V already
+there. The session is the first of these headers that is set, then the request body's `session_id`: `x-llm-flow-id`,
+`x-claude-code-session-id`, `x-session-id`, `x-session-affinity`. A request with none picks a slot by the longest shared prefix, then
+the least recently used. When the session's slot is busy, the request takes that normal pick and the session's slot becomes the new
+one. Claude Code sends one `x-claude-code-session-id` for a session and its parallel subagents, so their overlapping requests spread
+over slots.
+
 ### Prompts beside decoding slots
 
 A prompt of up to 16,384 tokens is read at once, and the slots wait a few seconds. A longer one is read beside them, on its own thread,
@@ -45,6 +54,19 @@ read the vision projector inside it.
 The server's address serves a page, updated every second from `/metrics`, `/slots` and `/api/logs`: GPU load, power, VRAM and temperature,
 RAM and disk, decode and prefill rates with 60 s charts, slots, the newest requests, and the console lines.
 
+Three quiet figures sit in it, each from `/metrics`:
+
+- `N chats cached · X GiB` at the right of the Speed footer: the conversations parked in RAM (`conversation`: `parked`,
+  `bytes`, `evictions`, and the last restore's `restored` tokens and `restored_ms`, in the tooltip). The server reads them
+  from the engine's `conversation cache:` lines and clears them when the engine unloads, sleeps or restarts. A model that
+  prints no line when it parks (DeepSeek) shows them after its first restore, without evictions.
+- `N requests served · M tokens written` under the Slots table (`totals`: requests, prompt, reused and written tokens, prompt
+  and decode time since the server started; the rest in the tooltip).
+- The header word reads `Thinking`, `Answering` or `Tool call` (`live.phase`) while exactly one request runs.
+
+The log panel shows the engine's long cache lines short (`cache: restored 187k tokens in 912 ms`); the log and `/api/logs`
+keep the raw line.
+
 ## Conversations on disk: `--conversation-cache-disk-mib`
 
 Off at 0. With a budget, conversations of at least 8,192 tokens are written to `conversations` in the model's cache folder when they leave
@@ -65,8 +87,9 @@ Basalt refuses settings that would leave the machine without memory, and never s
 - `--vram-reserve-mib` below 256 is refused on Windows and WSL2 (128 on Linux): less free VRAM makes the driver page GPU memory.
 - `--ram-reserve-mib` (default 2048) is the RAM left free for the rest of the system. The engine allocates its host buffers
   first, or holds their RAM when it page-locks them later; the expert tiers then take the free RAM less the reserve and less
-  the driver's tracking of the pages they pin (`RAM floor ...` in the start log). Programs left idle beside a small reserve
-  may be swapped out.
+  the driver's tracking of the pages they pin (`RAM floor ...` in the start log). When some experts stay in the file, the
+  tiers also leave the OS file cache they are read through a floor: one prompt chunk's file reads and two layers' share of
+  those experts, at least 4 GiB. Programs left idle beside a small reserve may be swapped out.
 - While serving, the RAM guard holds the reserve: below it, it parks conversations to disk or drops them. A request waits up to 30 s
   for RAM to return. A running request stops with an error only when RAM is critical (under 1 GiB free, or below the reserve under
   memory pressure). `--ram-reserve-mib 0` turns the guard off.
