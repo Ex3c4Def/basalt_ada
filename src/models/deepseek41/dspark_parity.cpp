@@ -152,7 +152,7 @@ int main() {
         verdict("moe down vs fp32 h", dstest::compare(dout.down(), o32, 1e-2), 3e-2);
     }
     {   // frozen: the hidden state and the outputs hash to the bits of the dp4a kernels
-        constexpr uint64_t kFrozen = 0x3be9ade2c87c72d7ull;
+        const uint64_t kFrozen = dstest::frozen_for_device(0x3be9ade2c87c72d7ull, 0x9c13389dbf259e5full);
         uint64_t hh = 1469598103934665603ull;
         for (const auto& v : {h_got, dout.down()}) {
             const uint8_t* b = reinterpret_cast<const uint8_t*>(v.data());

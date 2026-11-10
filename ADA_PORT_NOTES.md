@@ -89,6 +89,11 @@ the fallback so the trap is never launched.
   On the 4090 the replaced kernels (fork_4090's sources before 0.3.1+13) give other bits, and their replacements give
   exactly those: router f4ec7c76f483174c, gemv 258e734e874cae57, compressor d2ec8ec03dfea810, DSpark MoE c7b1acee87ad0e77.
   `frozen_for_device` (kernels/test_util.hpp) uses these below 9.0, upstream's values from 9.0 up.
+- Since 0.3.2+80 DSpark's MoE rows take q8_1 activations and dp4a (upstream 30ad59a6), which changes their bits by design;
+  upstream froze the new kernel's own bits (3be9ade2c87c72d7). dspark_kernels.cu has no architecture-dependent code, and
+  every other check in `ds41_dspark_parity` passes on the 4090 (against the double reference, the fp32 hidden rows, live
+  rows bitwise), so the 4090's bits of the same kernel are its frozen value below 9.0: 9c13389dbf259e5f. Unlike the values
+  above, this one was not checked against a replaced kernel on the 4090: it pins the dp4a kernel's bits for later changes.
 - Draft reads: on 8.9 the draft graphs' hyper-connection reads, their router and q8_1 rows run as one kernel,
   `hc_fused_ada` (hc_fused_ada.cu), where `hc_fused` does not run. Verify stays on `k_hc_ada`, and `--exp hc_fused_ada=0`
   keeps the separate kernels. A one-row read now takes fused_gr_read_multi's bits instead of gr_read's, which only the
