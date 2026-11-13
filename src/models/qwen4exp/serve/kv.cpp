@@ -53,8 +53,11 @@ void QfnRuntime::kv_ceiling_note() {
 // The experts the decoding slots routed lately leave CUDA0's slots from `first` on, which a prompt's loan or the
 // KV is about to take: each trades places with a less-routed expert of its layer below `first` that has a RAM
 // copy (a slot keeps its layer's size; the experts from `first` on come back from RAM).  One blob copy per
-// trade; the table is uploaded by the caller.  `why` names the taker for the log.  `lent_out`: entries whose
-// slots a loan still out holds (the prompt path's buffers, no expert), so their experts are copied from RAM.
+// trade; the table follows the copies once every one has landed, and is uploaded by the caller.  A move that
+// fails leaves the slots from `first` on live: the cold experts whose slots an issued copy may have overwritten
+// become misses, and with no loan out that table is uploaded at once.  `why` names the taker for the log.
+// `lent_out`: entries whose slots a loan still out holds (the prompt path's buffers, no expert), so their experts
+// are copied from RAM.
 bool QfnRuntime::move_routed_below(int64_t first, const char* why, std::string& e,
                                 const std::vector<serve_loans::LentEntry>* lent_out) {
 
@@ -71,9 +74,21 @@ bool QfnRuntime::move_routed_below(int64_t first, const char* why, std::string& 
     }
     std::vector<uint8_t> in_ram((size_t) g.n_expert);
     std::vector<serve_loans::RoutedTrade> trades;
+    std::vector<serve_loans::IssuedTrade> issued;
+    // The cards still name each cold expert in its old slot, which an issued copy may have overwritten: they get the
+    // table without those entries at once.  With a loan still out the caller's table names slots that hold the
+    // loan's buffers until its lend loop runs, so that table waits for the caller's own upload.
+    auto give_up = [&](const std::string& why_failed) {
+        (void) cudaStreamSynchronize(adapt_stream);
+        (void) cudaGetLastError();
+        serve_loans::settle_trades(host_res.data(), (int32_t) g.n_expert, issued, false, basalt::core::kNotResident);
+        if (!issued.empty() && out_of.empty()) res_upload();
+        e = why_failed;
+        return false;
+    };
     for (int64_t l = 0; l < g.n_layers; ++l) {
         const float* u = drive.d.usage.data() + (size_t) (l * g.n_expert);
-        int32_t* r = host_res.data() + (size_t) (l * g.n_expert);
+        const int32_t* r = host_res.data() + (size_t) (l * g.n_expert);
         for (int64_t ex = 0; ex < g.n_expert; ++ex) in_ram[(size_t) ex] = src.has_resident(l, ex) ? 1 : 0;
         trades.clear();
         routed += serve_loans::plan_routed_trades(u, r, in_ram.data(),
@@ -83,27 +98,22 @@ bool QfnRuntime::move_routed_below(int64_t first, const char* why, std::string& 
             const void* from = xcache.device_slot(t.from);
             cudaMemcpyKind kind = cudaMemcpyDeviceToDevice;
             if (t.from_ram) {
-                if ((from = srcp->blob(l, t.hot)) == nullptr) {
-                    e = "moving an expert out of the cache's tail: its RAM copy is gone";
-                    return false;
-                }
+                if ((from = srcp->blob(l, t.hot)) == nullptr)
+                    return give_up("moving an expert out of the cache's tail: its RAM copy is gone");
                 kind = cudaMemcpyHostToDevice;
                 ++from_ram;
             }
             if (cudaMemcpyAsync(xcache.device_slot(t.to), from, (size_t) lay.blob_bytes(l), kind, adapt_stream) !=
-                cudaSuccess) {
-                e = std::string("moving an expert out of the cache's tail: ") + cudaGetErrorString(cudaGetLastError());
-                return false;
-            }
-            r[t.hot] = t.to;
-            r[t.cold] = t.from;
+                cudaSuccess)
+                return give_up(std::string("moving an expert out of the cache's tail: ") +
+                               cudaGetErrorString(cudaGetLastError()));
+            issued.push_back({(int32_t) l, t});
             ++moved;
         }
     }
-    if (moved > 0 && cudaStreamSynchronize(adapt_stream) != cudaSuccess) {
-        e = std::string("moving experts out of the cache's tail: ") + cudaGetErrorString(cudaGetLastError());
-        return false;
-    }
+    if (moved > 0 && cudaStreamSynchronize(adapt_stream) != cudaSuccess)
+        return give_up(std::string("moving experts out of the cache's tail: ") + cudaGetErrorString(cudaGetLastError()));
+    serve_loans::settle_trades(host_res.data(), (int32_t) g.n_expert, issued, true, basalt::core::kNotResident);
     const std::string ram_note = from_ram > 0 ? std::to_string(from_ram) + " from RAM, " : std::string();
     basalt::log::info("basalt batch", "%s: %lld of the %lld routed experts in the cache's last %lld slots moved "
                          "below them (%s%.1f ms)", why, (long long) moved, (long long) routed,

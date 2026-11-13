@@ -35,4 +35,16 @@ int64_t plan_routed_trades(const float* use, const int32_t* slot, const uint8_t*
     return routed;
 }
 
+void settle_trades(int32_t* table, int32_t n, const std::vector<IssuedTrade>& issued, bool landed, int32_t miss) {
+    for (const IssuedTrade& x : issued) {
+        int32_t* r = table + (size_t) x.layer * (size_t) n;
+        if (landed) {
+            r[x.t.hot] = x.t.to;
+            r[x.t.cold] = x.t.from;
+        } else {
+            r[x.t.cold] = miss;
+        }
+    }
+}
+
 }  // namespace basalt::models::qwen4exp::serve

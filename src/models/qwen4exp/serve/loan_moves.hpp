@@ -40,4 +40,16 @@ struct RoutedTrade {
 int64_t plan_routed_trades(const float* use, const int32_t* slot, const uint8_t* in_ram, const uint8_t* lent_out,
                            int32_t n, int64_t first, std::vector<RoutedTrade>& out);
 
+/// A trade of layer `layer` whose copy was issued.
+struct IssuedTrade {
+    int32_t layer = 0;
+    RoutedTrade t;
+};
+
+/// The table side of the issued trades, `table` holding `n` experts per layer.  `landed`: every copy landed, so each
+/// hot expert takes slot `to` and its cold one `from`, a slot the caller's loan or KV takes next.  Otherwise the move
+/// is given up with the slots from `first` on still live: the table keeps what it said, except that each cold expert,
+/// whose slot `to` an issued copy may have overwritten, becomes `miss`.
+void settle_trades(int32_t* table, int32_t n, const std::vector<IssuedTrade>& issued, bool landed, int32_t miss);
+
 }  // namespace basalt::models::qwen4exp::serve
