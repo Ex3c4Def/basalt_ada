@@ -184,11 +184,24 @@ the fallback so the trap is never launched.
   step's sum moved into fp32, against the test's 1e-5), so the codes decode to f16 (exact) and the product runs on f16
   mma with fp32 accumulation: 1.6e-6, 134-161 TFLOP/s at 450 W. On the FP8 tensor cores the same kernel reaches 220-268
   TFLOP/s (1.65-1.85x) at 1.5e-4 even with the sums in fp32; open as item 6 of ADA_NOT_IMPLEMENTED.md (main checkout,
-  untracked), with the measurements. Only packs with F8_E4M3 projections (NVIDIA's 27B checkpoint) call it. FP4 W4A4 (`fp4_dense`, 12.0's FP4 tensor cores): each code
-  times its UE4M3 scale decoded to f16 (exact), f16 mma, the TMA kernel's epilogue arithmetic; the quantizer rounds to
-  E2M1 in software (nvfp4_planes.cu's rounding): max err 6.4e-8 of sum |w x|, rows bitwise at any chunk length, 97-128
-  TFLOP/s at 450 W. The products are exact; the sums run in another order than 12.0's block-scaled mma, so a 4090's
-  prompt rows are not a 5090's bits.
+  untracked), with the measurements. The cause, measured with single instructions: 8.9's e4m3 mma aligns its products
+  to the largest in a 14-bit window that also holds the accumulator (f16 mma: 25 bits). Only packs with F8_E4M3
+  projections (NVIDIA's 27B checkpoint) call it.
+- FP4 W4A4 (`fp4_dense`, 12.0's FP4 tensor cores). On 8.9 `kernel_ada` runs one e4m3 mma m16n8k16 per 16-value scale
+  group from a zero accumulator, then adds the sum times the token's and the row's group scales into fp32 with one fma.
+  - Why it is exact: every E2M1 code is an E4M3 value. A group's code products are multiples of 1/4 of at most 36, so
+    all their bits lie within 8 bits of the largest product, inside the 14-bit window, and the sum (at most 576) is
+    exact in fp32.
+  - Codes become E4M3 bytes by a byte permute; each warp turns its scales into fp32 at each stage. The epilogue is the
+    TMA kernel's arithmetic, and the quantizer rounds to E2M1 in software (nvfp4_planes.cu's rounding).
+  - Error in fp4_dense_tma_test, of sum |w x|: plain 6.6e-8, add 6.7e-8 (the f16 form it replaced: 6.4e-8, 8.4e-8).
+    At the 27B's shapes, gate (K 5120) 5.4e-8 and down (K 17408) 1.7e-8, against 3.0e-7 and 8.3e-8 before. Rows are
+    bitwise at any chunk length.
+  - Speed at 450 W, fp4_dense_tma_test --bench, alternated with the f16 form (ABBA, twice), TFLOP/s new (old):
+    gate+up SwiGLU 213-215 (128) at 2048 tokens and 204-205 (127-128) at 4096; down 172-175 (107) and 207 (128); down
+    with Add 172-176 (104-105) and 199-200 (124-125). That is 1.60-1.68x.
+  - The 12.0 SASS of the file is unchanged. Without a 27B pack, prefill end to end and quality are unmeasured.
+  - The sums run in another order than 12.0's block-scaled mma, so a 4090's prompt rows are not a 5090's bits.
 - sm_120 code: the SASS of every upstream kernel in the touched files (dense_ops, gdn_window, window_gemm*, fp8_gemm,
   fp4_dense) is identical to upstream 0.4.0's; the 8.9 kernels are trap stubs there.
 - `dense_ops_parity` fails only its old baseline, `bf16_rows_dot` + `gdn_gates` at T = 2048 (3.17e-4 against 3e-4, beta

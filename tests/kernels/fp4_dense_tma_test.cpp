@@ -1,7 +1,7 @@
 // tests/kernels/fp4_dense_tma_test.cpp - the TMA dense W4A4 product (prefill::fp4_dense) against a double-precision
 // reference over the same quantized codes and scales: the plain product, the Add epilogue and the SwiGLU product; a
 // token's row is the same bits at 1, 1000 and 1100 tokens.  --bench: TFLOP/s at the Qwen3.8-27B MLP shapes against the
-// cp.async path of prefill::fp4::run (12.0 only; on 8.9 the product is the f16 kernel).  Exit 77 without a GPU.
+// cp.async path of prefill::fp4::run (12.0 only; on 8.9 the product is the FP8-tensor-core kernel).  Exit 77 without a GPU.
 #include "basalt/kernels/nvfp4_planes.hpp"
 #include "basalt/prefill/fp4_dense.hpp"
 #include "basalt/prefill/moe_fp4.hpp"

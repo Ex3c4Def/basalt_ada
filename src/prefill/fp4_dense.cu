@@ -13,10 +13,10 @@
 // shared memory at the block's start for the same reason.  FP32 outputs go straight from the accumulators.
 //
 // Compute capability 8.9 has no FP4 tensor cores, TMA or mbarrier transaction counts: there kernel_ada runs the product on
-// the f16 tensor cores (see its comment), and the quantizer rounds to E2M1 without the FP4 convert.
+// the FP8 tensor cores, one scale group per instruction (see its comment), and the quantizer rounds to E2M1 without the
+// FP4 convert.
 #include "basalt/prefill/fp4_dense.hpp"
 
-#include "basalt/kernels/narrow_bf16.cuh"
 #include "basalt/kernels/silu.cuh"
 
 #include <cuda.h>
@@ -484,19 +484,23 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(const __grid_constant__ Pa
 }
 
 // ---------------------------------------------------------------------------------------- compute capability 8.9
-// kernel_ada: kernel's product on the f16 tensor cores.  An E2M1 code times its UE4M3 scale is exact in f16 (at most five
-// significant bits, magnitudes 2^-10 to 2688), so each warp decodes both operands into f16 pairs and runs mma m16n8k16
-// with fp32 accumulation: every product is the FP4 MMA's, the sums run in another order, and a token's row keeps one
-// order at any chunk length.  The block tile is 128 tokens x 256 weight rows (SwiGLU: 128 gate rows and the same 128 up
-// rows), eight warps as 2 (tokens) x 4 (rows) of 64 x 64, K in stages of 64 values (four, filled by cp.async from every
-// thread).  Thread (g, c) of a warp takes values 16c .. 16c + 15 of each stage (one scale group) for its rows, in four mma
-// steps: step s's k-slots {2c, 2c + 1} hold values 16c + 4s, +1 and {2c + 8, 2c + 9} values 16c + 4s + 2, +3, for both
-// operands (window_gemm.cuh's assignment).  The epilogues are kernel's arithmetic, from the accumulators to global memory.
+// kernel_ada: kernel's product on the FP8 tensor cores, one 16-value scale group per instruction.  Every E2M1 code is an
+// E4M3 value, so each warp turns both operands' codes into E4M3 bytes and runs mma m16n8k16 e4m3 from a zero
+// accumulator for each group: a group's code products are multiples of 1/4 of at most 36, so its sum is exact in the
+// MMA's accumulator.  That sum times the token's and the row's group scales is added into fp32 with one fma, group after
+// group in K order, so a token's row keeps one order at any chunk length.  The block tile is 128 tokens x 256 weight
+// rows (SwiGLU: 128 gate rows and the same 128 up rows), eight warps as 2 (tokens) x 4 (rows) of 64 x 64, K in stages of
+// 64 values (four groups; four stages, filled by cp.async from every thread).  In step s of a stage thread (g, c) gives
+// the MMA values 16s + 4c .. 16s + 4c + 3 of its rows, a 16-bit load of four codes; a row's two 16-byte halves are
+// swapped in every other group of four rows, so the eight rows of a load fall in different banks.  At each stage's start
+// a warp turns the group scales of its 64 tokens and 64 rows into fp32 in its own shared memory.  The epilogues are
+// kernel's arithmetic, from the accumulators to global memory.
 constexpr int kAdaBT = 128, kAdaBR = 256, kAdaStages = 4, kAdaThreads = 256;
 constexpr int kAdaACodes = kAdaBT * 32, kAdaBCodes = kAdaBR * 32;               // a stage's 64 values: 32 code bytes a row
 constexpr int kAdaAScales = kAdaBT * 4, kAdaBScales = kAdaBR * 4;               // and four scale bytes
 constexpr int kAdaStage = kAdaACodes + kAdaBCodes + kAdaAScales + kAdaBScales;  // 13,824 bytes
-constexpr int kAdaSmem = kAdaStages * kAdaStage;
+constexpr int kAdaWarpScales = 2 * 4 * 64;   // a warp's group scales of a stage in fp32: its 64 tokens and 64 rows, 4 groups
+constexpr int kAdaSmem = kAdaStages * kAdaStage + kAdaThreads / 32 * kAdaWarpScales * 4;
 
 struct AdaParams {
     const uint8_t* a_codes;    // [tokens][K / 2]
@@ -518,24 +522,28 @@ __device__ __forceinline__ void cp_async16(void* dst, const void* src, int n) {
 __device__ __forceinline__ void cp_async4(void* dst, const void* src, int n) {
     asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::"r"(smem_addr(dst)), "l"(src), "r"(n) : "memory");
 }
-// a UE4M3 scale byte as an f16 pair (exact)
-__device__ __forceinline__ unsigned scale_f16x2(unsigned b) {
-    unsigned f;
-    const unsigned short v = (unsigned short) (b | (b << 8));
-    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(f) : "h"(v));
-    return f;
-}
-// byte i of w (two E2M1 codes, the low nibble the lower half) times the f16 scale pair sc (exact)
-__device__ __forceinline__ unsigned decode(unsigned w, int i, unsigned sc) {
-    const unsigned f = kernels::e2m1x2_permute(w, i, 0x3e3c3800u, 0x46444240u, 0u, 0u);
+__device__ __forceinline__ unsigned prmt(unsigned a, unsigned b, unsigned sel) {
     unsigned d;
-    asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(d) : "r"(f), "r"(sc));
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(sel));
     return d;
 }
-__device__ __forceinline__ void mma_f16(float* c, const unsigned (&a)[4], unsigned b0, unsigned b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+// the four E2M1 codes of the low 16 bits of w (the first value in the lowest nibble) as four E4M3 bytes (exact): the
+// magnitude from a table of the eight values' E4M3 codes, the sign moved from bit 3 of the nibble to bit 7 of the byte
+__device__ __forceinline__ unsigned e2m1x4_e4m3(unsigned w) {
+    const unsigned mag = prmt(0x3c383000u, 0x4c484440u, w & 0x7777u);
+    const unsigned sign = prmt(0u, 0x80808080u, (w >> 1) & 0x4444u);
+    return mag | sign;
+}
+// two UE4M3 scale bytes (the low 16 bits of v) as floats (exact), the low byte in x
+__device__ __forceinline__ float2 ue4m3x2_float2(unsigned v) {
+    const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) v, __NV_E4M3);
+    return __half22float2(*reinterpret_cast<const __half2*>(&h));
+}
+// d = A (16 tokens x 16 values, E4M3) * B (16 values x 8 weight rows, E4M3), from a zero accumulator
+__device__ __forceinline__ void mma_e4m3(float* d, unsigned a0, unsigned a1, unsigned b) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%7,%7,%7};\n"
+                 : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+                 : "r"(a0), "r"(a1), "r"(b), "f"(0.0f));
 }
 #endif
 
@@ -560,7 +568,8 @@ __global__ __launch_bounds__(kAdaThreads, 1) void kernel_ada(const __grid_consta
     const int64_t K = p.K, half = K / 2;
     const int ktiles = (int) (K / 64);
     const size_t scale_off = (size_t) p.rows * (size_t) half;   // nvfp4p::scale_offset
-    // stage st <- K tile kt (values 64 kt ..): codes and scales, zeros past the tokens and the rows
+    // stage st <- K tile kt (values 64 kt ..): codes and scales, zeros past the tokens and the rows; a row's 16-byte
+    // halves (groups 0, 1 and 2, 3) trade places when bit 2 of the row is set
     const auto load = [&](int kt, int st) {
         unsigned char* ac = smem + st * kAdaStage;
         unsigned char* bc = ac + kAdaACodes;
@@ -569,7 +578,8 @@ __global__ __launch_bounds__(kAdaThreads, 1) void kernel_ada(const __grid_consta
         {
             const int r = tid >> 1, pc = tid & 1, t = token_begin + r;
             const bool ok = t < p.tokens;
-            cp_async16(ac + r * 32 + pc * 16, p.a_codes + (int64_t) (ok ? t : 0) * half + kt * 32 + pc * 16, ok ? 16 : 0);
+            const uint8_t* src = p.a_codes + (int64_t) (ok ? t : 0) * half + kt * 32 + pc * 16;
+            cp_async16(ac + r * 32 + (pc ^ ((r >> 2) & 1)) * 16, src, ok ? 16 : 0);
         }
 #pragma unroll
         for (int i = 0; i < 2; ++i) {
@@ -577,7 +587,8 @@ __global__ __launch_bounds__(kAdaThreads, 1) void kernel_ada(const __grid_consta
             const int m = SWIGLU ? r / loaded : 0;
             const int64_t wr = row_begin + (SWIGLU ? r % loaded : r);
             const bool ok = wr < p.rows;
-            cp_async16(bc + r * 32 + pc * 16, p.w[m] + (ok ? wr : 0) * half + kt * 32 + pc * 16, ok ? 16 : 0);
+            const uint8_t* src = p.w[m] + (ok ? wr : 0) * half + kt * 32 + pc * 16;
+            cp_async16(bc + r * 32 + (pc ^ ((r >> 2) & 1)) * 16, src, ok ? 16 : 0);
         }
         if (tid < kAdaBT) {   // a token's four groups: scale tile (t / 256) * (K / 256) + kt / 4, row t % 256
             const int t = token_begin + tid;
@@ -597,6 +608,11 @@ __global__ __launch_bounds__(kAdaThreads, 1) void kernel_ada(const __grid_consta
         }
     };
     float acc[4][8][4] = {};
+    // the warp's group scales of the stage in fp32: tokens as [group][g][mt][h] (token 16 mt + 8 h + g of its 64), rows
+    // as [group][c][f][e] (row 2c + e of fragment f), so a step's scales of a thread are 8 and 16 consecutive floats
+    float* const tsc = reinterpret_cast<float*>(smem + kAdaStages * kAdaStage) + warp * kAdaWarpScales;
+    float* const rsc = tsc + kAdaWarpScales / 2;
+    const int half_swap = (g >> 2) & 1;   // the thread's rows (g mod 8) have their 16-byte halves swapped
 #pragma unroll
     for (int st = 0; st < kAdaStages - 1; ++st) {
         if (st < ktiles) load(st, st);
@@ -612,42 +628,53 @@ __global__ __launch_bounds__(kAdaThreads, 1) void kernel_ada(const __grid_consta
         const unsigned char* bc = ac + kAdaACodes;
         const unsigned char* asc = bc + kAdaBCodes;
         const unsigned char* bsc = asc + kAdaAScales;
-        // the thread's 8 code bytes (values 16c .. 16c + 15) and scale of each of its rows
-        uint2 ar[4][2], br[8];
-        unsigned as2[4][2], bs2[8];
+        {   // lane l converts the four group scales of the warp's tokens 2l, 2l + 1 and of its rows 2l, 2l + 1
+            const int r = 2 * lane;
+            const uint2 tb = *reinterpret_cast<const uint2*>(asc + (wtk * 64 + r) * 4);
+            const uint2 rb = *reinterpret_cast<const uint2*>(bsc + (ada_row<SWIGLU>(wrw, r >> 3) + (r & 7)) * 4);
+            const int tg = r & 7, tmt = r >> 4, th = (r >> 3) & 1, rf = r >> 3, rc = (r & 7) >> 1;
+            __syncwarp();   // every lane is done with the last stage's scales
 #pragma unroll
-        for (int mt = 0; mt < 4; ++mt)
-#pragma unroll
-            for (int h = 0; h < 2; ++h) {
-                const int r = wtk * 64 + mt * 16 + g + 8 * h;
-                ar[mt][h] = *reinterpret_cast<const uint2*>(ac + r * 32 + 8 * c);
-                as2[mt][h] = scale_f16x2(asc[r * 4 + c]);
+            for (int q = 0; q < 4; ++q) {
+                const unsigned sel = (unsigned) q | (unsigned) (4 + q) << 4;   // byte q of each of the two rows
+                const float2 t = ue4m3x2_float2(prmt(tb.x, tb.y, sel));
+                tsc[((q * 8 + tg) * 4 + tmt) * 2 + th] = t.x;
+                tsc[((q * 8 + tg + 1) * 4 + tmt) * 2 + th] = t.y;
+                *reinterpret_cast<float2*>(rsc + ((q * 4 + rc) * 8 + rf) * 2) = ue4m3x2_float2(prmt(rb.x, rb.y, sel));
             }
-#pragma unroll
-        for (int f = 0; f < 8; ++f) {
-            const int r = ada_row<SWIGLU>(wrw, f) + g;
-            br[f] = *reinterpret_cast<const uint2*>(bc + r * 32 + 8 * c);
-            bs2[f] = scale_f16x2(bsc[r * 4 + c]);
+            __syncwarp();
         }
 #pragma unroll
-        for (int step = 0; step < 4; ++step) {   // bytes 2 step and 2 step + 1 of the eight
-            const int bi = (step & 1) * 2;
-            unsigned a[4][4];
+        for (int s = 0; s < 4; ++s) {   // group s: the thread's codes 4c .. 4c + 3 of it, from each of its rows
+            const int off = (((s >> 1) ^ half_swap) << 4) + ((s & 1) << 3) + 2 * c;
+            const auto codes = [&](const unsigned char* tile, int row) {
+                return e2m1x4_e4m3(*reinterpret_cast<const unsigned short*>(tile + row * 32 + off));
+            };
+            unsigned a[4][2], b[8];
 #pragma unroll
-            for (int mt = 0; mt < 4; ++mt) {
-                const unsigned w0 = step >> 1 ? ar[mt][0].y : ar[mt][0].x, w1 = step >> 1 ? ar[mt][1].y : ar[mt][1].x;
-                a[mt][0] = decode(w0, bi, as2[mt][0]);       // row g: values 16c + 4 step, +1
-                a[mt][1] = decode(w1, bi, as2[mt][1]);       // row g + 8
-                a[mt][2] = decode(w0, bi + 1, as2[mt][0]);   // row g: values 16c + 4 step + 2, +3
-                a[mt][3] = decode(w1, bi + 1, as2[mt][1]);
-            }
+            for (int mt = 0; mt < 4; ++mt)
 #pragma unroll
-            for (int f = 0; f < 8; ++f) {   // each weight fragment decoded right before its four products
-                const unsigned w = step >> 1 ? br[f].y : br[f].x;
-                const unsigned b0 = decode(w, bi, bs2[f]), b1 = decode(w, bi + 1, bs2[f]);
+                for (int h = 0; h < 2; ++h) a[mt][h] = codes(ac, wtk * 64 + mt * 16 + g + 8 * h);
 #pragma unroll
-                for (int mt = 0; mt < 4; ++mt) mma_f16(acc[mt][f], a[mt], b0, b1);
-            }
+            for (int f = 0; f < 8; ++f) b[f] = codes(bc, ada_row<SWIGLU>(wrw, f) + g);
+            float ts[8], rs[16];   // the step's scales of tokens (mt, h) and of rows (f, e)
+#pragma unroll
+            for (int i = 0; i < 2; ++i)
+                *reinterpret_cast<float4*>(ts + 4 * i) = *reinterpret_cast<const float4*>(tsc + (s * 8 + g) * 8 + 4 * i);
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                *reinterpret_cast<float4*>(rs + 4 * i) = *reinterpret_cast<const float4*>(rsc + (s * 4 + c) * 16 + 4 * i);
+#pragma unroll
+            for (int f = 0; f < 8; ++f)
+#pragma unroll
+                for (int mt = 0; mt < 4; ++mt) {
+                    float d[4];
+                    mma_e4m3(d, a[mt][0], a[mt][1], b[f]);
+                    acc[mt][f][0] = fmaf(d[0], ts[2 * mt] * rs[2 * f], acc[mt][f][0]);
+                    acc[mt][f][1] = fmaf(d[1], ts[2 * mt] * rs[2 * f + 1], acc[mt][f][1]);
+                    acc[mt][f][2] = fmaf(d[2], ts[2 * mt + 1] * rs[2 * f], acc[mt][f][2]);
+                    acc[mt][f][3] = fmaf(d[3], ts[2 * mt + 1] * rs[2 * f + 1], acc[mt][f][3]);
+                }
         }
     }
     // kernel's epilogue arithmetic: thread (g, c) holds tokens g and g + 8 of each 16-token fragment, rows 2c and 2c + 1

@@ -1615,7 +1615,7 @@ add_library(window_gemm STATIC src/kernels/cuda/window_gemm.cu src/kernels/cuda/
 set_target_properties(window_gemm PROPERTIES CUDA_ARCHITECTURES "${BASALT_CUDA_ARCHS_A}")
 target_include_directories(window_gemm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(window_gemm PUBLIC core ${_gpu_runtime_target})
-# The dense W4A4 product has an Ada kernel (f16 mma on the decoded codes), so it builds for every architecture; the MoE
+# The dense W4A4 product has an Ada kernel (e4m3 mma on the codes, a scale group at a time), so it builds for every architecture; the MoE
 # experts' FP4 kernels are sm_120a's alone (Flash-Next reads its prompt experts through MMQ on 8.9).
 add_library(prefill_fp4_dense STATIC src/prefill/fp4_dense.cu)
 set_target_properties(prefill_fp4_dense PROPERTIES CUDA_ARCHITECTURES "${BASALT_CUDA_ARCHS_A}")
