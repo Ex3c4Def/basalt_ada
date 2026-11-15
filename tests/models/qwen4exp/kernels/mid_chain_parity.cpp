@@ -16,7 +16,7 @@
 // leave, the last one runs on an SM they free, the launch ends cleanly, and the next launch is bitwise again.  The mid_chain_hold build has a short bound for this.
 //
 // On compute capability 8.9 the test is the arm of the mid chain's own kernel there (mid_chain_ada.cu): see ada_main.
-#include "basalt/models/qwen4exp/kernels/dec_gdn.hpp"
+#include "basalt/kernels/gdn_window.hpp"
 #include "basalt/models/qwen4exp/kernels/dense_tc.hpp"
 #include "basalt/models/qwen4exp/kernels/hc_fused.hpp"
 #include "basalt/models/qwen4exp/kernels/mid_chain.hpp"

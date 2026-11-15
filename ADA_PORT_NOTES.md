@@ -25,8 +25,10 @@ Read the first errors in `ada_build.log`, fix, rerun.
 
 ## What sm_89 does not have (so what any compile error will be about)
 Thread-block clusters and distributed shared memory, TMA / `cp.async.bulk` and mbarrier `expect_tx`/`try_wait`,
-`griddepcontrol` (PDL), `fence.proxy.async` (all sm_90+), and FP4 block-scaled MMA / `cvt e2m1` (sm_120a). It does have
-int8 `mma.sync`, `cp.async`, and 99 KB opt-in shared memory per block.
+`griddepcontrol` (PDL), `fence.proxy.async`, `mul.bf16x2` (all sm_90+), and the block-scaled MMAs, `cvt e2m1` and the
+direct `cvt.rn.bf16x2.e4m3x2` (sm_120a / sm_100+). It does have int8, bf16, f16 and plain e4m3 `mma.sync` (the e4m3 one
+sums with too few bits for a W8A8 product: see the dense stack below), `cvt.rn.f16x2.e4m3x2`, `cp.async`, and 99 KB
+opt-in shared memory per block.
 nvcc here is whole-program (no rdc), so unreachable `__device__` helpers are dropped; only code reachable from a
 compiled kernel must compile for sm_89.
 Pattern used: wrap sm_90+ instructions in `#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900` (or a local macro
@@ -34,7 +36,7 @@ Pattern used: wrap sm_90+ instructions in `#if defined(__CUDA_ARCH__) && __CUDA_
 the fallback so the trap is never launched.
 
 ## How the fallbacks are chosen on the 4090
-- GDN recurrence: `dec_gdnf_mode()` (dec_gdn_rec.cu, now a runtime function) returns 0 below sm_90, so
+- GDN recurrence: `dec_gdnf_mode()` (src/kernels/cuda/gdn_window.cu since 0.4.0, a runtime function) returns 0 below sm_90, so
   `record_gdn.cpp` takes the unfused sequence. On 8.9 it runs as one persistent kernel, `k_mid_ada` (mid_chain_ada.cu),
   bitwise equal to the separate kernels, after a join on the L2 read-ahead. `--exp mid_ada=0` runs the separate kernels
   (gdn_conv_l2_multi, gdn_ab_multi, gdn_step_norm_multi, z on native_mmvq), `--exp mid_ada=2` the kernel with z on
@@ -124,7 +126,7 @@ the fallback so the trap is never launched.
 - GDN split by key head (`gs_split`; taken when the peer has at least a quarter of the two cards' bandwidth, so also with
   two equal cards): CUDA0's half called `dense_tc_pair`, which exits on 8.9, and the cluster `dec_gdn_rec`. On 8.9 it now
   runs qkv and z as two `dense_proj` and `dec_gdn_rec_split` + `dec_gdn_rec_norm` (the same bits as `dec_gdn_rec`,
-  dec_gdn.hpp); sm_120 is unchanged. The peer's mixer item already used the split form.
+  gdn_window.hpp); sm_120 is unchanged. The peer's mixer item already used the split form.
 - `gdn_head_split_parity` runs on 8.9 (split recurrence only, both ranks on the one card): the slices, the in-place head map
   and the peer item's q8_1 rows are bitwise. It fails one tolerance: the combined out projection's max error against the
   CPU must stay within 2x the whole layer's, and is 2.3-3.0x in 11 of 60 cases (RMS within 1.2x). That is the rounding of
@@ -159,8 +161,37 @@ the fallback so the trap is never launched.
   (true under Linux's unified addressing), and `iq_avx512_test`'s rows differ from its frozen hashes under MSVC on Zen 5
   (max rel error against double 4e-6).
 - sm_120-only tests skip below their compute capability: `hc_fused_parity`, `prefill_fp4_test`, `mid_chain_hold*`,
-  `qsa_mid_parity`. `src/models/qwen4exp/prefill/fp4/moe_fp4.cu` is always built for `120a-real` and never launched on
-  8.9. The server does not parse gpu_select.cpp's error strings ("not sm_120 or sm_89").
+  `qsa_mid_parity`. The MoE experts' FP4 kernels (`src/prefill/moe_fp4.cu`, library `prefill_fp4`) are always built for
+  `120a-real` and never launched on 8.9. The server does not parse gpu_select.cpp's error strings ("not sm_120 or sm_89").
+
+## The dense stack (Qwen3.8-27B) on 8.9 (upstream 0.4.0)
+- No 27B pack has been run (none downloaded; `qwen35_checkpoint_round_trip` skips without one). The pack takes 16.0 GiB
+  on the card with its drafter, so it would fit a 4090. Every kernel the stack calls has an 8.9 path, checked by
+  upstream's kernel tests on the 4090.
+- Upstream builds `window_gemm`, `prefill_fp8`, the dense FP4 product and two tests (`narrow_bf16_parity`, `silu_parity`)
+  for `120a-real` only. They build for `BASALT_CUDA_ARCHS_A` (CMakeLists.txt): `120a-real` for a 120, `89-real` for an
+  89, so a 120-only build is as upstream's. The dense FP4 product is its own library, `prefill_fp4_dense`, which
+  `prefill_fp4` links.
+- Decode windows: `window_gemm` (cp.async, bf16 mma) runs as on 12.0. On 8.9 its NVFP4 codes decode by a byte permute
+  from the eight magnitudes' patterns, and its scale multiply is `fma.rn.bf16x2` with a -0 addend (narrow_bf16.cuh): the
+  same bits as 12.0a's conversions and `mul.rn.bf16x2` (`narrow_bf16_parity`: every input against the host values).
+  `dec_gdn_rec` runs as `dec_gdn_rec_split` + `dec_gdn_rec_norm` there (the same bits, `state_out` included; the raw
+  output in `a.o`, or else `a.y`); batch windows use `dec_gdn_rec_seg_split` on every card; `dec_gdn_rec_seg` refuses
+  below 9.0.
+- Prompt chunks. `gdn_gating_proj`: a flat form, a block of 8 warps per 16 tokens, warp q the cluster form's rank q (a
+  copy of its loop, so the cluster kernel stays upstream's source), the partials added in rank order. FP8 W8A8
+  (`fp8::gemm`): 8.9's FP8 mma keeps too few bits in its sums (1.2e-3 of sum |w a| at K 6144, 1.5e-4 with each k32
+  step's sum moved into fp32, against the test's 1e-5), so the codes decode to f16 (exact) and the product runs on f16
+  mma with fp32 accumulation: 1.6e-6, 134-161 TFLOP/s at 450 W. FP4 W4A4 (`fp4_dense`, 12.0's FP4 tensor cores): each code
+  times its UE4M3 scale decoded to f16 (exact), f16 mma, the TMA kernel's epilogue arithmetic; the quantizer rounds to
+  E2M1 in software (nvfp4_planes.cu's rounding): max err 6.4e-8 of sum |w x|, rows bitwise at any chunk length, 97-128
+  TFLOP/s at 450 W. The products are exact; the sums run in another order than 12.0's block-scaled mma, so a 4090's
+  prompt rows are not a 5090's bits.
+- sm_120 code: the SASS of every upstream kernel in the touched files (dense_ops, gdn_window, window_gemm*, fp8_gemm,
+  fp4_dense) is identical to upstream 0.4.0's; the 8.9 kernels are trap stubs there.
+- `dense_ops_parity` fails only its old baseline, `bf16_rows_dot` + `gdn_gates` at T = 2048 (3.17e-4 against 3e-4, beta
+  3.37e-5 against 3e-5): its tf32 mma accumulates below fp32 (the test's own comment), and the engine no longer calls it.
+  `bf16_rows_dot` itself passes. The thresholds were left as they are.
 
 ## Test once it builds
 1. Run the built `basalt` (see README.md for the command line; the binaries land in `build-ada`) on the user's NVFP4
