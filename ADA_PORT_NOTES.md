@@ -182,7 +182,9 @@ the fallback so the trap is never launched.
   copy of its loop, so the cluster kernel stays upstream's source), the partials added in rank order. FP8 W8A8
   (`fp8::gemm`): 8.9's FP8 mma keeps too few bits in its sums (1.2e-3 of sum |w a| at K 6144, 1.5e-4 with each k32
   step's sum moved into fp32, against the test's 1e-5), so the codes decode to f16 (exact) and the product runs on f16
-  mma with fp32 accumulation: 1.6e-6, 134-161 TFLOP/s at 450 W. FP4 W4A4 (`fp4_dense`, 12.0's FP4 tensor cores): each code
+  mma with fp32 accumulation: 1.6e-6, 134-161 TFLOP/s at 450 W. On the FP8 tensor cores the same kernel reaches 220-268
+  TFLOP/s (1.65-1.85x) at 1.5e-4 even with the sums in fp32; open as item 6 of ADA_NOT_IMPLEMENTED.md (main checkout,
+  untracked), with the measurements. Only packs with F8_E4M3 projections (NVIDIA's 27B checkpoint) call it. FP4 W4A4 (`fp4_dense`, 12.0's FP4 tensor cores): each code
   times its UE4M3 scale decoded to f16 (exact), f16 mma, the TMA kernel's epilogue arithmetic; the quantizer rounds to
   E2M1 in software (nvfp4_planes.cu's rounding): max err 6.4e-8 of sum |w x|, rows bitwise at any chunk length, 97-128
   TFLOP/s at 450 W. The products are exact; the sums run in another order than 12.0's block-scaled mma, so a 4090's
