@@ -38,7 +38,7 @@
 namespace basalt::models::deepseek41 {
 namespace {
 constexpr int kLendTierTokens = 4096;   // a prompt this long reads without the VRAM tier, in larger chunks
-constexpr int kStepTailTokens = 256;     // a tail this short may read one decode step at a time when no workspaces fit
+constexpr int kStepTailTokens = 16;     // a tail shorter than this reads one decode step at a time when no workspaces fit
 
 #define DS_CUDA(call)                                                                                   \
     do {                                                                                                \
@@ -261,8 +261,8 @@ public:
                 // the caches take their memory before the prompt workspaces do
                 if (!ops_->ensure_positions(r.pos + r.n_tokens, err)) return prompt_failed(err);
                 if (!prefill_ && !make_prefill_fit(plan_tokens, err)) {
-                    // a long context's caches left no room: a short tail takes the decode path, a longer read the tier's memory
-                    if (r.n_tokens <= kStepTailTokens) {
+                    // a long context's caches left no room: a short tail (< 16 tokens) takes the decode path, a longer read the tier's memory
+                    if (r.n_tokens < kStepTailTokens) {
                         close_prompt_path();
                         for (int i = 0; i < r.n_tokens; ++i)
                             if (!step(r.tokens + i, 1, r.pos + i, false, nullptr, nullptr, err)) return {model::Status::Error, err};
@@ -343,10 +343,7 @@ public:
         if (t == nullptr) return {model::Status::Error, e.empty() ? std::string("this session has no expert tier") : e};
         cudaStreamSynchronize(stream_);
         release_short_prompt();
-        t->set_free_floor(mib);
-        t->lend_all();
-        if (!t->reclaim(e)) return {model::Status::Error, e};
-        t->grow();
+        if (!t->replan(mib, e)) return {model::Status::Error, e};
         expert_slots = t->slots();
         return {};
     }
@@ -661,7 +658,8 @@ private:
             allocs_.push_back(v);
             dev = (float*) v;
         }
-        if (cudaMemcpy(dev, host, bytes, cudaMemcpyHostToDevice) != cudaSuccess) { err = "the logit bias upload failed"; return false; }
+        // on the sampling stream, so the draw that reads it is ordered after the upload
+        if (cudaMemcpyAsync(dev, host, bytes, cudaMemcpyHostToDevice, stream_) != cudaSuccess) { err = "the logit bias upload failed"; return false; }
         return true;
     }
 

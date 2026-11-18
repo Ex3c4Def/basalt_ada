@@ -156,6 +156,9 @@ public:
     std::vector<ConvCheckpoint> checks{};
     /// The checkpoint save in flight (see ckd_finish).  Declared after `checks`: its wait runs before their bytes are freed.
     basalt::core::CheckpointDeferral ckd{};
+    /// A model split across two cards: the second card's part of that save, on its device.
+    basalt::core::CheckpointDeferral ckd_peer{};
+    int ckd_peer_dev = -1;
     /// A checkpoint of `to` tokens already in the chain is used again (and keeps the higher `source`): true.
     bool touch_check(int64_t to, ConvCheckpoint::Source source);
     /// Adds a checkpoint to the chain; the least recently used one goes first past --prompt-cache.
@@ -183,9 +186,37 @@ public:
     // GENT: the request text arrives as bytes and the reader thread turns it into ids, from the pack's tokenizer tables
     basalt::program::Tokenizer text_tokenizer{};
     std::string text_tokenizer_note{};
+    /// The raw bytes a token stands for; empty when the pack's tokenizer tables are not loaded or the id has none.
+    std::string_view token_bytes(int32_t id) const {
+        return !text_tokenizer_note.empty() || id < 0 || (size_t) id >= text_tokenizer.vocab_size()
+                   ? std::string_view() : std::string_view(text_tokenizer.token_bytes(id));
+    }
     std::mutex gent_mu{};
     std::map<uint64_t, std::vector<int32_t>> gent_ids{};   // tokenized prompts waiting for their request line, by sequence
     uint64_t gent_seq{};
+    // ---- --batch: a prompt the server sends once (`PROMPT`: text the engine tokenizes, `PROMPTI`: ids) and then names by
+    // handle (`#<handle>[+<id>,...]` where a GEN line has its ids), so a request that runs in several engine runs or
+    // waits for a slot does not send or tokenize it again.  The input thread takes it in and answers `PROMPT <handle>
+    // <n>` at once, even while a request runs; `PMATCH <handle>` then says what each idle slot holds of it.  Guarded by gent_mu.
+    struct HeldPrompt {
+        std::vector<int32_t> ids;
+        bool media = false;   ///< its pictures are placed by the request that reads it: a held conversation meets it only as an exact prefix
+    };
+    std::map<uint64_t, HeldPrompt> prompts{};
+    static constexpr size_t kPromptsMax = 64;
+    /// The tokens an idle slot's conversation holds for its next turn; null when it holds none (or is decoding).
+    const std::vector<int32_t>* idle_ids(int b) const;
+    struct SlotMeet {
+        int64_t match = 0;   ///< the tokens of the prompt the slot's conversation covers, the same ones the request would reuse from it
+        int64_t held = 0;    ///< the tokens it holds
+    };
+    std::vector<SlotMeet> slot_meets(const std::vector<int32_t>& prompt, bool media) const;
+    /// Holds a prompt and returns its handle.
+    uint64_t hold_prompt(HeldPrompt&& p);
+    /// PROMPTI [img] <id,id,...>, from the input thread: held and answered.
+    void take_prompt_ids(const std::string& line);
+    /// PMATCH <handle> | PFREE <handle>, from the main loop.
+    void prompt_command(const std::string& line);
     std::atomic<bool> stop_req{};
     std::atomic<bool> stdin_lost{};
     std::thread reader_{};
@@ -247,7 +278,7 @@ public:
         bool from_sfx = false;
         double acc = 0.6;          ///< drafts accepted per offered, smoothed: who gets the free rows
         int64_t since_draft = 0;   ///< windows since the slot last drafted
-        int64_t windows = 0;
+        int64_t windows = 0;   ///< the request's windows in this slot, for BDONE
         int64_t drafts_accepted = 0, drafts_offered = 0;   ///< the request's draft tokens, for BDONE
     };
     std::vector<BSlot> bs{};

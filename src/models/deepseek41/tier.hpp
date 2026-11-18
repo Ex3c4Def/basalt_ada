@@ -11,6 +11,7 @@
 #pragma once
 
 #include "basalt/core/expert_cache.hpp"
+#include "basalt/core/loader.hpp"
 #include "basalt/core/ram_load.hpp"
 #include "basalt/program/expert_spill.hpp"
 #include "basalt/program/probe_rates.hpp"
@@ -26,6 +27,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <vector>
@@ -70,17 +72,28 @@ public:
         uint64_t beside_homes = 0; ///< beside homes and the copies next to them, where a short prompt's workspaces fit
         uint64_t modules = 0;      ///< ... until a first token has loaded the kernel modules
     };
-    /// Sizes the tiers and loads them. `h_rows`: the mapped rows a second card shares with the CPU pool.
-    bool open(const Reserve& reserve, float* h_rows, std::string& err);
+    /// Sizes the tiers and queues their experts' reads in `reads` (the start's one pass places them). `h_rows`: the mapped
+    /// rows a second card shares with the CPU pool.
+    bool open(const Reserve& reserve, float* h_rows, core::LoadPlan& reads, std::string& err);
+    /// Once the experts have landed: the RAM tier pinned, the main card's copies seeded, and the slots beside the base arena
+    /// planned once (an exact --expert-cache that does not fit stops the start here) and opened.
+    bool attach(std::string& err);
 
+    /// The tier's size is planned once, at the start (`attach`); nothing reads the free VRAM afterwards. A prompt
+    /// borrows slots inside that total and gives the same number back.
+    ///
     /// Gives the VRAM slots that the prompt path's workspaces occupy back to the driver (call before they are
-    /// allocated); `grow` takes the memory freed after them as extra slots. Residency in those slots is dropped.
+    /// allocated); `grow` opens the planned slots beside the base arena again, empty, once they are free.
     void shrink();
     void grow();
     /// A long prompt streams every expert to the main card and needs the card for its chunks: the slots that are
-    /// copies go back whole, and reclaim() opens them again empty. Homes stay.
+    /// copies go back whole, and reclaim() opens the same number again, empty (an error if the card cannot hold them
+    /// any more). Homes stay.
     void lend_all();
     bool reclaim(std::string& err);
+    /// An explicit new --vram-reserve-mib (`mib` < 0: the start's): the one time the size is planned again after the
+    /// start. The slots that fit above the new reserve are opened; the response reports them.
+    bool replan(int64_t mib, std::string& err);
     /// Main card bytes the tier, the caches and the prompt path leave free: --vram-reserve-mib, or `mib` once set
     /// (`mib` < 0: back to the start's). The arena is not resized here.
     void set_free_floor(int64_t mib);
@@ -135,9 +148,20 @@ public:
         const uint8_t* pinned = nullptr;
     };
     Source locate(int layer, int e) const;
-    core::PeerExperts* peer() const { return peer_.get(); }
-    /// The second card's share of a prompt chunk's experts; null without a second card.
-    prefill::PeerShare* peer_share() const { return share_.get(); }
+    /// The first second card (null without any): for "is there a second card" questions; per-layer work takes peer_for.
+    core::PeerExperts* peer() const { return peers_.empty() ? nullptr : peers_[0].get(); }
+    /// The second card that holds `layer`'s second-card homes (each card owns a block of layers), or null.
+    core::PeerExperts* peer_for(int layer) const {
+        return peers_.empty() ? nullptr : peers_[(size_t) layer_card_[(size_t) layer]].get();
+    }
+    /// Every second card, in block order (for work each card does once, such as loading kernel modules).
+    const std::vector<std::unique_ptr<core::PeerExperts>>& peers() const { return peers_; }
+    /// The first second card's share of a prompt chunk's experts; null without a second card.
+    prefill::PeerShare* peer_share() const { return shares_.empty() ? nullptr : shares_[0].get(); }
+    /// The share of `layer`'s prompt experts, opened on peer_for(layer)'s card; null without a second card.
+    prefill::PeerShare* share_for(int layer) const {
+        return shares_.empty() ? nullptr : shares_[(size_t) layer_card_[(size_t) layer]].get();
+    }
     /// What the split of a layer's experts between the cards prices them at.
     const prefill::ShareRates& share_rates(int layer) const { return rates_[(size_t) layer]; }
     /// The prompt path's and the images' host buffers, allocated before the RAM tier is sized.
@@ -161,6 +185,8 @@ public:
     void probe_env(program::ProbeEnv& env);
 
 private:
+    bool plan_ext(std::string& err);
+    bool reopen_base(int64_t n, std::string& err);
     /// A slot's copy on its way. `out` >= 0: the home it replaces is on its way to RAM place `place`.
     struct Pending {
         int layer, expert, slot, event;
@@ -193,8 +219,10 @@ private:
     void land_all();
     void apply(const Pending& p);
     void apply(const PeerMove& m);
-    bool load_ram(std::string& err);
-    bool open_share(std::string& err);
+    bool load_ram(core::LoadPlan& reads, std::string& err);
+    bool land_ram(std::string& err);
+    bool open_share(size_t card, std::string& err);
+    void fill_share_rates();
     int ranked(int layer, int r) const;
     bool load_rank(std::string& err);
     void seed_copies(int64_t n);
@@ -222,7 +250,10 @@ private:
     int64_t per_layer_ = 0;                 ///< VRAM slots each layer owns in the base arena
     core::ExpertCache ext_;                 ///< slots beside the base arena, open only while no prompt workspace is
     int64_t ext_per_layer_ = 0;             ///< slots each layer owns in `ext_`
-    bool unread_said_ = false;              ///< `grow` has said that the runtime could not answer
+    bool ram_queued_ = false;               ///< the RAM tier's reads are in the start's pass
+    std::chrono::steady_clock::time_point ram_t0_{};
+    int64_t ext_n_ = 0;                     ///< the slots per layer `grow` opens in `ext_`: planned at the start (and by replan)
+    int64_t exact_per_layer_ = 0;           ///< an exact --expert-cache, per layer; 0 when auto
     int64_t lent_per_layer_ = 0;            ///< base slots given up by lend_all(), 0 when none
     std::vector<int32_t> res_;              ///< [layer * n_expert + e] VRAM slot or -1
     std::vector<uint64_t> stamp_;           ///< [layer * n_expert + e] last use
@@ -263,8 +294,10 @@ private:
     std::vector<uint16_t> uses_;            ///< [layer * n_expert + e] CPU uses toward a promotion, with reads_ open
     int64_t read_ = 0;                      ///< experts read into the RAM tier
     PromptHost host_;
-    std::unique_ptr<core::PeerExperts> peer_;
-    std::unique_ptr<prefill::PeerShare> share_;
+    std::vector<std::unique_ptr<core::PeerExperts>> peers_;   ///< [card] the second cards, each holding blocks_'s layers
+    std::vector<std::unique_ptr<prefill::PeerShare>> shares_; ///< [card] the prompt share on the same card
+    policy::PeerBlocks blocks_;             ///< card c holds the second-card homes of layers [lo[c], hi[c])
+    std::vector<int> layer_card_;           ///< [layer] its card in peers_ / shares_
     std::vector<prefill::ShareRates> rates_;    ///< [layer]
     std::vector<kernels::cpu::NativeFmt> fmt_;   ///< [layer]
     std::unique_ptr<kernels::cpu::ExpertPool> pool_;

@@ -37,11 +37,11 @@ bool checkpoint_restore(const ConvCheckpoint& c, basalt::core::SessionState& ss,
 uint64_t conversation_identity(const Options& o, const basalt::core::ModelGeometry& g) {
     using basalt::core::conversation_store_hash;
     char num[512];
-    std::snprintf(num, sizeof num, " rope %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g cvec %d %d %d %d", o.rope_scale,
-                  o.rope_freq_base, o.rope_freq_scale, o.yarn_orig_ctx, o.yarn_ext_factor, o.yarn_attn_factor,
-                  o.yarn_beta_fast, o.yarn_beta_slow, o.cvec_first, o.cvec_last, o.cvec_mode, o.cvec_single);
+    std::snprintf(num, sizeof num, " rope %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g cvec %d %d %d %d", o.rope.scale,
+                  o.rope.freq_base, o.rope.freq_scale, o.rope.orig_ctx, o.rope.ext_factor, o.rope.attn_factor,
+                  o.rope.beta_fast, o.rope.beta_slow, o.cvec_first, o.cvec_last, o.cvec_mode, o.cvec_single);
     std::string text = std::string("basalt conversation state kv ") + o.kv + " rope " +
-                       o.rope_scaling + num + " mtp " + o.mtp + " vision_in_engine " + (o.vision_in_engine ? "1" : "0");
+                       o.rope.type + num + " mtp " + o.mtp + " vision_in_engine " + (o.vision_in_engine ? "1" : "0");
     for (const auto& [path, scale] : o.cvec_files) text += " cvec " + path + " " + std::to_string(scale);
     uint64_t h = conversation_store_hash(text.data(), text.size(), 1);
     const int64_t geo[] = {g.n_embd, g.n_layers, g.qsa_interval, g.ssm_state_size, g.ssm_v_heads, g.n_head_kv,
@@ -173,7 +173,10 @@ bool QfnRuntime::park_current(size_t held, int64_t kept) {
         for (size_t k = 0; k < n_st; ++k) {   // the later stages
             auto& st = stages[k];
             const basalt::core::OnDevice on(st->dev);
-            if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
+            if (const cudaError_t ce = cudaDeviceSynchronize(); ce != cudaSuccess) {
+                err = std::string("stage sync failed: ") + cudaGetErrorString(ce);
+                return false;
+            }
             const basalt::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
             basalt::core::SavedConversation part;
             if (!basalt::core::conversation_snapshot_save(part, view_k, st->ss, g, draft_of(k), err,

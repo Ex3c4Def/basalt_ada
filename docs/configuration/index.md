@@ -30,7 +30,7 @@ A config file is one JSON object. `models` lists the models; `engine` applies to
   `engine` (an engine flag) the same places, `model entry` a model entry only.
 - Keys are flag names without dashes. Switches are `true`. A repeatable option (`allowed-host`, `cors-origin`, `image-url-host`,
   `image-dir`) takes a list. `model` paths are relative to the file.
-- A row marked Flash-Next only or DeepSeek only stops the start in a model entry or on the command line of the other model; in the top-level `engine` it is left out for that model, with a start line ([checks at start](models.md#checks-at-start)).
+- A row that names its models (Flash-Next only, DeepSeek only, ...) stops the start in a model entry or on the command line of another model; in the top-level `engine` it is left out for that model, with a start line ([checks at start](models.md#checks-at-start)).
 - Precedence: command line, then config file, then defaults; `--model` and `--alias` do not go with `--config` (its entries name the models).
   A wrong block or an unknown name stops the start. `api-key` cannot be in a file.
 - The defaults are the fastest settings that need no knowledge of the machine. The keys that change output or memory (8,192 context,
@@ -72,6 +72,7 @@ Command line `--name`; the Where column says which config block takes it.
 | `debug` | server | switch | off | One log line per request, and the raw model text. |
 | `request-lines` | server | switch | off | Echo the per-request summary on stdout. |
 | `temperature`, `top-p`, `top-k`, `min-p`, `presence-penalty`, `frequency-penalty`, `repetition-penalty`, `penalty-last-n`, `seed` | entry | number (`top-k`, `penalty-last-n`, `seed`: integer) | the model file's `sampling`, else the engine's | Default for a request that leaves the field out. See [sampling](sampling.md). |
+| `reasoning-effort` | entry | `none`, `low`, `medium`, `high`, `xhigh` or `max` | unset (the template's default) | Reasoning effort for requests that name no effort, thinking switch or budget. See [sampling](sampling.md). |
 | `reasoning-budget-tokens` | entry | integer | `0` | Thinking budget for requests that name none. A request's own value wins. |
 | `thinking-loop-tokens` | entry | integer | `256` | End thinking when one token repeats this many times in a row; `0` turns it off. |
 | `answer-room` | entry | `auto` or integer | `auto` | Output tokens kept for closing the thinking and the answer: `auto`, or a fixed number (`0`: none). See [sampling](sampling.md#thinking). |
@@ -90,11 +91,11 @@ Command line `--name`; the Where column says which config block takes it.
 | --- | --- | --- | --- | --- |
 | `max-context` | engine | tokens | 8192 | Longest context. Shared by `parallel` slots. The KV cache grows with it. |
 | `kv` | engine | Flash-Next: `fp16`, `int8`, `q4_0`, `k8v4`; DeepSeek: `fp8`, `fp16`; Qwen3.8-27B: `fp16`, `int8` | Flash-Next `fp16`, DeepSeek `fp8`, Qwen3.8-27B `fp16` | KV storage. Qwen3.8-27B: `int8` takes about half of `fp16`'s memory per position ([guide](../models/qwen38-27b.md#memory)). Flash-Next: `int8` halves VRAM; `q4_0` is 4-bit after rotation; `k8v4` keeps K int8 and V 4-bit (816 bytes per cell against `int8`'s 1,056); not with `kv-resident`. DeepSeek: `fp8` rounds as the model's reference (FP8 window rows, FP4 compressed rows and index keys, 920 bytes per position); `fp16` keeps the unrounded values (3,200 bytes per position). A model refuses the other's values. |
-| `kv-resident` | engine | cells (min 20,480) or `0` | 0 | Flash-Next only. Keep N cells of KV in VRAM and the rest in pinned RAM. With `parallel` and `kv` `int8`, every slot streams its own K/V this way. |
-| `rope-scaling` | engine | `none`, `linear`, `yarn` | model's, else `none` | Flash-Next only. Extend past the trained length. Fixed for the run. |
-| `rope-scale` | engine | number | model's, else 1 | Flash-Next only. Factor for `linear` and `yarn`. |
-| `rope-freq-base`, `rope-freq-scale` | engine | number | 0 (model's own) | Flash-Next only. Raw RoPE values. Leave at 0 unless you know them. |
-| `yarn-orig-ctx`, `yarn-ext-factor`, `yarn-attn-factor`, `yarn-beta-fast`, `yarn-beta-slow` | engine | number | 0 (262144), auto, 1, 32, 1 | Flash-Next only. YaRN parameters, as in llama.cpp. |
+| `kv-resident` | engine | cells (Flash-Next: min 20,480) or `0` | 0 | Flash-Next and Qwen3.8-27B. Keep N cells of KV in VRAM and the rest in pinned RAM. Flash-Next: with `parallel` and `kv` `int8`, every slot streams its own K/V this way. Qwen3.8-27B: each attention layer keeps its first N positions on the card and every decoded token reads the rest over the bus, so decode slows with each one ([guide](../models/qwen38-27b.md#memory)); output is unchanged. |
+| `rope-scaling` | engine | `none`, `linear`, `yarn` | model's, else `none` | Flash-Next and Qwen3.8-27B. Extend past the trained length (Qwen3.8-27B: `--max-context` up to 262,144 x `rope-scale`). Fixed for the run, and it changes every position's rotation, short prompts too ([precision](../precision/qwen38-27b.md#context-past-262144)). |
+| `rope-scale` | engine | number | model's, else 1 | Flash-Next and Qwen3.8-27B. Factor for `linear` and `yarn`. |
+| `rope-freq-base`, `rope-freq-scale` | engine | number | 0 (model's own) | Flash-Next and Qwen3.8-27B. Raw RoPE values. Leave at 0 unless you know them. |
+| `yarn-orig-ctx`, `yarn-ext-factor`, `yarn-attn-factor`, `yarn-beta-fast`, `yarn-beta-slow` | engine | number | 0 (the model's 262144), auto, 1, 32, 1 | Flash-Next and Qwen3.8-27B. YaRN parameters, as in llama.cpp. |
 
 ## Expert cache and memory
 
@@ -111,7 +112,7 @@ Command line `--name`; the Where column says which config block takes it.
 | `resident-cpu-experts` | engine | switch | off (implied by `resident-experts`) | Flash-Next only. With `mmap-experts`: keep RAM-resident experts in ordinary RAM. |
 | `vram-elastic` | engine | switch | off | Flash-Next only. Hold the expert cache in segments so `POST /v1/vram` can lend VRAM between requests. |
 | `vram-segment-mib` | engine | MiB, at least 64 | 512 | Flash-Next only. Segment size for `vram-elastic`. |
-| `expert-cache` | engine | `auto` or a count | `auto` | Expert blobs kept in VRAM. `auto` takes what fits after weights, session and reserve. |
+| `expert-cache` | engine | `auto` or a count | `auto` | Expert blobs kept in VRAM. `auto` takes what fits after weights, session and reserve. A count is honoured exactly or the start is refused with a one-line message (what fits, the free VRAM, the reserve); it is never trimmed. |
 | `ram-reserve-mib` | engine | MiB | 2048 | RAM left free for the rest of the system. The expert tiers take what is above it after the engine's own host buffers, and the serving RAM guard holds it. `0` keeps nothing and turns the guard off. [memory floors](../running.md#memory-floors) |
 | `adapt-every` | engine | windows | 1 on a server, 4 with a layer split (`0` = off) | Flash-Next only. An adaptive round every N windows. [adaptive](adaptive.md) |
 | `adapt-swaps` | engine | integer | 96 (`0` = off) | Flash-Next only. Most experts one round swaps into the main GPU. [adaptive](adaptive.md) |
@@ -136,7 +137,7 @@ Unless `relaxed-drafting` is on, output is exactly plain decoding's.
 | --- | --- | --- | --- | --- |
 | `spec` | engine | integer | 8 (MTP), 6 (DSpark), 16 (Qwen3.8-27B), else 0 | Verify windows of at most N tokens (Qwen3.8-27B: up to 16). `0` or `1` turns it off. |
 | `draft-experts` | engine | 32, 64, 96, 128, or 0 | 32 | DeepSeek only. Experts each drafter stage keeps (`0` = all 128). |
-| `suffix-draft` | engine | tokens | 3 (`0` = the drafter only) | Flash-Next and Qwen3.8-27B. Prompt lookup: fill a window from an earlier repeat of at least N tokens. |
+| `suffix-draft` | engine | tokens | 3 (`0` = the drafter only) | Flash-Next and Qwen3.8-27B. Prompt lookup: fill a window from an earlier repeat of at least N tokens. Its index takes host RAM by `max-context`: 64 MiB per slot at 262,144 tokens. |
 | `mtp-max-t` | engine | integer | 0 (= `spec`) | Flash-Next only. Caps the MTP's own windows. |
 | `mtp-window` | engine | cells | 32768 (`0` = all) | Flash-Next only. The drafter attends to the last N cells. |
 | `relaxed-drafting` | engine (`[P]`) | `true` or 0 to 1 | off | Flash-Next only. **Changes output.** Under sampling, keeps a draft the model gives probability P or more. Greedy, `logit_bias`, JSON and tool calls stay exact. [precision](../precision/qwen38-flash-next.md#relaxed-drafting) |

@@ -1,6 +1,8 @@
 # GPUs
 
-Flash-Next uses every mechanism on this page. DeepSeek takes one second card as an expert tier and nothing else.
+Flash-Next uses every mechanism on this page. DeepSeek takes up to four second cards as expert tiers and nothing else, each
+holding the experts of its own block of layers ([DeepSeek memory](../models/deepseek41.md#memory)).
+Qwen3.8-27B uses a second card for long prompts, or for its later layers when it does not fit the main card.
 
 One setting picks the cards: `gpu`. It means the same in the server (`"gpu"` in the config's `server` section, or
 `--gpu`), in `basalt` itself, in `basalt-bench` and in `basalt-probe`.
@@ -9,11 +11,12 @@ One setting picks the cards: `gpu`. It means the same in the server (`"gpu"` in 
 | --- | --- | --- |
 | not set | GPU 0 alone; one warning at start names the other visible cards | GPU 0 |
 | `"0,1"`, `"1,0"`, ... | exactly these, in this order | the first one listed |
-| `"auto"` | every visible Blackwell (sm_120) card; any other card is skipped with one line naming it | the one with the most memory bandwidth, then the most VRAM |
+| `"auto"` | every visible Blackwell (sm_120) or Ada (sm_89) card; any other card is skipped with one line naming it | the one with the most memory bandwidth, then the most VRAM |
 
 Cards are numbered as `nvidia-smi` numbers them. When `CUDA_VISIBLE_DEVICES` is set, the numbers count within its list
 (`CUDA_VISIBLE_DEVICES=1,0` makes `gpu 0` the card `nvidia-smi` calls 1), and its numbers are read as `nvidia-smi`'s
-too. A number past the visible cards, a card listed twice or a card that is not Blackwell stops the start with an error.
+too. A number past the visible cards, a card listed twice, a card that is neither sm_120 nor sm_89, or one the build holds
+no code for ([an Ada card](#an-ada-sm_89-card)) stops the start with an error.
 
 The main card holds the dense weights, the KV cache, the drafter and its own expert cache. The engine decides what the
 other cards do and prints one line at start, for example `gpus: RTX 5090 (nvidia-smi 0) main, RTX 5060 Ti (nvidia-smi 1)
@@ -29,15 +32,22 @@ expert tier`:
   2,559 rows when it is slower (a slower card costs a longer chunk more than the experts it saves the main card's link).
   When its memory is faster than the main card's it takes a share of each GDN mixer and of the head (one start line
   each; see [the GDN split](../precision/qwen38-flash-next.md#gdn-split-across-two-cards)).
-- **Idle.** The engine runs up to three expert tiers: a fifth card and later ones stay idle.
+- **Idle.** The engine runs up to three expert tiers: a fifth card and later ones stay idle. So does a card that would hold no
+  expert: when the main card holds every expert, or a card has no room for one, the start says `no expert tier` for that
+  card and runs without it.
 
 Three or more cards are community-tested: the path is checked here on two cards, with two expert tiers sharing the
 second one. Reports from machines with three or four cards are welcome (see [community](../community.md)).
 
 ## What several cards do together
 
-A dense model (Qwen3.8-27B) runs on the main card alone: it reads every weight every token, so a layer split would put part of
-each token on the slower card. The server warns that the other cards are unused.
+A dense model (Qwen3.8-27B) decodes on the main card alone when the model, its context and its slots fit there: it reads every weight
+every token, so a split would put part of each token on the slower card. A second card (the start line calls it the `prompt split`) then
+reads the last layers of long prompts as a pipeline beside the main card ([Qwen3.8-27B](../models/qwen38-27b.md#long-prompts-on-two-cards));
+the split is off with `kv-resident`. When they do not fit, the second card is a `layer stage`: it holds the later layers with their KV cache
+and recurrent state and runs them in every decode window and prompt chunk, and the output is the main card's alone to the bit
+([Qwen3.8-27B](../models/qwen38-27b.md#two-cards-when-it-does-not-fit-one)). Later cards idle. `"auto"` gives the 27B both cards when two
+Blackwell cards are visible; without room on the second card the start says why and the model runs on the main card alone.
 
 With two or more cards the engine prices three mechanisms at start, as milliseconds per decode window, from the cards'
 memory bandwidth, their VRAM and the model's size, and prints one line, for example
@@ -102,3 +112,19 @@ room for the buffers of that share (about 200 MiB, the size is computed, not a s
 `prefill peer: the peer's buffers do not fit`, raise `peer-reserve-mib` (the card shows a display or another program using
 its VRAM) and the second card's experts shrink by the same amount. The start line `peer GPU 1: N experts` says how many
 it holds.
+
+## An Ada (sm_89) card
+
+On this fork every path also runs on sm_89 (Ada): an Ada card can be the only card, the main card or a second card. The
+build must hold its code: `-DCMAKE_CUDA_ARCHITECTURES=89` for Ada cards alone, `"120;89"` beside a Blackwell card
+(`-DPEER_ADA=ON` adds 89 to the list). The engine refuses at start a card its build holds no code for. On 8.9 the kernels
+that need thread-block clusters, bulk async copies or FP4 tensor cores are compiled out and their callers take plain
+kernels ([Ada port notes](../../ADA_PORT_NOTES.md)). On a Blackwell + Ada pair:
+
+- Flash-Next: both cards read NVFP4 prompts through MMQ (its FP4 prompt kernels run only when every card is 12.x), so
+  the buffers, chunk plan and row rounding are the same on both. Its decode does not use FP4 tensor cores.
+- DeepSeek takes an Ada second card; its peer-tier kernels are built for 8.9 as well.
+- Flash-Next's layer split, overlapped windows and tensor parallel need matched cards; an unlike pair uses the expert
+  tier.
+- Not run here: no Blackwell card was available, so a mixed pair has been checked only with the 4090 alone running the
+  `"120;89"` binary.

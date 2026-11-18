@@ -11,9 +11,10 @@ import time
 from pathlib import Path
 from typing import Iterator
 
-from serve.engine.errors import EngineDied, EngineSilent, EngineStartError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
+from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStarting, EngineStuck, GpuBusy, ModelBusy, WakeBlocked
 from serve.engine.mock import Engine
-from serve.frontend import ChatTemplate, Event, images_of, mark_think_literals, media_of, unmark_think_literals
+from serve.frontend import ChatTemplate, Event, effort_kwargs, images_of, mark_think_literals, media_of, unmark_think_literals
+from serve.util import vram
 from serve.util.logbuf import LogBuffer
 from serve.security import LOOPBACK_NAMES
 from serve.models import Dialect, dialect_for
@@ -148,6 +149,7 @@ class Service:
         self.vram_reserve = None                         # last POST /v1/vram reserve (None: the start's)
         self.reasoning_budget_tokens = 0                 # default thinking budget (0: none)
         self.answer_room: str | int = "auto"             # answer reserve when thinking: "auto" or a fixed token count (0: none)
+        self.reasoning_effort: str | None = None         # effort for a request that names none (None: the template's)
         self.thinking_loop_tokens = 256                  # one token repeated this often in the thinking ends it (0: off)
         self.anthropic_think_unasked = True               # "anthropic_thinking": "on_request" -> False
         self.stop_ids = {t for s in self.dialect.stop_texts for t in tokenizer.encode(s, parse_special=True)}
@@ -285,8 +287,10 @@ class Service:
                 time.sleep(0.5)
                 free = self.free_vram_mib()
             if free is not None and free < self.min_free_vram_mib:
+                held = vram.holders([int(getattr(self, "gpu_index", 0) or 0)])
                 raise GpuBusy(f"the GPU is in use by another program: {free} MiB of VRAM free, the model needs "
-                              f"{self.min_free_vram_mib} (min_free_vram_mib) - it stays unloaded until that is free")
+                              f"{self.min_free_vram_mib} (min_free_vram_mib)" + (f"; held by {held}" if held else "") +
+                              " - it stays unloaded until that is free")
         if self._vision_down():                         # first: a GPU encoder takes its VRAM before the engine sizes its cache
             print("[server] restarting the vision encoder", flush=True)
             self.vision.restart()
@@ -300,8 +304,12 @@ class Service:
         elif getattr(self.engine, "unloaded", False):
             print("[server] loading the model again", flush=True)
         else:
-            code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
-            print(f"[server] warning: the engine stopped (exit code {code}), restarting it", flush=True)
+            note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
+            if not note:
+                code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
+                note = f"the engine stopped (exit code {code})"
+            log = getattr(self.engine, "log_path", None)
+            print(f"[server] warning: {note}, restarting it{', log ' + log if log else ''}", flush=True)
         try:
             tries = 1 if self.booting else self.start_tries   # the start-up load tries once
             self.engine.restart(tries=tries) if tries else self.engine.restart()
@@ -352,7 +360,10 @@ class Service:
         """Print the server-window line for an engine that ended mid-request."""
         note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
         log = getattr(self.engine, "log_path", None)
-        why = f"{e}: {note}" if note else str(e)
+        if note and note in str(e):
+            why = str(e)
+        else:
+            why = f"{e}: {note}" if note else str(e)
         print(f"[server] warning: {why} (the next request restarts it{', log ' + log if log else ''})", flush=True)
 
     def require_grammar(self, response_format) -> None:
@@ -394,12 +405,38 @@ class Service:
         """Wake a sleeping engine (caller holds fifo); a failed wake ends it and the next start loads it again."""
         t = time.time()
         try:
-            self.engine.wake()
+            self.engine.wake(vram_check=self._wake_vram_check)
+        except WakeBlocked as e:                        # nothing was touched: it stays asleep until the memory is free
+            print(f"[server] error: the model cannot wake: {e}", flush=True)
+            raise GpuBusy(f"the model cannot wake: {e}") from None
         except (ValueError, EngineDied) as e:
             print(f"[server] warning: waking the model failed ({e}); loading it again", flush=True)
             return
         print(f"[server] model awake in {time.time() - t:.1f} s (driver restore {self.engine.restore_s:.1f} s)",
               flush=True)
+
+    WAKE_VRAM_WAIT_S = 15.0                              # for memory just released elsewhere
+
+    def _wake_vram_check(self, parked: dict[int, int] | None) -> str | None:
+        """Whether the VRAM a sleeping engine's state needs is free again on each card; None if so (or unknown), else who
+        holds it. The driver restores the state at its old addresses, so each card's memory has to be there as it was: a
+        restore into a card someone else filled fails halfway, and the state is then lost."""
+        if not parked:
+            return None
+        deadline = time.time() + self.WAKE_VRAM_WAIT_S
+        while True:
+            short = {}
+            for g, need in parked.items():
+                free = vram.free_mib(g)
+                if free is not None and free < need:
+                    short[g] = (need, free)
+            if not short:
+                return None
+            if time.time() >= deadline:
+                held = vram.holders(list(short))
+                what = "; ".join(f"GPU {g} needs {n} MiB and has {f} MiB free" for g, (n, f) in short.items())
+                return what + (f"; held by {held}" if held else "") + " - the model stays asleep until that is free"
+            time.sleep(0.5)
 
     sleep_refused_at = None                              # the request an idle sleep was last refused after
     SLEEP_RAM_MARGIN_MIB = 8192                          # RAM left free once the GPU state is in host memory
@@ -448,7 +485,10 @@ class Service:
 
     def _sleep_fits(self) -> str | None:
         """Whether the GPU memory the engine still holds fits in RAM with the margin left; None if so, else why not."""
-        used = self.used_vram_mib()
+        pid = getattr(getattr(self.engine, "proc", None), "pid", None)
+        used = vram.process_mib(pid) if pid else None    # the engine's own memory: what the driver moves to RAM
+        if used is None:
+            used = self.used_vram_mib()
         avail = available_ram_mib()
         if used is None or avail is None:
             return None if avail is not None else "RAM unreadable"
@@ -507,9 +547,7 @@ class Service:
                     return "busy"
             if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
                 return "busy"
-            if getattr(self.engine, "asleep", False) is True:
-                self._wake()
-            self.engine.unload()
+            self.engine.unload()                        # a sleeping engine is resumed (or killed) by its close()
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
             print(f"[server] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}, the next request loads it", flush=True)
@@ -582,12 +620,22 @@ class Service:
         return {"total": max(1, total), "active": max(0, min(max(1, total), running - waiting)),
                 "queue_depth": queued + waiting}
 
+    def _engine_slots(self, total: int) -> list[dict] | None:
+        """The engine's own slots (ProcessEngine.slot_view), when it has one per row; None otherwise."""
+        view = getattr(self.engine, "slot_view", None)
+        view = view() if callable(view) else None
+        return view if isinstance(view, list) and len(view) == total else None
+
     def slot_table(self) -> tuple[list[dict], list[dict]]:
-        """Per-slot rows and the waiting requests. The oldest running requests take the slots, each keeping its
-        slot until it ends; the rest of the live requests wait for admission."""
+        """Per-slot rows and the waiting requests. Row N is the engine's slot N when the engine says which request
+        runs where (an idle row then shows what its slot holds for the next turn); otherwise the oldest running
+        requests take the rows, each keeping its row until it ends. The rest of the live requests wait for
+        admission."""
         base = self.slot_stats()
         total, active = base["total"], base["active"]
         now = time.time()
+        view = self._engine_slots(total)
+        owners = {v["owner"]: b for b, v in enumerate(view or []) if v["owner"] is not None}
         with self.status_lock:
             if self.live_reqs:
                 live = [st for st, _ in self.live_reqs.values()]
@@ -596,7 +644,13 @@ class Service:
                 live = [self.status] if self.status.get("busy") else []
                 rates = {id(self.status): list(self.rate)}
             live.sort(key=lambda st: st.get("started") or 0)
-            running, waiting = live[:active], live[active:]
+            if owners:                                  # a request in no slot waits for one
+                running = [st for st in live if st.get("thread") in owners]
+                waiting = [st for st in live if st.get("thread") not in owners]
+                for st in running:
+                    st["slot"] = owners[st["thread"]]
+            else:
+                running, waiting = live[:active], live[active:]
             taken = {st["slot"] for st in running if st.get("slot") is not None and st["slot"] < total}
             for st in running:
                 if st.get("slot") is None or st["slot"] >= total:
@@ -620,20 +674,39 @@ class Service:
                    "prefill_done": 0, "reused": None, "ttft_s": None, "draft_len": None,
                    "ctx_used": held.get("ctx", 0), "drafts_offered": held.get("offered"),
                    "drafts_accepted": held.get("accepted")}       # draft counts are the slot's last finished request's
+            if view:
+                row["ctx_used"] = view[i]["held"]
             if i in by_slot:
                 st, rate = by_slot[i]
                 prompt, gen = int(st.get("prompt_tokens") or 0), int(st.get("generated") or 0)
                 decoding = st.get("first_token") is not None
                 done = prompt if decoding else (min(progress[0], prompt) if progress and reading == [i] else None)
-                windows = st.get("windows") or 0
+                # the finished passes' windows (the engine's own) and the run in progress (counted from its BT lines)
+                windows = (st.get("windows") or 0) + (st.get("run_windows") or 0)
+                win_tokens = (st.get("window_tokens") or 0) + (st.get("run_tokens") or 0)
                 row.update(state="decoding" if decoding else "prefill", api=st.get("api"), model=st.get("model"),
                            tok_s=round(self._rate_of(st, rate), 1), generated=gen, max_tokens=st.get("max_tokens"),
                            prompt_tokens=prompt, prefill_done=done, ctx_used=prompt + gen, reused=st.get("reused"),
                            ttft_s=round(st["first_token"] - st["started"], 2) if decoding and st.get("started")
                            else None,
-                           draft_len=round(st.get("window_tokens", 0) / windows, 2) if windows else None)
+                           draft_len=round(win_tokens / windows, 2) if windows else None)
             rows.append(row)
         return rows, queue
+
+    def prompt_progress(self, n_prompt: int | None) -> dict | None:
+        """llama.cpp's `prompt_progress` for the request this thread runs: {total, cache, processed, time_ms}, where
+        `processed` counts the cached prefix too; None before the engine has said anything of the read (or when it has
+        no such figures). `n_prompt` stands in for the total when only the cache is known."""
+        state = getattr(self.engine, "prompt_progress", None)
+        s = state() if callable(state) else None
+        if not isinstance(s, dict) or not s:
+            return None
+        total = s.get("total") if s.get("total") is not None else n_prompt
+        if total is None:
+            return None
+        cache = min(int(s.get("cache") or 0), total)
+        processed = min(max(int(s["read"]), cache), total) if s.get("read") is not None else cache
+        return {"total": total, "cache": cache, "processed": processed, "time_ms": int(s.get("ms") or 0)}
 
     def metrics(self) -> dict:
         """GET /metrics: engine facts, live state, recent requests, hardware and speed history."""
@@ -776,10 +849,18 @@ class Service:
             return prompt, []
         return unmark_think_literals(prompt, self.literals)
 
+    def thinking_kwargs(self, kwargs: dict) -> dict:
+        """The request's template kwargs, with the server's default effort when it names no effort and no thinking
+        switch (a request's budget already named a level)."""
+        if self.reasoning_effort is None or "reasoning_effort" in kwargs or "enable_thinking" in kwargs:
+            return kwargs
+        return {**kwargs, **effort_kwargs(self.reasoning_effort)}
+
     def encode_prompt(self, messages, tools, kwargs, videos=None) -> list[int]:
         """The rendered, tokenized prompt (see render_text). `videos`: the text standing for each video in prompt order,
         put in place of the template's marker before the prompt is tokenized, so its timestamps are tokenized with the
         text around them as the reference processor's are."""
+        kwargs = self.thinking_kwargs(kwargs)
         prompt, plain = self.render_text(messages, tools, kwargs)
         if videos is not None:
             prompt, plain = self._splice_videos(prompt, plain, videos)
@@ -846,6 +927,7 @@ class Service:
         prompt; with thinking, run() writes it once the thinking is over.  `image_access`: what this request's
         connection may name as an image; without one, the remote policy."""
         self.embeddings.path = None
+        kwargs = self.thinking_kwargs(kwargs)
         try:
             return self._prepare(messages, tools, kwargs, max_new, force, image_access or self.image_sources)
         except BaseException:
@@ -890,7 +972,7 @@ class Service:
             self._check_images(messages, images)
         if videos:
             self._check_videos(videos)
-        if not media and getattr(self.engine, "takes_text", False) and not getattr(self.engine, "batch", 0):
+        if not media and getattr(self.engine, "takes_text", False):
             return self._prepare_text(messages, tools, kwargs, max_new, force)
         results, spliced = [], None
         if media:
@@ -996,9 +1078,9 @@ class Service:
         with self.status_lock:
             s = self.status if st is None else st
             s["generated"] = n
-            windows = getattr(self.engine, "window_stats", None)
-            if windows is not None:
-                s["windows"], s["window_tokens"] = windows()
+            run_windows = getattr(self.engine, "window_stats", None)
+            if run_windows is not None:                  # the run in progress: its windows are known at its end
+                s["run_windows"], s["run_tokens"] = run_windows()
             if s.get("first_token") is None:
                 s["first_token"] = time.time()
             (self.rate if rate is None else rate).append((time.time(), n))   # live rate window
@@ -1122,6 +1204,7 @@ class Service:
         emb = getattr(self.embeddings, "path", None)
         # identity token: only a DONE line replaces engine.last, so a request without one records no stale figures
         engine_last0 = getattr(self.engine, "last", None)
+        counted_last = engine_last0                     # the `last` whose windows are in st: a pass without a DONE adds none
         path = getattr(self.request_ctx, "path", None)   # the API path serving this request
         # parallel requests keep their own status and rate window; otherwise self.status / self.rate
         par = bool(getattr(self.engine, "batch", 0))
@@ -1173,7 +1256,7 @@ class Service:
                     with self.status_lock:
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
-                                  max_tokens=max_new, slot=None, reused=None,
+                                  max_tokens=max_new, slot=None, reused=None, thread=threading.get_ident(),
                                   api="anthropic" if path == "/v1/messages" else "openai",
                                   model=getattr(self.request_ctx, "model", None) or self.model)
                         if par:
@@ -1331,6 +1414,18 @@ class Service:
                                 if not leaving and not cancel.is_set():
                                     raise
                         run_last = getattr(self.engine, "last", None)
+                        with self.status_lock:
+                            st["run_windows"] = st["run_tokens"] = 0
+                            if isinstance(run_last, dict) and run_last is not counted_last and run_last.get("windows"):
+                                # the pass's windows as the engine counted them over all its runs (solo and slot)
+                                st["windows"] = (st.get("windows") or 0) + run_last["windows"]
+                                st["window_tokens"] = (st.get("window_tokens") or 0) + n - n_pass0
+                                counted_last = run_last
+                        if isinstance(run_last, dict) and run_last is not engine_last0 and run_last.get("finish") == "error":
+                            finish = "error"          # the engine ended the request itself: the grammar allowed no token
+                            err = "the grammar allowed no token to continue the reply; the engine log has the state"
+                            print(f"[server] error: engine reported {err}", flush=True)
+                            raise EngineError(err)
                         if reused0 is None and isinstance(run_last, dict) and run_last is not engine_last0 \
                                 and run_last.get("reused") is not None:
                             reused0 = min(int(run_last["reused"]), len(ids))    # later passes extend this reply
@@ -1482,8 +1577,9 @@ class Service:
             yield "event", ev
         if stops is not None and stops.hit is None and stops.held:
             yield "event", Event("content", stops.flush())     # the held tail was not a stop string
+        # prompt_tokens: the engine's count, now known; a text prompt's length before the engine reads it is an estimate
         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
-                "timings": timings, "reasoning_tokens": thinking_n}
+                "timings": timings, "reasoning_tokens": thinking_n, "prompt_tokens": len(ids)}
         if stops is not None and stops.hit is not None:
             done["stop_sequence"] = stops.hit
         yield "done", done

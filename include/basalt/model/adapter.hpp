@@ -8,6 +8,7 @@
 #include "basalt/core/checkpoint_regions.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/sampler.hpp"
+#include "basalt/model/rope_flags.hpp"
 #include "basalt/program/grammar/tool_form.hpp"
 
 #include <cstdint>
@@ -22,6 +23,7 @@ class GgufFile;
 }
 namespace basalt::core {
 struct ConversationKv;
+class LoadPlan;
 }
 namespace basalt::program {
 struct CommonOptions;
@@ -96,6 +98,10 @@ struct LoadRequest {
     int draft_experts = 32;           ///< the drafter's routed experts each stage keeps (0: all)
     bool diag_tier_frozen = false;    ///< diagnostic: the VRAM tier keeps what it holds, no bus copy and no promotion
     std::string kv;                   ///< --kv: the KV storage as the model names it, checked by its flags (empty: default)
+    RopeFlags rope;                   ///< the rope scaling flags, for a model that takes them (rope_flags.hpp)
+    int64_t kv_resident = 0;          ///< --kv-resident: K/V cells per attention layer kept in VRAM (0: all)
+    std::vector<double> card_gbps;    ///< memory bandwidth of the main card, then of each peer device (GB/s, 0: unknown)
+    int diag_split_at = 0;            ///< diagnostic: a dense model's layers split at this one across two cards (0: off)
 };
 
 struct DecodeRequest {
@@ -180,7 +186,9 @@ public:
     virtual Result row_logprobs(int row0, int n, const int32_t* picks, int top, float* out) { (void) row0; (void) n; (void) picks; (void) top; (void) out; return {Status::NotImplemented, "this model keeps no logits"}; }
     /// The logits of row `row` of the last decoded window (n_vocab floats).
     virtual Result copy_logits(int row, float* out) { (void) row; (void) out; return {Status::NotImplemented, "this model keeps no logits"}; }
-    /// low: the VRAM the session can give back goes back to the driver; else it is taken again. The slots it holds now.
+    /// low: the VRAM the session can give back goes back to the driver; else it is taken again. The slots it holds now,
+    /// left at -1 by a session with no cache to lend (it answers ok and SLEEP goes on to the driver). Without this the
+    /// model cannot sleep.
     virtual Result set_low_memory(bool low, int64_t& expert_slots) { (void) low; (void) expert_slots; return {Status::NotImplemented, "this model cannot give VRAM back"}; }
     /// What the session leaves free on the main card from now on (`mib` < 0: the start's reserve), through prompts and
     /// images too; its VRAM use is resized to that now. The slots it holds now.
@@ -238,14 +246,28 @@ public:
     }
 };
 
-/// A loaded model: weights resolved, ready to make sessions.
+/// A model and its sessions.  Its start runs in three steps (ModelAdapter::start): the model's plan, the one pass that
+/// places every byte the plan queued (core::place_start), and the model's attach.
 class LoadedModel {
 public:
     virtual ~LoadedModel() = default;
     virtual const ModelDesc& desc() const = 0;
     /// The context the loaded model runs with, when it sizes that itself (0: the caller's --max-context stands).
     virtual int64_t context() const { return 0; }
-    virtual Result make_session(std::unique_ptr<ModelSession>& out) = 0;
+    /// Everything the model will hold is decided and allocated, in the order its sizing depends on (its weights, then what
+    /// is sized from the memory left: caches, tiers, prompt stages), and every byte it reads is queued in `reads`; no byte
+    /// is placed.  The model makes its req.sessions sessions here, into `sessions`, when what it sizes from the memory left
+    /// must see their state; else in attach().
+    virtual Result plan(const LoadRequest& req, core::LoadPlan& reads, std::vector<std::unique_ptr<ModelSession>>& sessions) = 0;
+    /// Once every queued byte has landed: the model connects what the reads filled (prompt stages, copies made from the
+    /// weights, checks of what was placed) and makes its sessions if plan() did not; they are then ready to run.
+    virtual Result attach(const LoadRequest& req, std::vector<std::unique_ptr<ModelSession>>& sessions) = 0;
+};
+
+/// A started model and its sessions.
+struct Started {
+    std::unique_ptr<LoadedModel> model;
+    std::vector<std::unique_ptr<ModelSession>> sessions;
 };
 
 /// The texts of the model's own tokens in the pack's vocabulary: the defaults of --eos-ids, --turn-token, --image-pad-id,
@@ -270,13 +292,17 @@ public:
     virtual std::string validate(const GgufFile& meta) const = 0;
     /// Geometry from the file's metadata.
     virtual ModelDesc describe(const GgufFile& meta) const = 0;
-    virtual Result load(const LoadRequest& req, std::unique_ptr<LoadedModel>& out) const = 0;
+    /// The model a start runs, before its plan; null for a model with its own start (run()).
+    virtual std::unique_ptr<LoadedModel> make_model() const { return nullptr; }
+    /// The start: the model's plan, the bytes it queued announced as the start's total and placed in one pass, its attach;
+    /// then the load bar ends.
+    Result start(const LoadRequest& req, Started& out) const;
     /// The file names under data/profiles the engine ships for the pack `key` ("<arch>-<layers>x<experts>") names; the
     /// start refuses when one is missing. Empty for a pack the engine ships no profile for.
     virtual std::vector<std::string> shipped_profiles(const std::string& /*key*/) const { return {}; }
     virtual std::vector<SideTableSpec> side_tables(const ModelDesc&) const { return {}; }
     virtual TokenizerSpec tokenizer_spec() const = 0;
-    /// A model with its own start and serving runs them here to the exit code; nullopt: the shared server runs load()'s sessions.
+    /// A model with its own start and serving runs them here to the exit code; nullopt: the shared server runs start()'s sessions.
     virtual std::optional<int> run(program::CommonOptions& o, std::vector<program::GpuCard>& cards) const {
         (void) o; (void) cards;
         return std::nullopt;
@@ -291,6 +317,14 @@ public:
     virtual int quality_window() const { return 1; }
     /// The cards that may hold experts beside the main one.
     virtual int max_expert_cards() const = 0;
+    /// A model with no experts to put on a second card reads long prompts there instead (a one-stage prompt split, not an expert tier).
+    virtual bool second_card_reads_prompts() const { return false; }
+    /// Such a model with these flags does not fit its main card and splits its layers across the main card and the second
+    /// (a layer stage), given the two cards' memory bandwidth; asked once the run's cards are visible, before the load.
+    virtual bool second_card_runs_layers(const program::CommonOptions& o, double main_gbps, double peer_gbps) const {
+        (void) o; (void) main_gbps; (void) peer_gbps;
+        return false;
+    }
     virtual TokenNames token_names() const = 0;
     /// The pre-tokenizer's name in the pack's tokenizer.json and its rule.
     struct PreTokenizer {

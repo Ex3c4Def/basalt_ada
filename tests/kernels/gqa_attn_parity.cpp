@@ -1,6 +1,6 @@
 // tests/kernels/gqa_attn_parity.cpp - gqa_decode_attn and gqa_prompt_attn (basalt/kernels/gqa_attn.hpp) and
 // attn_qk_prepare (dense_ops.hpp) against a CPU reference in double precision, at the Qwen3.5-27B attention geometry
-// (24 query heads, 4 KV heads, 256 wide, 64 rotated dims, interleaved M-RoPE sections 11/11/10).
+// (24 query heads, 4 KV heads, 256 wide, 64 rotated dims, interleaved M-RoPE sections 11/11/10), unscaled and under YaRN.
 //
 // Checks: each kernel's max absolute and relative error to the reference (the int8 prompt kernel's narrow, split and
 // 8-warp launches); a decode row's output is bitwise the same
@@ -23,6 +23,7 @@
 namespace {
 
 constexpr int NH = 24, NKV = 4, HD = 256, ROT = 64;
+constexpr double kPi = 3.14159265358979323846;
 
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
@@ -81,8 +82,10 @@ int main(int argc, char** argv) {
     std::normal_distribution<float> nd(0.f, 1.f);
     int fails = 0;
 
-    // ---- attn_qk_prepare: q/k norm, partial rope with M-RoPE axes, cache write
-    {
+    // ---- attn_qk_prepare: q/k norm, partial rope with M-RoPE axes, cache write; unscaled, then under YaRN x2 past the
+    // trained 262,144 against transformers' YaRN (_compute_yarn_parameters: the frequency blend by pair index, cos and sin
+    // times 0.1 ln(factor) + 1), the angle rounded as the kernel takes it (fp32 position times fp32 frequency)
+    for (const bool yarn : {false, true}) {
         const int T = 3;
         std::vector<float> qf((size_t) T * NH * 2 * HD), k((size_t) T * NKV * HD), v(k.size()), qn(HD), kn(HD);
         for (auto& x : qf) x = nd(rng);
@@ -91,10 +94,33 @@ int main(int argc, char** argv) {
         for (auto& x : qn) x = 1.0f + 0.1f * nd(rng);
         for (auto& x : kn) x = 1.0f + 0.1f * nd(rng);
         std::vector<int32_t> pos = {5, 5, 5, 6, 9, 11, 7, 7, 7};   // a text row, an image row (t, h, w), a text row
+        if (yarn) pos = {300001, 300001, 300001, 400000, 400003, 400005, 524287, 524287, 524287};
         basalt::kernels::RopeSpec rope;
         rope.rot = ROT;
         rope.theta = 1e7f;
         for (int i = 0; i < ROT / 2; ++i) rope.axis[i] = (int8_t) (i % 3 == 1 && i < 33 ? 1 : i % 3 == 2 && i < 30 ? 2 : 0);
+        const double factor = 2.0, orig = 262144.0, base = 1e7;
+        std::vector<double> inv_freq(ROT / 2);
+        double mscale = 1.0;
+        for (int i = 0; i < ROT / 2; ++i) inv_freq[(size_t) i] = std::pow(base, -2.0 * i / ROT);
+        if (yarn) {
+            rope.scaling.type = basalt::kernels::RopeScalingType::YaRN;
+            rope.scaling.factor = factor;
+            rope.scaling.orig_ctx = orig;
+            rope.scaling.freq_base = base;
+            rope.scaling.ext_factor = 1.0;
+            // transformers: find_correction_range(beta_fast 32, beta_slow 1, dim, base, orig) with truncation, a linear
+            // ramp over dim / 2 pairs, inv = interp (1 - extrap_factor) + extrap extrap_factor, extrap_factor = 1 - ramp
+            const auto corr = [&](double rot) { return ROT * std::log(orig / (rot * 2 * kPi)) / (2 * std::log(base)); };
+            const double lo = std::max(0.0, std::floor(corr(32))), hi0 = std::min((double) ROT - 1, std::ceil(corr(1)));
+            const double hi = lo == hi0 ? hi0 + 0.001 : hi0;
+            for (int i = 0; i < ROT / 2; ++i) {
+                const double ramp = std::min(1.0, std::max(0.0, (i - lo) / (hi - lo)));
+                const double ex = 1.0 - ramp, extrap = inv_freq[(size_t) i];
+                inv_freq[(size_t) i] = extrap / factor * (1.0 - ex) + extrap * ex;
+            }
+            mscale = 0.1 * std::log(factor) + 1.0;
+        }
         float *d_qf = dev<float>(qf.size()), *d_k = dev<float>(k.size()), *d_v = dev<float>(v.size()), *d_qn = dev<float>(HD),
               *d_kn = dev<float>(HD), *d_qo = dev<float>((size_t) T * NH * HD);
         int32_t* d_pos = dev<int32_t>(pos.size());
@@ -124,16 +150,19 @@ int main(int argc, char** argv) {
                 for (int i = 0; i < HD; ++i) y[(size_t) i] = x[i] * inv * w[i];
                 std::vector<double> r = y;
                 for (int i = 0; i < ROT / 2; ++i) {
-                    const double f = std::pow(1e7, -2.0 * i / ROT) * pos[(size_t) t * 3 + rope.axis[i]];
-                    r[(size_t) i] = y[(size_t) i] * std::cos(f) - y[(size_t) i + ROT / 2] * std::sin(f);
-                    r[(size_t) i + ROT / 2] = y[(size_t) i + ROT / 2] * std::cos(f) + y[(size_t) i] * std::sin(f);
+                    const int32_t p = pos[(size_t) t * 3 + rope.axis[i]];
+                    const double f = yarn ? (double) ((float) p * (float) inv_freq[(size_t) i]) : inv_freq[(size_t) i] * p;
+                    const double c = std::cos(f) * mscale, sn = std::sin(f) * mscale;
+                    r[(size_t) i] = y[(size_t) i] * c - y[(size_t) i + ROT / 2] * sn;
+                    r[(size_t) i + ROT / 2] = y[(size_t) i + ROT / 2] * c + y[(size_t) i] * sn;
                 }
                 for (int i = 0; i < HD; ++i) {
                     if (isq) eq.add(qo[((size_t) t * NH + j) * HD + i], r[(size_t) i]);
                     else ek.add(h2f(kc[(((size_t) cell0 + t) * NKV + (j - NH)) * HD + i]), r[(size_t) i]);
                 }
             }
-        std::printf("attn_qk_prepare: q max abs %.3g rel %.3g; k (fp16 cache) max abs %.3g rel %.3g\n", eq.abs, eq.rel, ek.abs, ek.rel);
+        std::printf("attn_qk_prepare%s: q max abs %.3g rel %.3g; k (fp16 cache) max abs %.3g rel %.3g\n", yarn ? " (YaRN x2)" : "",
+                    eq.abs, eq.rel, ek.abs, ek.rel);
         if (eq.abs > 1e-3 || ek.rel > 2e-3) ++fails;
     }
 
@@ -223,8 +252,8 @@ int main(int argc, char** argv) {
             ck(cudaMemcpy(d_at, at2, sizeof at2, cudaMemcpyHostToDevice), "copy");
         }
         // its cost at a short context in a large capacity, against the host launch's grid of the chunks in use
-        const int32_t near[2] = {2999, 0};
-        ck(cudaMemcpy(d_at, near, sizeof near, cudaMemcpyHostToDevice), "copy");
+        const int32_t near_at[2] = {2999, 0};
+        ck(cudaMemcpy(d_at, near_at, sizeof near_at, cudaMemcpyHostToDevice), "copy");
         double us[2];
         for (int dv = 0; dv < 2; ++dv) {
             for (int i = 0; i < 5; ++i)
@@ -415,6 +444,102 @@ int main(int argc, char** argv) {
             cudaFree(bs);
             cudaFree(bk); cudaFree(bv); cudaFree(bq); cudaFree(bo); cudaFree(b8.k); cudaFree(b8.v); cudaFree(b8.ks); cudaFree(b8.vs);
         }
+    }
+    // ---- the decode kernel's bits are frozen: random fp16 and int8 caches, many (pos0, T), a device pos0, two windows in one launch.
+    // The hashes below are those of the kernel before its next-chunk fetch; a change that must not move a bit leaves them as they are.
+    {
+        std::mt19937 hr(99);
+        std::normal_distribution<float> hn(0.f, 1.f);
+        const int64_t cap = 4096;
+        const size_t n = (size_t) cap * NKV * HD;
+        std::vector<uint16_t> hk(n), hv(n);
+        for (size_t i = 0; i < n; ++i) {
+            hk[i] = basalt::kernels::f16_from_f32(hn(hr));
+            hv[i] = basalt::kernels::f16_from_f32(hn(hr));
+        }
+        std::vector<int8_t> k8(n), v8(n);
+        std::vector<uint16_t> ks(n / 64), vs(n / 64);
+        const auto quant = [&](const std::vector<uint16_t>& src, std::vector<int8_t>& q8v, std::vector<uint16_t>& sc) {
+            for (size_t g = 0; g < n / 64; ++g) {
+                float amax = 0;
+                for (int i = 0; i < 64; ++i) amax = std::max(amax, std::fabs(h2f(src[g * 64 + i])));
+                sc[g] = basalt::kernels::f16_from_f32(amax / 127.0f);
+                const float s16 = h2f(sc[g]);
+                for (int i = 0; i < 64; ++i) q8v[g * 64 + i] = (int8_t) (s16 > 0 ? std::lrint(h2f(src[g * 64 + i]) / s16) : 0);
+            }
+        };
+        quant(hk, k8, ks);
+        quant(hv, v8, vs);
+        uint16_t *dk = dev<uint16_t>(n), *dv = dev<uint16_t>(n);
+        ck(cudaMemcpy(dk, hk.data(), n * 2, cudaMemcpyHostToDevice), "copy");
+        ck(cudaMemcpy(dv, hv.data(), n * 2, cudaMemcpyHostToDevice), "copy");
+        basalt::kernels::KvInt8 c8;
+        ck(cudaMalloc(&c8.k, n), "malloc");
+        ck(cudaMalloc(&c8.v, n), "malloc");
+        ck(cudaMalloc(&c8.ks, ks.size() * 2), "malloc");
+        ck(cudaMalloc(&c8.vs, vs.size() * 2), "malloc");
+        ck(cudaMemcpy(c8.k, k8.data(), n, cudaMemcpyHostToDevice), "copy");
+        ck(cudaMemcpy(c8.v, v8.data(), n, cudaMemcpyHostToDevice), "copy");
+        ck(cudaMemcpy(c8.ks, ks.data(), ks.size() * 2, cudaMemcpyHostToDevice), "copy");
+        ck(cudaMemcpy(c8.vs, vs.data(), vs.size() * 2, cudaMemcpyHostToDevice), "copy");
+        constexpr int TW2 = basalt::kernels::kGqaMaxWindow;
+        std::vector<float> hq((size_t) TW2 * NH * HD);
+        for (auto& x : hq) x = 2.0f * hn(hr);
+        float *dq = dev<float>(hq.size()), *dout = dev<float>(hq.size());
+        float* dscr = dev<float>(basalt::kernels::gqa_decode_scratch_floats(cap, TW2, NH));
+        int32_t* dpos = dev<int32_t>(1);
+        ck(cudaMemcpy(dq, hq.data(), hq.size() * 4, cudaMemcpyHostToDevice), "copy");
+        std::vector<float> got(hq.size());
+        unsigned long long hash[4] = {1469598103934665603ull, 1469598103934665603ull, 1469598103934665603ull, 1469598103934665603ull};
+        const auto fold = [&](unsigned long long& h, size_t floats) {
+            ck(cudaMemcpy(got.data(), dout, floats * 4, cudaMemcpyDeviceToHost), "copy");
+            for (size_t i = 0; i < floats; ++i) {
+                unsigned u;
+                std::memcpy(&u, &got[i], 4);
+                h = (h ^ u) * 1099511628211ull;
+            }
+        };
+        const int64_t starts[] = {0, 1, 31, 32, 33, 500, 1999, 2047, 3000, 4000};
+        for (int cache = 0; cache < 2; ++cache) {
+            const uint16_t* kk = cache ? nullptr : dk;
+            const uint16_t* vv = cache ? nullptr : dv;
+            const basalt::kernels::KvInt8 q8 = cache ? c8 : basalt::kernels::KvInt8{};
+            for (int T : {1, 2, 5, 8, 12, 16})
+                for (int64_t p0 : starts) {
+                    if (p0 + T > cap) continue;
+                    basalt::kernels::gqa_decode_attn(dq, kk, vv, NH, NKV, p0, T, dscr, cap, dout, nullptr, nullptr, q8);
+                    fold(hash[cache], (size_t) T * NH * HD);
+                }
+            for (int p0 : {1500, 3000}) {
+                ck(cudaMemcpy(dpos, &p0, 4, cudaMemcpyHostToDevice), "copy");
+                basalt::kernels::gqa_decode_attn(dq, kk, vv, NH, NKV, 0, 3, dscr, cap, dout, nullptr, dpos, q8);
+                fold(hash[2], (size_t) 3 * NH * HD);
+            }
+            basalt::kernels::GqaSeg sg[2];
+            sg[0].T = 5;
+            sg[0].k_cache = kk;
+            sg[0].v_cache = vv;
+            sg[0].pos0 = 1000;
+            sg[0].q8 = q8;
+            sg[1] = sg[0];
+            sg[1].T = 7;
+            sg[1].pos0 = 3333;
+            basalt::kernels::gqa_decode_attn_segs(dq, NH, NKV, sg, 2, dscr, cap, dout, nullptr);
+            fold(hash[3], (size_t) 12 * NH * HD);
+        }
+        // Below 9.0 (the Ada port) the same kernel gives other bits: those of the kernel before its next-chunk fetch on a
+        // 4090, which the fetch leaves as they are
+        int dev = 0, major = 0;
+        ck(cudaGetDevice(&dev), "device");
+        ck(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev), "compute capability");
+        const unsigned long long frozen_bw[4] = {0x430a8888287f57faull, 0xb6471ecdf9c79b73ull, 0x1c64ae81d108b6b5ull, 0x24e2ead0c780fabeull};
+        const unsigned long long frozen_ada[4] = {0xe623cf95c7cf1db6ull, 0x4ef92fd5e661f377ull, 0x975a047781ba58c2ull, 0x2c965200ddb0e159ull};
+        const unsigned long long* frozen = major >= 9 ? frozen_bw : frozen_ada;
+        std::printf("decode hashes: %016llx %016llx %016llx %016llx\n", hash[0], hash[1], hash[2], hash[3]);
+        bool frozen_ok = true;
+        for (int i = 0; i < 4; ++i) frozen_ok = frozen_ok && hash[i] == frozen[i];
+        std::printf("decode kernel bits against the frozen hashes: %s\n", frozen_ok ? "identical" : "DIFFERENT");
+        if (!frozen_ok) ++fails;
     }
     std::printf("%s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;

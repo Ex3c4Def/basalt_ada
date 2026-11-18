@@ -7,6 +7,7 @@
 
 #include <cuda_runtime.h>
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -101,6 +102,23 @@ struct ChunkScratch {
 };
 
 struct SessionState;
+/// A second card that holds the model's last layers and reads them for the main card: the prompt split reads a long prompt's
+/// chunks through them while the main card reads the next chunk's first layers (stage.cpp).
+class Stage;
+struct StageDeleter {
+    void operator()(Stage* p) const;
+};
+using StagePtr = std::unique_ptr<Stage, StageDeleter>;
+
+/// The layer split's decode hand-off, page-locked and device-mapped: each card's window graph writes and reads its rows with
+/// kernels and raises the other card's flag (the host lowers both before a window).
+struct SplitHand {
+    uint16_t* fwd = nullptr;       ///< [kBatch][n_embd] BF16: the main card's residual after its last layer
+    uint16_t* ret = nullptr;       ///< [1 + taps][kBatch][n_embd] BF16: the second card's after the last layer, then after each tap
+    uint32_t* flag = nullptr;      ///< [0]: fwd is in; [1]: ret is in
+    std::vector<int> taps;         ///< the block drafter's target layers on the second card, in order
+    size_t first_tap = 0;          ///< the first of them among the drafter's target layers
+};
 
 class Model {
 public:
@@ -111,8 +129,15 @@ public:
     WindowScratch ws;
     ChunkScratch cs;
     bool chunk_ready = false;
+    // K/V streaming: the VRAM copy of one attention layer's far cells a prompt chunk reads (at = the resident cells; at
+    // INT64_MAX without streaming), filled on stage_side from stage_free (the stage's last reader done) to stage_ready
+    kernels::KvFar stage;
+    cudaStream_t stage_side = nullptr;
+    cudaEvent_t stage_free = nullptr, stage_ready = nullptr;
     std::unique_ptr<prefill::mmq::Context> mmq;
-    std::vector<int> gdn_index, attn_index;      // per layer: its index among the GDN or attention layers (-1)
+    int lb = 0, le = 0;                          // the layers this card runs: [lb, le)
+    int n_gdn = 0, n_attn = 0;                   // the GDN and attention layers among them
+    std::vector<int> gdn_index, attn_index;      // per layer: its index among the card's GDN or attention layers (-1)
     // the batch windows' graphs, one per composition (the sessions in the window and their rows), the least recently used out
     using BatchKey = std::vector<std::pair<const SessionState*, int>>;
     struct BatchGraph {
@@ -130,8 +155,15 @@ public:
     std::unique_ptr<vision::CudaEncoder> encoder;
     BlockDrafter bd_dec;                         // the block drafter as decode windows run it (its products in Q8 planes)
     std::vector<void*> owned;                    // device buffers the model allocated (Q8 plane copies, a wider workspace)
+    std::vector<std::function<bool(void*)>> drafter_steps;   // bd_dec's forms, made once the weights have landed (attach_drafter)
+    size_t drafter_tmp = 0;                      // the scratch they go through
     void* enc_arena = nullptr;
     size_t enc_bytes = 0;
+    StagePtr prompt_split;                       // the prompt split: a second card reading long prompts' last layers (null: none)
+    StagePtr split;                              // the layer split's second card: layers [le, n) (null: none)
+    SplitHand* hand = nullptr;                   // the layer split's decode hand-off, on both cards' models (null: none)
+    Model* split_model = nullptr;                // the split's second card's model, and its CUDA device
+    int split_dev = -1;
     ~Model();
     bool ensure_chunk(std::string& err);
     /// llama.cpp's MMQ readied for every product of the model (its kernels loaded for each format and height).
@@ -142,6 +174,10 @@ public:
     void vision_detach();
 };
 
+struct SessionState;
+struct PeerStateDeleter {
+    void operator()(SessionState* s) const;
+};
 /// One conversation's device state.
 struct SessionState {
     cudaStream_t stream = nullptr;
@@ -158,6 +194,10 @@ struct SessionState {
     size_t gdn_floats = 0;                       // per layer
     std::vector<uint16_t*> kc, vc;               // per attention layer: [cell][n_kv][head_dim] fp16 (null with int8)
     std::vector<kernels::KvInt8> kq;             // per attention layer: the int8 cache ({} with fp16)
+    // per attention layer, with K/V streaming: the cells from Options::kv_resident on, in page-locked host memory
+    // (device-mapped); {} without.  kc/vc/kq then hold only the first kv_resident cells
+    std::vector<kernels::KvFar> far_kv;
+    void* far_host = nullptr;
     // the last window's rows per GDN layer, until its commit
     float *rec_qkv = nullptr, *rec_h = nullptr, *rec_gate = nullptr, *rec_beta = nullptr;
     int32_t* n_keep = nullptr;                   // device
@@ -184,7 +224,26 @@ struct SessionState {
     // how the block drafter picks (temperature 0: its best candidates; above, drawn), set by the request's sampling
     float dtemp = 0.0f;
     uint64_t dseed = 0;
+    // the layer split: the second card's state of this conversation (its layers' cells and recurrent state; null: none),
+    // and the device a second card's state lives on
+    std::unique_ptr<SessionState, PeerStateDeleter> peer;
+    int dev = -1;
 };
+
+/// One session's device state on the card of model `m` (its layers' cells and recurrent state; on the card that holds layer
+/// 0 also the logits, the picks and the drafter's state), on the current device; free_state releases it there.
+bool init_state(Model& m, SessionState& st, std::string& err);
+void free_state(SessionState& st);
+/// The layer split's second card's state of the session `st` of model `m` (st.peer).
+bool split_session(Model& m, SessionState& st, std::string& err);
+/// Tokens [pos, pos + n) of the session `st` across the layer split's cards, the chunks pipelined (the second card reads a
+/// chunk's later layers while the main card reads the next one's first layers); `progress` and `stop` as prompt_split_read's.
+/// A session with an MTP drafter reads its prompt chunk by chunk (split_chunk): that drafter reads every chunk's last rows.
+bool split_read(Model& m, SessionState& st, const int32_t* tokens, int n, int64_t pos, const std::function<void(int)>& progress,
+                const std::function<bool()>& stop, std::string& err);
+/// A prompt chunk across the layer split's cards, one after the other (forward_chunk's arguments).
+bool split_chunk(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, int64_t pos, const int32_t* pos3,
+                 std::string& err);
 
 /// Runs a decode window of T rows at cells pos..pos+T-1 (`pos3` [T][3] their rope positions); leaves the logits in
 /// st.logits and the GDN rows for the commit.
@@ -202,6 +261,31 @@ bool forward_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens,
 /// Runs a prompt chunk; rows are token embeddings, or `rows` (fp32 [T][n_embd]) when given.  `pos3` [T][3].
 bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, int64_t pos,
                    const int32_t* pos3, std::string& err);
+/// A prompt chunk in phases (forward_chunk runs them in turn).  chunk_start: the bounds (host [2], null: {0, T}) and
+/// positions, then the input rows into the BF16 residual (token embeddings, or `rows`; neither: the caller places it).
+void chunk_start(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, const int32_t* pos3,
+                 const int32_t* bounds = nullptr);
+/// Layers [l0, l1) of the chunk in m.cs; with `taps`, the block drafter's features of its target layers in the range
+/// into cs.dacc (the first target layer's written, the later ones' added).  The last layer's rows are made in full when
+/// something reads them (`read_last`, a drafter), else only its cells.
+void chunk_layers(Model& m, SessionState& st, int T, int64_t pos, int l0, int l1, const BlockDrafter* taps, bool read_last = false);
+/// The block drafter's feature projection j of the rows in cs.x into cs.dacc (j == 0 writes it, later ones add).
+void chunk_tap(Model& m, SessionState& st, int T, const BlockDrafter& taps, size_t j);
+/// After the last layer: the block drafter's context from cs.dacc, or the MTP history.
+bool chunk_finish(Model& m, SessionState& st, int T, int64_t pos, std::string& err);
+/// The block drafter's context cells at positions pos .. pos + n - 1 from n rows of features `dacc` (device).
+void block_ctx_chunk(Model& m, SessionState& st, const float* dacc, int n, int64_t pos);
+
+/// The stage on CUDA device `dev` with layers [l_min, n_layers) of `w` (their weights on `dev`, the other layers empty):
+/// its memory, before the weights land (attach_prompt_split times both cards' rates once they have).
+StagePtr make_prompt_split(Model& main, int dev, int l_min, const Weights& w, std::string& err);
+/// Reads tokens [pos, pos + n) of the session `st` (of model `main`) across the cards when the rates price that cheaper,
+/// true; false with empty `err` when it does not (the caller reads them on the main card).
+/// `stop` is asked between chunks on both cards: true ends the read where it is (the session then holds a part of the prompt
+/// only, as after a stopped read on the main card), true returned.
+bool prompt_split_read(Stage& stage, Model& main, SessionState& st, const int32_t* tokens, int n, int64_t pos,
+                      const std::function<void(int)>& progress, const std::function<bool()>& stop, std::string& err);
+
 /// The commit of the last window's first n rows into the recurrent state.
 void commit_window(Model& m, SessionState& st, int n, cudaStream_t s);
 

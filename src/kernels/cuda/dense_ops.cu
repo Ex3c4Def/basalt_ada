@@ -410,7 +410,7 @@ __global__ void __launch_bounds__(HDW) attn_qk_prepare_kernel(const In* q_full, 
                                                             const float* __restrict__ k_norm, float eps, RopeSpec rope,
                                                             const int32_t* pos, int n_head, int n_kv, QO* q_out,
                                                             __half* k_cache, __half* v_cache, int64_t cell0, int q_stride,
-                                                            int64_t cap, const int32_t* cell0_dev, KvInt8 q8) {
+                                                            int64_t cap, const int32_t* cell0_dev, KvInt8 q8, KvFar far_kv) {
     pdl_launch_dependents();
     pdl_wait();
     __shared__ float red[HDW / 32];
@@ -431,6 +431,10 @@ __global__ void __launch_bounds__(HDW) attn_qk_prepare_kernel(const In* q_full, 
         const float ang = (float) pos[t * 3 + rope.axis[i]] * inv_freq;
         float sn, cs;
         sincosf(ang, &sn, &cs);
+        if (rope.mscale != 1.0f) {
+            sn *= rope.mscale;
+            cs *= rope.mscale;
+        }
         y = d < half ? y * cs - xs[d + half] * sn : y * cs + xs[d - half] * sn;
     }
     if (is_q) {
@@ -438,14 +442,17 @@ __global__ void __launch_bounds__(HDW) attn_qk_prepare_kernel(const In* q_full, 
         return;
     }
     const int64_t c0 = cell0_dev ? (int64_t) *cell0_dev : cell0;
-    const int64_t cell = cap > 0 ? (c0 + t) % cap : c0 + t;
+    int64_t cell = cap > 0 ? (c0 + t) % cap : c0 + t;
+    const bool fa = cell >= far_kv.at;   // a split cache's far cell: its row in the far buffers
+    if (fa) cell -= far_kv.at;
     const int64_t at = (cell * n_kv + head) * HDW + d;
     const float vv = ldf(v + (t * n_kv + head) * HDW + d);
     if (!q8.k) {
-        k_cache[at] = __float2half_rn(y);
-        v_cache[at] = __float2half_rn(vv);
+        (fa ? (__half*) far_kv.k : k_cache)[at] = __float2half_rn(y);
+        (fa ? (__half*) far_kv.v : v_cache)[at] = __float2half_rn(vv);
         return;
     }
+    if (fa) q8 = far_kv.q8;
     // int8: per 64 values, scale = amax / 127 (stored fp16), codes rounded to nearest against the stored scale; a group
     // is two warps: each warp's max by shuffles, then the pair's (a max is exact in any order)
     float ak = fabsf(y), av = fabsf(vv);
@@ -744,10 +751,35 @@ void gdn_gating_proj(const uint16_t* x, const uint16_t* w_ab, const float* dt, c
     check("gdn_gating_proj");
 }
 
+namespace {
+// Each pair's inverse frequency and the magnitude correction, once on the host in double.  Unscaled: theta^(-2i/rot).
+// Scaled: ggml's rope_yarn on the frequency instead of the angle (the angle is the position times it): the
+// interpolated frequency freq_scale theta^(-2i/rot), blended toward the trained one by the ramp at pair i times
+// ext_factor; cos and sin times mscale.
+RopeSpec rope_tables(const RopeSpec& rope) {
+    RopeSpec r = rope;
+    const RopeScaling& sc = rope.scaling;
+    if (sc.type == RopeScalingType::None) {
+        for (int i = 0; i < rope.rot / 2; ++i) r.inv_freq[i] = (float) std::pow((double) rope.theta, -2.0 * (double) i / (double) rope.rot);
+        return r;
+    }
+    const double fs = sc.freq_scale();
+    double cd[2];
+    sc.corr_dims(rope.rot, cd);
+    for (int i = 0; i < rope.rot / 2; ++i) {
+        const double extrap = std::pow((double) rope.theta, -2.0 * (double) i / (double) rope.rot);
+        const double mix = sc.ext_factor != 0 ? (double) rope_yarn_ramp((float) cd[0], (float) cd[1], i) * sc.ext_factor : 0.0;
+        r.inv_freq[i] = (float) (fs * extrap * (1.0 - mix) + extrap * mix);
+    }
+    r.mscale = (float) sc.mscale();
+    return r;
+}
+}  // namespace
+
 void attn_qk_prepare(const float* q_full, const float* k, const float* v, const float* q_norm, const float* k_norm,
                      float eps, const RopeSpec& rope, const int32_t* pos, int64_t T, int n_head, int n_kv,
                      float* q_out, uint16_t* k_cache, uint16_t* v_cache, int64_t cell0, void* stream, int hd, bool gated,
-                     int64_t cap, const int32_t* cell0_dev, KvInt8 q8) {
+                     int64_t cap, const int32_t* cell0_dev, KvInt8 q8, KvFar far_kv) {
     if (T <= 0) return;
     if (rope.rot <= 0 || rope.rot > hd || rope.rot % 2 || (hd != 128 && hd != 256)) {
         basalt::log::error("basalt", "attn_qk_prepare: a rotary width of %d in %d-wide heads", rope.rot, hd);
@@ -755,35 +787,32 @@ void attn_qk_prepare(const float* q_full, const float* k, const float* v, const 
     }
     const dim3 grid((unsigned) T, (unsigned) (n_head + n_kv));
     const int qs = gated ? 2 * hd : hd;
-    // each pair's inverse frequency, once on the host in double (the kernel used to take a double pow per thread)
-    RopeSpec r = rope;
-    for (int i = 0; i < rope.rot / 2; ++i) r.inv_freq[i] = (float) std::pow((double) rope.theta, -2.0 * (double) i / (double) rope.rot);
+    const RopeSpec r = rope_tables(rope);
     if (hd == 256)
         launch_pdl(attn_qk_prepare_kernel<256>, grid, dim3(256), 0, (cudaStream_t) stream, q_full, k, v, q_norm, k_norm, eps, r,
-                   pos, n_head, n_kv, q_out, (__half*) k_cache, (__half*) v_cache, cell0, qs, cap, cell0_dev, q8);
+                   pos, n_head, n_kv, q_out, (__half*) k_cache, (__half*) v_cache, cell0, qs, cap, cell0_dev, q8, far_kv);
     else
         launch_pdl(attn_qk_prepare_kernel<128>, grid, dim3(128), 0, (cudaStream_t) stream, q_full, k, v, q_norm, k_norm, eps, r,
-                   pos, n_head, n_kv, q_out, (__half*) k_cache, (__half*) v_cache, cell0, qs, cap, cell0_dev, q8);
+                   pos, n_head, n_kv, q_out, (__half*) k_cache, (__half*) v_cache, cell0, qs, cap, cell0_dev, q8, far_kv);
     check("attn_qk_prepare");
 }
 
 void attn_qk_prepare_bf16(const uint16_t* q_full, const uint16_t* k, const uint16_t* v, const float* q_norm, const float* k_norm,
                           float eps, const RopeSpec& rope, const int32_t* pos, int64_t T, int n_head, int n_kv, uint16_t* q_out,
-                          int64_t cell0, void* stream, KvInt8 q8, uint16_t* k_cache, uint16_t* v_cache) {
+                          int64_t cell0, void* stream, KvInt8 q8, uint16_t* k_cache, uint16_t* v_cache, KvFar far_kv) {
     if (T <= 0) return;
     if (rope.rot <= 0 || rope.rot > 256 || rope.rot % 2) {
         basalt::log::error("basalt", "attn_qk_prepare_bf16: a rotary width of %d", rope.rot);
         std::exit(1);
     }
     const dim3 grid((unsigned) T, (unsigned) (n_head + n_kv));
-    RopeSpec r = rope;
-    for (int i = 0; i < rope.rot / 2; ++i) r.inv_freq[i] = (float) std::pow((double) rope.theta, -2.0 * (double) i / (double) rope.rot);
+    const RopeSpec r = rope_tables(rope);
     const __nv_bfloat16* qf = reinterpret_cast<const __nv_bfloat16*>(q_full);
     const __nv_bfloat16* kk = reinterpret_cast<const __nv_bfloat16*>(k);
     const __nv_bfloat16* vv = reinterpret_cast<const __nv_bfloat16*>(v);
     launch_pdl(attn_qk_prepare_kernel<256, __nv_bfloat16, __nv_bfloat16>, grid, dim3(256), 0, (cudaStream_t) stream, qf, kk, vv,
                q_norm, k_norm, eps, r, pos, n_head, n_kv, reinterpret_cast<__nv_bfloat16*>(q_out), (__half*) k_cache, (__half*) v_cache, cell0, 512, (int64_t) 0,
-               (const int32_t*) nullptr, q8);
+               (const int32_t*) nullptr, q8, far_kv);
     check("attn_qk_prepare_bf16");
 }
 

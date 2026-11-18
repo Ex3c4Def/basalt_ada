@@ -5,7 +5,7 @@ Settings: [configuration](configuration/index.md). Diagnostic flags: `bin/basalt
 ## Start-up
 
 The page is up at once and the model loads behind it. The header reads `Loading` with the percent over a progress bar while weights load; choosing a model in the picker loads it. `/health` and `/metrics`
-show the load. A failed start-up load ends the server. Requests wait during a load and get a 503 if it fails.
+show the load: `load.percent` and `load.gib`, the GiB placed so far in one figure over every byte the model loads (a card, a second card, RAM), where it was one figure per target. A failed start-up load ends the server. Requests wait during a load and get a 503 if it fails.
 
 ## Concurrent requests: `--parallel N`
 
@@ -14,6 +14,9 @@ each slot holds `max-context / N` tokens (`--parallel 4 --max-context 262144` gi
 is refused with a 400 that names the length. `--slot-full-context` gives every slot the whole `--max-context`, at N times the KV cache.
 
 Each slot keeps two checkpoints (end of the system prompt, last turn), so requests that share a long system prompt read it once.
+
+The engine tokenizes every prompt and matches it against what each slot holds. A reply the client sends back unchanged continues the
+slot's own tokens even when the model wrote it in other pieces than the tokenizer cuts the same bytes into (not with images).
 
 ### Session affinity
 
@@ -40,12 +43,14 @@ Each request ends with one `done` line:
 ```
 
 - `pp=<prompt tokens>/<cached>c`: the rate counts newly read tokens only.
-- `acc`: drafts accepted over drafts offered. `dl`: tokens per window. Both are absent when the request did not draft.
+- `acc`: drafts accepted over drafts offered. `dl`: tokens per window, from the engine's own window count over the whole request (its solo and batch runs and every pass). With `--parallel` a window serves every busy slot in a fixed number of rows, so `dl` falls toward 1.0 as the slots fill. Both are absent when the request did not draft.
 - `end`: `stop`, `length`, `cancelled`, `disconnect` or `error`.
 - `hit`: expert cache hit rate. `pcie`: share of routed experts read over PCIe.
 
 The engine's own `basalt ...` lines go to `~/.cache/basalt/<id>/engine.log`, one folder per model file (`<id>` is 16 hex digits
-taken from the file); `[server] engine log: PATH` names it when the engine fails to start. The folder also holds the conversation
+taken from the file); `[server] engine log: PATH` names it at start. A log of 10 MiB or more moves to `engine.log.1` at the
+next start. An engine that dies of a fault or an unhandled exception writes a `basalt crash: error: ...` line (the fault, the stage
+it was in) and the server's warning quotes it with the exit status. The folder also holds the conversation
 cache. Nothing is unpacked from the model file: the server reads the tokenizer from its sections, and the engine and `basalt-vision`
 read the vision projector inside it.
 
@@ -77,7 +82,7 @@ write always leaves 4 GiB of the volume free. After a restart, a prompt that sta
 ## Sleep: `--idle-sleep`
 
 After the given seconds without requests, the engine frees its VRAM (the driver moves the GPU state to host memory). The process and its
-RAM copy of the experts stay. The next request wakes it in seconds. Linux only. The server stays awake when the GPU state would not fit in
+RAM copy of the experts stay (a dense model has no cache to give back first: the driver moves all its GPU state, both cards' on two cards). The next request wakes it in seconds. Linux only. The server stays awake when the GPU state would not fit in
 free RAM with 8 GiB to spare. `--idle-unload` ends the process instead.
 
 ## Memory floors
@@ -87,7 +92,9 @@ Basalt refuses settings that would leave the machine without memory, and never s
 - `--vram-reserve-mib` below 256 is refused on Windows and WSL2 (128 on Linux): less free VRAM makes the driver page GPU memory.
 - `--ram-reserve-mib` (default 2048) is the RAM left free for the rest of the system. The engine allocates its host buffers
   first, or holds their RAM when it page-locks them later; the expert tiers then take the free RAM less the reserve and less
-  the driver's tracking of the pages they pin (`RAM floor ...` in the start log). When some experts stay in the file, the
+  the driver's tracking of the pages they pin (`RAM floor ...` in the start log). Flash-Next's copy and top-up also leave 2 GiB beside the reserve
+  for the host memory the engine takes after they read the free RAM (CUDA graphs, the first request), so the free RAM settles
+  above the guard, not on it. When some experts stay in the file, the
   tiers also leave the OS file cache they are read through a floor: one prompt chunk's file reads and two layers' share of
   those experts, at least 4 GiB. Programs left idle beside a small reserve may be swapped out.
 - While serving, the RAM guard holds the reserve: below it, it parks conversations to disk or drops them. A request waits up to 30 s

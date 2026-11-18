@@ -5,6 +5,7 @@
 #pragma once
 
 #include "basalt/kernels/gqa_attn.hpp"
+#include "basalt/kernels/rope_scaling.hpp"
 
 #include <cstdint>
 
@@ -39,27 +40,31 @@ void gdn_gating_proj(const uint16_t* x, const uint16_t* w_ab, const float* dt, c
 
 /// The rotary part of a gated GQA attention layer: `rot` leading dims of each head rotate NeoX-style (pairs i and
 /// i + rot/2) with inverse frequency theta^(-2i/rot); pair i takes its position from axis `axis[i]` (0 t, 1 h, 2 w:
-/// interleaved M-RoPE; all 0 for plain rope).
+/// interleaved M-RoPE; all 0 for plain rope).  `scaling` (rope_scaling.hpp; none by default) blends each pair's
+/// frequency between the trained one and the interpolated one by its pair index, whatever its axis, and scales cos and
+/// sin by its magnitude correction.
 struct RopeSpec {
     int rot = 0;
     float theta = 0.0f;
-    int8_t axis[64] = {};   // per rotated pair
-    float inv_freq[64] = {};   // filled by attn_qk_prepare from theta and rot (the kernels read the table)
+    int8_t axis[64] = {};      // per rotated pair
+    RopeScaling scaling;       // its freq_base is theta's
+    float inv_freq[64] = {};   // filled by attn_qk_prepare from theta, rot and scaling (the kernels read the table)
+    float mscale = 1.0f;       // likewise: the magnitude correction
 };
 
 /// One window's or chunk's query and key heads: q_full [T][n_head][2 hd] (query | gate per head; `gated` false:
 /// [T][n_head][hd], queries only), k and v [T][n_kv][hd]. Each q and k head is RMS-normed (q_norm / k_norm, with any
 /// offset folded) and rotated at its row's position (pos [T][3]); q goes to q_out [T][n_head][hd], k and v to the fp16
 /// cache at cells (cell0 + t) % cap (cap 0: cell0 + t; cache [cell][n_kv][hd]; cell0_dev: cell0 read from the device).
-/// hd 128 or 256. `q8`: K and V go to that int8 cache instead (gqa_attn.hpp).
+/// hd 128 or 256. `q8`: K and V go to that int8 cache instead (gqa_attn.hpp); `far`: cells from far.at on go there.
 void attn_qk_prepare(const float* q_full, const float* k, const float* v, const float* q_norm, const float* k_norm,
                      float eps, const RopeSpec& rope, const int32_t* pos, int64_t T, int n_head, int n_kv,
                      float* q_out, uint16_t* k_cache, uint16_t* v_cache, int64_t cell0, void* stream, int hd = 256,
-                     bool gated = true, int64_t cap = 0, const int32_t* cell0_dev = nullptr, KvInt8 q8 = {});
+                     bool gated = true, int64_t cap = 0, const int32_t* cell0_dev = nullptr, KvInt8 q8 = {}, KvFar far_kv = {});
 /// The prompt chunk's form: BF16 q_full (gated, hd 256), k and v; BF16 q_out; the cache at cells cell0 + t.
 void attn_qk_prepare_bf16(const uint16_t* q_full, const uint16_t* k, const uint16_t* v, const float* q_norm, const float* k_norm,
                           float eps, const RopeSpec& rope, const int32_t* pos, int64_t T, int n_head, int n_kv, uint16_t* q_out,
-                          int64_t cell0, void* stream, KvInt8 q8, uint16_t* k_cache, uint16_t* v_cache);
+                          int64_t cell0, void* stream, KvInt8 q8, uint16_t* k_cache, uint16_t* v_cache, KvFar far_kv = {});
 /// out[t][h][d] = attn[t][h][d] * sigmoid(q_full[t][h][hd + d])  (hd = 256).
 void attn_gate(const float* attn, const float* q_full, float* out, int64_t T, int n_head, void* stream);
 /// attn_gate's rows rounded to E4M3 for the out projection: codes [T][n_head * 256], scales[T] = amax / 448 per token

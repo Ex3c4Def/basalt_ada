@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "basalt/kernels/cpu/pool.hpp"
+#include "basalt/model/rope_flags.hpp"
 #include "basalt/platform/memory.hpp"
 
 namespace basalt::program {
@@ -45,9 +46,17 @@ struct CommonOptions {
     /// every expert tier's device, the first one peer_device, and each card's memory bandwidth (GB/s, 0 unknown)
     std::vector<int> peer_devices;
     std::vector<double> peer_gbps;
+    double main_gbps = 0;         ///< the main card's memory bandwidth (GB/s, 0 unknown)
     int peer_reserve_mib = 600;
     bool no_prompt_skip = false;  ///< --no-prompt-skip: every prompt row through every layer
     std::string kv;               ///< --kv: the KV storage, as each model names it (empty: the model's default)
+    /// --rope-scaling, --rope-scale, --yarn-* ...: taken by the models that extend their context (basalt/model/rope_flags.hpp)
+    basalt::model::RopeFlags rope;
+    /// --kv-resident N: K/V streaming, N cells of each attention layer in VRAM and the rest in page-locked RAM (0: all in
+    /// VRAM), for the models that take it
+    int64_t kv_resident = 0;
+    /// --diag-split-at N: diagnostic, a dense model split across two cards at layer N whether or not it fits one (0: off)
+    int diag_split_at = 0;
     /// The engine's expert profile for the model (--expert-profile, else data/profiles/<key>.prof, cli::profile_key),
     /// or the --expert-profile-save file a start places from; empty means none.  A profile decides residency by routing
     /// frequency instead of by first use.

@@ -3,6 +3,10 @@
 Linux x64 and Windows x64, NVIDIA Blackwell (sm_120). Linux is where the engine is tested and benchmarked. CI builds both and runs
 the CPU tests on each. The GPU tests and the quality gate need a card.
 
+This fork also runs every path on sm_89 (Ada), as the only card, the main card or a second card, in a build that holds
+sm_89 code ([GPUs](configuration/gpus.md#an-ada-sm_89-card), [Ada port notes](../ADA_PORT_NOTES.md)); every other
+architecture is refused.
+
 | | Linux | Windows |
 | --- | --- | --- |
 | OS | x86-64, AVX2 (AVX-512 used when present) | Windows 10 1903+ x64 |
@@ -90,6 +94,8 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
 cmake --build build -j
 ctest --test-dir build -L cpu -j 8 --output-on-failure
 ```
+
+The executables land in `bin/` whatever the generator is (a Visual Studio generator would otherwise put them in `bin/Release`, away from `data/`).
 
 `-DBASALT_MODELS=qwen4exp`, `deepseek41` or `qwen35` builds one model ([building](building.md#building-only-some-models)); the option works the same here.
 

@@ -163,22 +163,23 @@ bool decode_drafter(Model& m, std::string& err) {
     m.bd_dec = m.w.dflash;
     BlockDrafter& bd = m.bd_dec;
     if (!bd.present || m.o.drafter != Drafter::Block) return true;
-    void* tmp = nullptr;
-    size_t tmp_bytes = 0;
+    // the memory and the new forms now (later sizing sees them); the kernels that make them once the weights have landed
+    // (attach_drafter), in this order, through one scratch buffer of the largest matrix
+    std::vector<std::function<bool(void*)>>& steps = m.drafter_steps;
+    size_t& tmp_bytes = m.drafter_tmp;
     auto q8 = [](const Linear& l) { return l.type == 8 && l.cols % 256 == 0 && l.rows > 0; };
     auto bytes = [](const Linear& l) { return (size_t) l.rows * (size_t) l.cols / 32 * 34; };
     auto in_place = [&](Linear& l) -> bool {
         if (!q8(l)) return true;
         const size_t n = bytes(l);
-        if (n > tmp_bytes) {
-            if (tmp) cudaFree(tmp);
-            tmp = nullptr;
-            if (cudaMalloc(&tmp, n) != cudaSuccess) return false;
-            tmp_bytes = n;
-        }
-        if (cudaMemcpy(tmp, l.w, n, cudaMemcpyDeviceToDevice) != cudaSuccess) return false;
-        kernels::wgemm::q8_planes(tmp, l.rows, l.cols, const_cast<void*>(l.w), nullptr);
-        if (cudaDeviceSynchronize() != cudaSuccess) return false;
+        tmp_bytes = std::max(tmp_bytes, n);
+        void* w = const_cast<void*>(l.w);
+        const int rows = l.rows, cols = l.cols;
+        steps.push_back([=](void* tmp) {
+            if (cudaMemcpy(tmp, w, n, cudaMemcpyDeviceToDevice) != cudaSuccess) return false;
+            kernels::wgemm::q8_planes(tmp, rows, cols, w, nullptr);
+            return cudaDeviceSynchronize() == cudaSuccess;
+        });
         l.type = kTypeQ8P;
         return true;
     };
@@ -187,7 +188,12 @@ bool decode_drafter(Model& m, std::string& err) {
         void* p = nullptr;
         if (cudaMalloc(&p, bytes(l)) != cudaSuccess) return false;
         m.owned.push_back(p);
-        kernels::wgemm::q8_planes(l.w, l.rows, l.cols, p, nullptr);
+        const void* w = l.w;
+        const int rows = l.rows, cols = l.cols;
+        steps.push_back([=](void*) {
+            kernels::wgemm::q8_planes(w, rows, cols, p, nullptr);
+            return true;
+        });
         l.w = p;
         l.type = kTypeQ8P;
         return true;
@@ -197,17 +203,17 @@ bool decode_drafter(Model& m, std::string& err) {
     auto to_fp4 = [&](Linear& l) -> bool {
         if (!q8(l) || !kernels::nvfp4p::fits(l.rows, l.cols)) return in_place(l);
         const size_t n = bytes(l);
-        if (n > tmp_bytes) {
-            if (tmp) cudaFree(tmp);
-            tmp = nullptr;
-            if (cudaMalloc(&tmp, n) != cudaSuccess) return false;
-            tmp_bytes = n;
-        }
+        tmp_bytes = std::max(tmp_bytes, n);
         void* sc = nullptr;
-        if (cudaMemcpy(tmp, l.w, n, cudaMemcpyDeviceToDevice) != cudaSuccess || cudaMalloc(&sc, 16) != cudaSuccess) return false;
+        if (cudaMalloc(&sc, 16) != cudaSuccess) return false;
         m.owned.push_back(sc);
-        kernels::nvfp4p::from_q8(tmp, l.rows, l.cols, const_cast<void*>(l.w), (float*) sc, nullptr);
-        if (cudaDeviceSynchronize() != cudaSuccess) return false;
+        void* w = const_cast<void*>(l.w);
+        const int rows = l.rows, cols = l.cols;
+        steps.push_back([=](void* tmp) {
+            if (cudaMemcpy(tmp, w, n, cudaMemcpyDeviceToDevice) != cudaSuccess) return false;
+            kernels::nvfp4p::from_q8(tmp, rows, cols, w, (float*) sc, nullptr);
+            return cudaDeviceSynchronize() == cudaSuccess;
+        });
         l.scale = (const float*) sc;
         l.type = kTypeNvfp4Planes;
         return true;
@@ -228,7 +234,12 @@ bool decode_drafter(Model& m, std::string& err) {
                 }
                 m.owned.push_back(p);
                 m.owned.push_back(sc);
-                kernels::nvfp4p::from_q8(l->w, l->rows, l->cols, p, (float*) sc, nullptr);
+                const void* w = l->w;
+                const int rows = l->rows, cols = l->cols;
+                steps.push_back([=](void*) {
+                    kernels::nvfp4p::from_q8(w, rows, cols, p, (float*) sc, nullptr);
+                    return true;
+                });
                 l->w = p;
                 l->scale = (const float*) sc;
                 l->type = kTypeNvfp4Planes;
@@ -238,8 +249,7 @@ bool decode_drafter(Model& m, std::string& err) {
         }
     }
     for (Linear& l : bd.fc) ok = ok && copy(l);
-    if (tmp) cudaFree(tmp);
-    if (!ok || cudaDeviceSynchronize() != cudaSuccess) {
+    if (!ok) {
         err = m.o.arch + ": laying out the block drafter for decode windows failed";
         return false;
     }
@@ -288,19 +298,82 @@ bool decode_drafter(Model& m, std::string& err) {
 
 }  // namespace
 
-uint64_t shared_bytes(const Geometry& g, int64_t max_context) { return window_bytes(g, BlockDrafter{}, max_context) + chunk_bytes(g) + (512ull << 20); }
+bool attach_drafter(Model& m, std::string& err) {
+    if (m.drafter_steps.empty()) return true;
+    void* tmp = nullptr;
+    bool ok = m.drafter_tmp == 0 || cudaMalloc(&tmp, m.drafter_tmp) == cudaSuccess;
+    for (const auto& step : m.drafter_steps) ok = ok && step(tmp);
+    if (tmp) cudaFree(tmp);
+    m.drafter_steps.clear();
+    if (!ok || cudaDeviceSynchronize() != cudaSuccess) {
+        err = m.o.arch + ": laying out the block drafter for decode windows failed";
+        return false;
+    }
+    return true;
+}
 
-uint64_t session_bytes(const Geometry& g, int64_t max_context, bool mtp, bool kv_int8) {
-    const uint64_t C = (uint64_t) g.conv_channels();
-    const uint64_t gdn = (uint64_t) g.gdn_layers() *
-                         (2 * ((uint64_t) g.gdn_state * g.gdn_v_heads * g.gdn_state + C * 3) +
-                          kWindow * (2 * C + 2 * (uint64_t) g.gdn_v_heads)) * 4;
-    const uint64_t cell16 = (uint64_t) g.n_kv * g.head_dim * 2 * 2;   // a cell of one layer, K and V, fp16
-    const uint64_t cell8 = (uint64_t) g.n_kv * (g.head_dim + g.head_dim / 64 * 2) * 2;
-    const uint64_t kv = (uint64_t) max_context * ((uint64_t) g.attn_layers() * (kv_int8 ? cell8 : cell16) + (mtp ? cell16 : 0)) +
-                        (uint64_t) g.attn_layers() * 4 * 256;
-    const uint64_t drafter = mtp ? ((uint64_t) (kWindow + 3) * g.n_embd + g.n_vocab + (uint64_t) kWindow * 64) * 4 : 0;
-    return gdn + kv + drafter + (uint64_t) kWindow * g.n_vocab * 4 + 64 * 256;
+namespace {
+// a cell of one attention layer, K and V: fp16, or int8 codes with their fp16 scales
+uint64_t cell_bytes(const Geometry& g, bool kv_int8) {
+    return kv_int8 ? (uint64_t) g.n_kv * (g.head_dim + g.head_dim / 64 * 2) * 2 : (uint64_t) g.n_kv * g.head_dim * 2 * 2;
+}
+}  // namespace
+
+int64_t resident_cells(int64_t max_context, int64_t kv_resident) {
+    return kv_resident > 0 && kv_resident < max_context ? kv_resident : max_context;
+}
+
+uint64_t shared_bytes(const Geometry& g, int64_t max_context, bool kv_int8, int64_t kv_resident) {
+    const uint64_t stage = g.attn_layers() > 0 ? (uint64_t) (max_context - resident_cells(max_context, kv_resident)) * cell_bytes(g, kv_int8) : 0;
+    return window_bytes(g, BlockDrafter{}, max_context) + chunk_bytes(g) + stage + (512ull << 20);
+}
+
+uint64_t session_host_bytes(const Geometry& g, int64_t max_context, bool kv_int8, int64_t kv_resident) {
+    return (uint64_t) (max_context - resident_cells(max_context, kv_resident)) * g.attn_layers() * cell_bytes(g, kv_int8);
+}
+
+uint64_t session_layer_bytes(const Geometry& g, int il, int64_t max_context, bool kv_int8, int64_t kv_resident) {
+    if (g.kinds[(size_t) il] == Mixer::Gdn) {
+        const uint64_t C = (uint64_t) g.conv_channels();
+        return (2 * ((uint64_t) g.gdn_state * g.gdn_v_heads * g.gdn_state + C * 3) + kWindow * (2 * C + 2 * (uint64_t) g.gdn_v_heads)) * 4;
+    }
+    return (uint64_t) resident_cells(max_context, kv_resident) * cell_bytes(g, kv_int8) + 4 * 256;
+}
+
+uint64_t session_bytes(const Geometry& g, int64_t max_context, bool mtp, bool kv_int8, int64_t kv_resident, int lb, int le) {
+    uint64_t b = 64 * 256;
+    for (int il = lb; il < (le > 0 ? le : g.n_layers); ++il) b += session_layer_bytes(g, il, max_context, kv_int8, kv_resident);
+    if (lb > 0) return b;
+    const uint64_t drafter = mtp ? (uint64_t) max_context * cell_bytes(g, false) + ((uint64_t) (kWindow + 3) * g.n_embd + g.n_vocab + (uint64_t) kWindow * 64) * 4
+                                 : 0;
+    return b + drafter + (uint64_t) kWindow * g.n_vocab * 4;
+}
+
+uint64_t block_session_bytes(const Geometry& g, const BlockDrafter& bd) {
+    if (!bd.present) return 0;
+    return bd.layers.size() * 2 * (uint64_t) (bd.window + 256) * bd.n_kv * bd.head_dim * 2 + (uint64_t) kWindow * (g.n_embd * 4 + 16) +
+           64 * 256;
+}
+
+SplitInputs split_inputs(const Geometry& g, const Options& o, const BlockDrafter& bd, const std::vector<uint64_t>& layer_weights,
+                         uint64_t main_weights, SplitCard main_card, SplitCard peer_card) {
+    SplitInputs in;
+    const bool mtp = o.drafter == Drafter::Mtp;
+    in.layer = layer_weights;
+    in.slots = std::max(o.sessions, 1);
+    uint64_t layers = 0;
+    for (int il = 0; il < g.n_layers; ++il) {
+        in.per_slot.push_back(session_layer_bytes(g, il, o.max_context, o.kv_int8, o.kv_resident));
+        layers += in.per_slot.back();
+    }
+    const uint64_t slot_rest = session_bytes(g, o.max_context, mtp, o.kv_int8, o.kv_resident) - layers +
+                               (o.drafter == Drafter::Block ? block_session_bytes(g, bd) : 0);
+    const uint64_t scratch = shared_bytes(g, o.max_context, o.kv_int8, o.kv_resident);
+    in.main_fixed = main_weights + scratch + (uint64_t) in.slots * slot_rest + stage_main_bytes(g, bd);
+    in.peer_fixed = scratch + 2ull * kChunk * g.n_embd * 2;   // its own scratch and the landing residuals
+    in.main = main_card;
+    in.peer = peer_card;
+    return in;
 }
 
 Model::~Model() {
@@ -308,6 +381,9 @@ Model::~Model() {
     if (gate_side) cudaStreamDestroy(gate_side);
     if (gate_fork) cudaEventDestroy(gate_fork);
     if (gate_join) cudaEventDestroy(gate_join);
+    if (stage_side) cudaStreamDestroy(stage_side);
+    if (stage_free) cudaEventDestroy(stage_free);
+    if (stage_ready) cudaEventDestroy(stage_ready);
     for (void* p : owned) cudaFree(p);
     vision_detach();
 }
@@ -444,10 +520,17 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         err = o.arch + ": " + e;
         return nullptr;
     }
-    int gi = 0, ai = 0;
-    for (Mixer k : g.kinds) {
-        m->gdn_index.push_back(k == Mixer::Gdn ? gi++ : -1);
-        m->attn_index.push_back(k == Mixer::Attention ? ai++ : -1);
+    m->lb = o.layer_begin;
+    m->le = o.layer_end > 0 ? o.layer_end : g.n_layers;
+    if (m->lb < 0 || m->lb >= m->le || m->le > g.n_layers) {
+        err = o.arch + ": layers " + std::to_string(m->lb) + "-" + std::to_string(m->le - 1) + " of " + std::to_string(g.n_layers);
+        return nullptr;
+    }
+    for (int il = 0; il < g.n_layers; ++il) {
+        const bool here = il >= m->lb && il < m->le;
+        const Mixer k = g.kinds[(size_t) il];
+        m->gdn_index.push_back(here && k == Mixer::Gdn ? m->n_gdn++ : -1);
+        m->attn_index.push_back(here && k == Mixer::Attention ? m->n_attn++ : -1);
     }
     if (o.vision) {   // the projector stays in page-locked RAM; each request's pictures take it to the card
         m->mmproj = std::make_unique<vision::Mmproj>();
@@ -541,6 +624,31 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         return nullptr;
     }
     prefill::mmq::iota(b.iota, kBatch, nullptr);
+    if (const int64_t kept = resident_cells(o.max_context, o.kv_resident); kept < o.max_context && g.attn_layers() > 0) {
+        // the prompt chunks' VRAM copy of one layer's far cells, laid out as a session's far buffers
+        const size_t cells = (size_t) (o.max_context - kept) * g.n_kv * g.head_dim;
+        void* p = nullptr;
+        if (cudaMalloc(&p, (size_t) (o.max_context - kept) * cell_bytes(g, o.kv_int8)) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&m->stage_side, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaEventCreateWithFlags(&m->stage_free, cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&m->stage_ready, cudaEventDisableTiming) != cudaSuccess) {
+            if (p) cudaFree(p);
+            err = o.arch + ": out of device memory for the streamed K/V's prompt copy";
+            return nullptr;
+        }
+        m->owned.push_back(p);
+        kernels::KvFar& f = m->stage;
+        f.at = kept;
+        if (o.kv_int8) {
+            f.q8.k = (int8_t*) p;
+            f.q8.v = f.q8.k + cells;
+            f.q8.ks = (uint16_t*) (f.q8.v + cells);
+            f.q8.vs = f.q8.ks + cells / 64;
+        } else {
+            f.k = (uint16_t*) p;
+            f.v = f.k + cells;
+        }
+    }
     if (!decode_drafter(*m, err)) return nullptr;
     if (!m->ready_products(err) || cudaDeviceSynchronize() != cudaSuccess) {
         if (err.empty()) err = o.arch + ": readying the products failed";

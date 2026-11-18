@@ -77,15 +77,16 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
 }
 
 // Programmatic dependent launch: a kernel waits for its predecessor, or signals that the next may start.
-// Below 9.0 there is no griddepcontrol; launches there are fully serialized, so both are no-ops.
+// Below sm_90 (an Ada peer tier) the intrinsics lower to griddepcontrol, which does not exist there: both
+// become no-ops and the host side launches these kernels the plain way.
 static __device__ __forceinline__ void ggml_cuda_pdl_sync() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
     cudaGridDependencySynchronize();
 #endif
 }
 
 static __device__ __forceinline__ void ggml_cuda_pdl_lc() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }

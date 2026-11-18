@@ -208,6 +208,41 @@ the fallback so the trap is never launched.
   3.37e-5 against 3e-5): its tf32 mma accumulates below fp32 (the test's own comment), and the engine no longer calls it.
   `bf16_rows_dot` itself passes. The thresholds were left as they are.
 
+## Upstream's own Ada peer and the rest of 0.4.1 (merged 2026-11-18)
+- Upstream added a narrower Ada mode (ba7d5d72, #343): with `-DPEER_ADA=ON` a list of peer-tier files also compiles for
+  sm_89, so an Ada card can be an expert-tier second card beside an sm_120 main card; the main card stays sm_120 and
+  DeepSeek refuses an older second card. Here every kernel has an 8.9 form and an Ada card can be the main card, so:
+  - `PEER_ADA=ON` adds 89 to `CMAKE_CUDA_ARCHITECTURES` (the `"120;89"` build); upstream's per-file list is gone. A
+    per-file build would hold only those files' 8.9 code, and the start refuses a card whose code the build lacks
+    (`build_archs.hpp`).
+  - gpu_select keeps upstream's `gpu_main_supported` / `gpu_peer_supported`, both 12.0 or 8.9; `gpu_select_test`'s Ada
+    case expects an Ada card as main or second card, and auto makes the card with the most bandwidth main.
+  - DeepSeek refuses a second card that is neither 12.0 nor 8.9 (its `ds41_*` tests pass on 8.9).
+  - Kernel guards: gdn_window.cu keeps the fork's `REC_NO_CLUSTER` trap stubs (they also cover an 89-only build's host
+    pass, where `__cluster_dims__` must not appear) instead of upstream's `DM_REC_NO_CLUSTERS`; gu2.cuh and
+    mmq_common.cuh take upstream's text (`pdl_launch_dependents`, the same griddepcontrol on 12.0, nothing below 9.0);
+    dec_moe.cuh's TMA kernel is compiled out below 9.0 by upstream's guard (the fork's `DM_SM90_ONLY` inside it stays).
+  - docs/configuration/gpus.md ("An Ada (sm_89) card") and docs/platforms.md say what this fork does.
+- The rest of upstream's 79 commits add no instruction 8.9 lacks: the new fp16 KV prompt attention is f16 mma m16n8k16
+  and ldmatrix, the GQA decode's next-chunk fetch plain loads, the 27B's layer split and `--kv-resident` host code and
+  flag kernels. The FP8 GEMM's per-device shared-memory opt-in sits beside the fork's `gemm_ada`, which already had one.
+- `gqa_attn_parity` freezes the decode kernel's bits (upstream measured them on Blackwell). The 4090 gives other bits,
+  the same before and after upstream's next-chunk fetch (checked by building the test with that change undone), so the
+  test takes those below 9.0.
+- Output: with `--kv int8` (with and without prompt lookup) 3 greedy and 2 sampled cases are identical to fork_4090's.
+  With the default fp16 KV they differ from the first token on, by upstream's design: its fp16 prompt attention now rounds
+  q and p to fp16 and runs one fp16 mma instead of hi + lo parts (c8f54503; upstream's gate: lossless).
+- sm_120 code: in the 21 files the fork changes, every upstream kernel's SASS equals upstream's, apart from two kernels
+  in verify_kernels.cu whose constant-bank address load reads offset 8 instead of 0 (the fork's `g_l2_ahead_sink` comes
+  first in the module's address table; the instructions are the same).
+- Speed against fork_4090 (2 rotated pairs on fresh servers, engine_bench community, int8 KV, 450 W, DDR5-4800): decode_tps
+  197.4 against 197.9 (-0.2 %), conv/struct +0.8/-1.1 %, prefill 16K +1.8 %, 64K -3.6 % in both pairs (the server's own
+  lines: 6057 and 6122 t/s against 6295 and 6316). Both builds reach 35,920 tokens at the same speed; the rest of the 64K
+  prompt runs about 5 % slower. Not explained: the int8 prompt attention times the same before and after upstream's
+  rewrite on the 4090 (1.906 ms per 32K chunk; fp16 KV's went from 9.7 to 2.3 ms). Sampled prose is other text (1176 and
+  1200 tokens against 1125): upstream's clock-free lookup-or-MTP choice and 8-gram suffix index change the windows a
+  reply verifies (conv acceptance 75 % against 77 %).
+
 ## Test once it builds
 1. Run the built `basalt` (see README.md for the command line; the binaries land in `build-ada`) on the user's NVFP4
    pack. Ask the user for the model path and any flags. Start with a short prompt, greedy.

@@ -69,6 +69,20 @@ python3 tools/convert/convert.py --sections-from Qwen3.8-FN-UD-Q4_K_XL.basalt --
 `--mtp-dense FILE` (the `mtp/dense` bytes of an official NVFP4, UD-IQ1_M, UD-IQ2_XS or UD-IQ3_XXS pack) swaps in a tuned drafter layer; the converter
 records it in `meta.mtp.dense`. Output is about 122 GiB (123 GiB for the 8-bit variant). The base's vocabulary must be NVIDIA's.
 
+## Flash-Next QAD pack
+
+An alternative to the NVFP4 pack, from NVIDIA's quantization-aware distillation export
+([nvidia/Qwen3.8-Flash-Next-NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD)): lower PPL, further from
+BF16, no faster ([measured](precision/qwen38-flash-next.md#qad-checkpoint)). The routed experts keep their NVFP4 codes and
+scales; the MXFP8 projections and NVFP4 shared experts become Q6_K (Q8_0 where rows are not whole blocks), the indexer and
+GDN a/b rows BF16, the FP8 n-gram shards Q8_0. The drafter and the vision tower come from a base pack.
+
+```sh
+hf download nvidia/Qwen3.8-Flash-Next-NVFP4-QAD --local-dir qad
+python3 tools/convert/convert.py --sections-from Qwen3.8-FN-NVFP4.basalt --checkpoint qad \
+    --out Qwen3.8-FN-NVFP4-QAD.basalt --name "Qwen3.8-Flash-Next NVFP4-QAD"
+```
+
 ## Qwen3.8-27B pack
 
 The published pack comes from QUASAR's quantization-aware NVFP4 checkpoint
