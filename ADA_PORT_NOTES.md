@@ -236,12 +236,19 @@ the fallback so the trap is never launched.
   in verify_kernels.cu whose constant-bank address load reads offset 8 instead of 0 (the fork's `g_l2_ahead_sink` comes
   first in the module's address table; the instructions are the same).
 - Speed against fork_4090 (2 rotated pairs on fresh servers, engine_bench community, int8 KV, 450 W, DDR5-4800): decode_tps
-  197.4 against 197.9 (-0.2 %), conv/struct +0.8/-1.1 %, prefill 16K +1.8 %, 64K -3.6 % in both pairs (the server's own
-  lines: 6057 and 6122 t/s against 6295 and 6316). Both builds reach 35,920 tokens at the same speed; the rest of the 64K
-  prompt runs about 5 % slower. Not explained: the int8 prompt attention times the same before and after upstream's
-  rewrite on the 4090 (1.906 ms per 32K chunk; fp16 KV's went from 9.7 to 2.3 ms). Sampled prose is other text (1176 and
-  1200 tokens against 1125): upstream's clock-free lookup-or-MTP choice and 8-gram suffix index change the windows a
-  reply verifies (conv acceptance 75 % against 77 %).
+  197.4 against 197.9 (-0.2 %), conv/struct +0.8/-1.1 %, prefill 16K +1.8 %, 64K -3.6 % (the server's own lines: 6057
+  and 6122 t/s against 6295 and 6316). The 64K figure is not the prefill code, but where the adaptive swaps leave the
+  experts after the decode requests before it:
+  - The prefill alone is as fast: basalt-bench -p 65536 (a cold engine, 4 alternating pairs) 6131 against 6103 t/s; the
+    64K request alone on a server, 13-14 warm requests each, medians 6288 and 6314 against 6316 and 6313. The int8
+    prompt attention times the same before and after upstream's rewrite (1.906 ms per 32K chunk; fp16 KV's went from
+    9.7 to 2.3 ms).
+  - With `--adapt-swaps 0` the whole workload gives the same text in both builds and 64K 6260 against 6264 t/s
+    (-0.1 %); with checkpoints off (`--prompt-cache-every 0`) and swaps on, the merge still varied.
+  - With swaps on, fork_4090's sampled prose is nearly always the same text (1125 tokens), so the experts sit the same
+    and its 64K reads about 6300 every time. The merge's varies from run to run (1093 to 1200 tokens): upstream's
+    clock-free lookup-or-MTP choice and 8-gram suffix index change the windows a sampled reply verifies (conv acceptance
+    75 % against 77 %). Its 64K followed (6057 to 6284).
 
 ## Test once it builds
 1. Run the built `basalt` (see README.md for the command line; the binaries land in `build-ada`) on the user's NVFP4
