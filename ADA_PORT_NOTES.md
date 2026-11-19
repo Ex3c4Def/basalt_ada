@@ -250,6 +250,23 @@ the fallback so the trap is never launched.
     clock-free lookup-or-MTP choice and 8-gram suffix index change the windows a sampled reply verifies (conv acceptance
     75 % against 77 %). Its 64K followed (6057 to 6284).
 
+## Upstream 0.5.0: Hy4-flash (merged 2026-11-20)
+- Hy4-flash (src/models/hy4flash) and the code it shares with DeepSeek, moved to shared places (the expert tier, its
+  policy, file reads and elastic array in src/core; the router, row norms and hyper-connections in src/kernels/cuda; the
+  decode MQA chunk stage in basalt/kernels/mqa_chunk.cuh), build for 8.9 as they are: no new or moved kernel uses an
+  instruction 8.9 lacks. Prompt attention, indexer scores and the vision tower are f16 mma m16n8k16 with ldmatrix and
+  cp.async; FP8 cache rows use the e4m3 cvt; NVFP4 experts go through the shared grouped kernels and MMQ (E2M1 by
+  table). The largest shared-memory opt-in, `attend_mma_kernel` with 32 heads a block, is 85,760 bytes (8.9: 101,376).
+  Hy4-flash checks no compute capability, so an Ada card can be its main or second card.
+- On the 4090: its kernel, drafter and encoder parity tests and `expert_tier_test` pass; `ds41_router_parity` keeps the
+  8.9 frozen hash after the router's move. No Hy4-flash pack (158.7 GB) has been run: output, quality and speed unknown.
+- `file_expert_repin_test` fails on Windows: its new check that the RAM copy holds no pinned page before its reads
+  assumes Linux; here `RamAllocation` takes host VMM memory, pinned when allocated (`kPreferHostVmm`).
+- Flash-Next output is identical to fork_4090's (fp16 and int8 KV, swaps off); sm_120 SASS of 33 files as upstream's.
+- Speed A/Bs need the RAM free as well as the GPU: a browser's 37 GiB moved during one, two starts found 50.4 GiB free,
+  kept a 41 GB RAM tier instead of 56-59 and decoded at about 73 tok/s instead of 197. Compare only runs whose server
+  line `ram-experts=` agrees.
+
 ## Test once it builds
 1. Run the built `basalt` (see README.md for the command line; the binaries land in `build-ada`) on the user's NVFP4
    pack. Ask the user for the model path and any flags. Start with a short prompt, greedy.
