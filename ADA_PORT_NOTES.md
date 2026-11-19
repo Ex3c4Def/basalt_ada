@@ -266,6 +266,10 @@ the fallback so the trap is never launched.
 - Speed A/Bs need the RAM free as well as the GPU: a browser's 37 GiB moved during one, two starts found 50.4 GiB free,
   kept a 41 GB RAM tier instead of 56-59 and decoded at about 73 tok/s instead of 197. Compare only runs whose server
   line `ram-experts=` agrees.
+- Speed against fork_4090 before the merge, rerun with 111 GiB of RAM available before each start (2 rotated pairs on
+  fresh servers, engine_bench community, int8 KV, 450 W, DDR5-4800; every run `ram-experts=59.5GB`, the same text, the
+  same acceptance and hit rates): decode_tps 202.2 against 203.0 (-0.4 %; pairs -0.2 and -0.6 %), conv / struct / prose
+  -0.7 / -0.4 / -0.2 %, prefill 16K -1.0 %, 64K -0.1 %. A tie: the 16K figure moves more within one build (5367, 5436).
 
 ## Test once it builds
 1. Run the built `basalt` (see README.md for the command line; the binaries land in `build-ada`) on the user's NVFP4
