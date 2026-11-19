@@ -355,6 +355,116 @@ class UnexpectedTensorTest(unittest.TestCase):
         C.Checkpoint(self.build(other=ok))
 
 
+def csf_encode(s: np.ndarray):
+    """A reference CSF encoder for [rows, cols] scale bytes: each row's base is its smallest scale (at most 240), a
+    scale more than 15 above it is an exception (its code 0)."""
+    rows, cols = s.shape
+    base = np.minimum(s.min(axis=1), C.CSF_MAX_BASE).astype(np.uint8)
+    d = s.astype(np.int16) - base[:, None]
+    exc = d > 15
+    codes = np.where(exc, 0, d).astype(np.uint8)
+    packed = (codes[:, 0::2] | (codes[:, 1::2] << 4)).astype(np.uint8)
+    fixed = np.concatenate([base.reshape(rows // 16, 16), packed.reshape(rows // 16, 16 * cols // 2)], axis=1)
+    pos = np.flatnonzero(exc.reshape(-1)).astype(np.uint32)
+    words = (pos | (s.reshape(-1)[pos].astype(np.uint32) << 24)).astype("<u4")
+    return np.ascontiguousarray(fixed), words
+
+
+class CsfScalesTest(unittest.TestCase):
+    def test_layout(self):
+        # one slab: row r has base r and codes 1, 2, 3, 4 (bytes 0x21, 0x43: low nibble first); one exception at
+        # row 1, column 1
+        fixed = np.zeros((1, 16 * 3), np.uint8)
+        fixed[0, :16] = np.arange(16)
+        fixed[0, 16:] = np.tile([0x21, 0x43], 16)
+        words = np.array([1 * 4 + 1 | 0x77 << 24], "<u4")
+        got = C.csf_scales(fixed, words, 16, 4)
+        want = np.arange(16, dtype=np.uint8)[:, None] + np.array([1, 2, 3, 4], np.uint8)
+        want[1, 1] = 0x77
+        np.testing.assert_array_equal(got, want)
+
+    def test_round_trip(self):
+        rng = np.random.default_rng(5)
+        s = rng.integers(40, 56, size=(48, 40), dtype=np.uint8)
+        s[rng.random(s.shape) < 0.05] = rng.integers(1, 0x7F, size=1)[0]      # outliers below and above the window
+        s[17] = 0x7E                                                            # a row at the largest finite scale
+        fixed, words = csf_encode(s)
+        self.assertGreater(words.size, 0)
+        np.testing.assert_array_equal(C.csf_scales(fixed, words, 48, 40), s)
+
+    def test_malformed_streams(self):
+        s = np.full((16, 4), 9, np.uint8)
+        fixed, words = csf_encode(s)
+        with self.assertRaisesRegex(S.ConvertError, "row base"):
+            bad = fixed.copy()
+            bad[0, 3] = 241
+            C.csf_scales(bad, words, 16, 4)
+        with self.assertRaisesRegex(S.ConvertError, "position"):
+            C.csf_scales(fixed, np.array([64 | 9 << 24], "<u4"), 16, 4)
+        with self.assertRaisesRegex(S.ConvertError, "fixed stream"):
+            C.csf_scales(fixed, words, 16, 6)
+
+    def test_experts_from_csf_shards_in_a_subfolder(self):
+        """FP4-Local's form: CSF expert scales and the shards in tensors/, named by model.safetensors.index.json. The
+        expert blobs equal those of the same checkpoint with plain scales."""
+        rng = np.random.default_rng(6)
+        cfg = UnexpectedTensorTest.CFG
+        plain, csf = {}, {}
+        for e in range(2):
+            for r, (rows, cols) in {"gate_proj": (64, 128), "up_proj": (64, 128), "down_proj": (128, 64)}.items():
+                p = f"model.language_model.layers.0.mlp.experts.{e}.{r}."
+                w = rng.integers(0, 256, size=(rows, cols // 2), dtype=np.uint8)
+                s = rng.integers(30, 50, size=(rows, cols // 16), dtype=np.uint8)
+                s[rng.random(s.shape) < 0.1] = 0x70
+                fixed, words = csf_encode(s)
+                for tens in (plain, csf):
+                    tens[p + "weight"] = ("U8", w.shape, w.tobytes())
+                    tens[p + "weight_scale_2"] = ("F32", (), np.float32(0.25 + e).tobytes())
+                    tens[p + "input_scale"] = ("F32", (), np.float32(1).tobytes())
+                plain[p + "weight_scale"] = ("F8_E4M3", s.shape, s.tobytes())
+                csf[p + "weight_scale" + C.CSF_FIXED] = ("U8", fixed.shape, fixed.tobytes())
+                csf[p + "weight_scale" + C.CSF_EXCEPTIONS] = ("U32", words.shape, words.tobytes())
+        blobs = []
+        for tens, sub in ((plain, None), (csf, "tensors")):
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            d = Path(tmp.name)
+            if sub:
+                (d / sub).mkdir()
+                write_safetensors(d / sub / "model-00001-of-00001.safetensors", tens)
+                (d / "model.safetensors.index.json").write_text(
+                    json.dumps({"weight_map": {k: f"{sub}/model-00001-of-00001.safetensors" for k in tens}}))
+                (d / "config.json").write_text(json.dumps(cfg))
+            else:
+                small_checkpoint(d, tens, cfg)
+            ex = C.CheckpointExperts(C.Checkpoint(d))
+            blob = C._expert_job((ex.entries[0], 2))
+            self.assertIsInstance(blob, bytes)
+            blobs.append(blob)
+        self.assertEqual(blobs[0], blobs[1])
+
+
+class F32SourceTest(unittest.TestCase):
+    """FP4-Local stores its hyper-connection norms in F32: a norm is + 1 in f32, and an F32 matrix quantizes from its
+    values as a BF16 one does."""
+
+    def test_f32_norm_and_matrix(self):
+        import multiprocessing
+        rng = np.random.default_rng(7)
+        norm = (rng.standard_normal(64) * 1e-3).astype(np.float32)        # not exactly BF16
+        mat = rng.standard_normal((4, 256)).astype(np.float32)
+        tens = {"model.language_model.hyper_connection_mixer.hc_norm.weight": ("F32", norm.shape, norm.tobytes()),
+                "model.language_model.layers.0.self_attn.q_proj.weight": ("F32", mat.shape, mat.tobytes())}
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            small_checkpoint(d, tens)
+            dn = C.CheckpointDense(C.Checkpoint(d), q6k=True, require_complete=False)
+            np.testing.assert_array_equal(dn.bytes("output_hc_norm.weight").view("<f4"), norm + np.float32(1))
+            with multiprocessing.Pool(1) as pool:
+                q = b"".join(dn.chunks("blk.0.attn_q.weight", pool))
+            self.assertEqual(q, S.q6_k(mat.reshape(-1)))
+
+
 class CompleteSetTest(unittest.TestCase):
     """A two-layer checkpoint (linear attention, then full attention with the PLE) with every dense tensor."""
     CFG = {"text_config": {**GDN_CFG["text_config"], "indexer_n_heads": 1, "indexer_head_dim": 32,

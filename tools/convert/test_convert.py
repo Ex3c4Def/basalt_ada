@@ -547,6 +547,59 @@ class PleFp8Test(unittest.TestCase):
                 S.PleFp8([str(a), str(b)])
 
 
+class PleNvfp4Test(unittest.TestCase):
+    """The NVFP4 n-gram table (FP4-Local) as Q8_0 rows: values are E2M1 code x E4M3 scale per 16 x the table scale,
+    value 2i in the low nibble of byte i; the Q8_0 values stay within about half a step of them."""
+
+    @staticmethod
+    def values(codes, scales, scale2):
+        nib = np.empty((codes.shape[0], S.PLE_DIM), np.uint8)
+        nib[:, 0::2], nib[:, 1::2] = codes & 15, codes >> 4
+        mag = np.array([0, .5, 1, 1.5, 2, 3, 4, 6], np.float64)[nib & 7] * np.where(nib & 8, -1, 1)
+        return mag * np.repeat(S.fp8_e4m3_table()[scales].astype(np.float64), 16, axis=1) * scale2
+
+    def shard(self, rng, rows):
+        return (rng.integers(0, 256, size=(rows, S.PLE_DIM // 2), dtype=np.uint8),
+                rng.integers(0x20, 0x60, size=(rows, S.PLE_DIM // 16), dtype=np.uint8))
+
+    def test_q8_0_rows(self):
+        rng = np.random.default_rng(3)
+        codes, scales = self.shard(rng, 6)
+        got = S.nvfp4_rows_to_q8_0(codes, scales, 0.03)
+        self.assertEqual(len(got), 6 * S.PLE_DIM // 32 * 34)
+        deq = ggufq.dequantize(np.frombuffer(got, dtype=np.uint8), ggufq.GGMLQuantizationType.Q8_0).reshape(-1, 32)
+        ref = self.values(codes, scales, np.float32(0.03)).reshape(-1, 32)
+        step = np.abs(ref).max(axis=1, keepdims=True) / 127.0
+        self.assertTrue((np.abs(deq - ref) <= step * 0.6 + 1e-9).all())
+
+    def test_reads_safetensors_shards(self):
+        rng = np.random.default_rng(4)
+        stem = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding."
+        shards = [self.shard(rng, r) for r in (3, 5)]
+        s2 = np.array([0.0625], "<f4")
+        tensors = {stem + "weight_scale_2": ("F32", [1], s2.tobytes())}
+        for i, (c, s) in enumerate(shards):
+            tensors[f"{stem}shard_{i}.weight"] = ("U8", list(c.shape), c.tobytes())
+            tensors[f"{stem}shard_{i}.weight_scale"] = ("F8_E4M3", list(s.shape), s.tobytes())
+        want = b"".join(S.nvfp4_rows_to_q8_0(c, s, 0.0625) for c, s in shards)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.safetensors"
+            head, data, at = {}, b"", 0
+            for k, (dt, shape, raw) in tensors.items():
+                head[k] = {"dtype": dt, "shape": shape, "data_offsets": [at, at + len(raw)]}
+                data += raw
+                at += len(raw)
+            hb = json.dumps(head).encode()
+            path.write_bytes(struct.pack("<Q", len(hb)) + hb + data)
+            ple = S.ple_reader([str(path)])
+            self.assertIsInstance(ple, S.PleNvfp4)
+            self.assertEqual((ple.rows, ple.scale, ple.src_type), (8, 0.0625, "NVFP4"))
+            ple.chunk_rows = 2
+            got = b"".join(S._ple_job(j) for j in ple.jobs())
+            self.assertEqual(len(got), ple.nbytes)
+            self.assertEqual(got, want)
+
+
 class BoundedImapTest(unittest.TestCase):
     def test_order_and_depth(self):
         class Pool:

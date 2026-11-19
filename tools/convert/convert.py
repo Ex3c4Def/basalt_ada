@@ -34,7 +34,9 @@ From an NVFP4 checkpoint (--sections-from with --checkpoint)
                      experts) likewise to Q6_K or Q8_0, and BF16 where the checkpoint has BF16. Each form goes to Q6_K
                      where rows are whole 256-value blocks, Q8_0 elsewhere and for the output head and token embedding;
                      the other tensors keep BF16 or become F32/F16 as the engine reads them; the n-gram table is FP8
-                     code x scale as Q8_0. The GGUF metadata and the tokenizer come from the checkpoint's files.
+                     code x scale (or NVFP4's code x scale x table scale) as Q8_0. CSF-compressed expert scales and
+                     shards in a folder model.safetensors.index.json names (NVIDIA's FP4-Local) are read too. The GGUF
+                     metadata and the tokenizer come from the checkpoint's files.
   --dense-q8-0       Q8_0 projections instead of Q6_K (the 8-bit dense variant)
   The drafter and vision sections come from BASE byte for byte; BASE's vocabulary must be the checkpoint's.
 
@@ -568,7 +570,7 @@ def from_checkpoint(a) -> None:
         experts = C.CheckpointExperts(ck)
         dense_src = C.CheckpointDense(ck, q6k)
         ple_paths = C.ple_table(ck)
-        ple = S.PleFp8([str(p) for p in ple_paths])
+        ple = S.ple_reader([str(p) for p in ple_paths])
         kv = C.model_kv(ck, S.PLE_DIM, 18 if q6k else 7, a.name)
         dense = S.Dense(dense_src, False)
     except S.ConvertError as e:
@@ -644,9 +646,8 @@ def from_checkpoint(a) -> None:
                 "gguf_kv": kv,
                 "tensors": tens,
                 "conversions": {"compat_bf16": False, "tensors": [{
-                    "name": "per_layer_token_embd.weight", "src_type": "F8_E4M3", "dst_type": "Q8_0",
-                    "method": "fp8 code x per-tensor BF16 scale, Q8_0 blocks of 32 (ggml reference rounding)",
-                    "scale": ple.scale}]},
+                    "name": "per_layer_token_embd.weight", "src_type": ple.src_type, "dst_type": "Q8_0",
+                    "method": ple.method, "scale": ple.scale}]},
                 "license": model_license(kv),
             }
             for k in ("mtp", "vision"):
