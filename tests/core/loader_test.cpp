@@ -1,7 +1,10 @@
 // The loader: file ranges land byte for byte in host memory and (with a device present) in device memory, on any
 // alignment and size, with every conversion, from a path or a descriptor, with items coalesced, counted exactly once,
-// copies of bytes the plan itself places run after its reads, and a failure or a cancel reported.  The host cases need no GPU.
+// copies of bytes the plan itself places run after its reads, its steps between the two, the reads that land on a card
+// before those that land in RAM (the start's bar says which), and a failure or a cancel reported.  The host cases need no GPU.
 #include "basalt/core/loader.hpp"
+
+#include "basalt/core/load_progress.hpp"
 
 #include "basalt/kernels/f16_bits.hpp"
 #include "basalt/platform/file.hpp"
@@ -9,9 +12,12 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <random>
 #include <string>
 #include <vector>
@@ -152,6 +158,83 @@ void conversions(const TestFile& f) {
         }
         check(ok, "converted elements");
     }
+}
+
+// bf16 -> block_q8_0 over several of a conversion's pieces, to host and to device memory, against ggml's reference rule
+void q8_0_blocks() {
+    const uint64_t n = (5ull << 20) + 96;   // elements, whole blocks; three 4 MiB pieces and a tail
+    const uint64_t off = 4098;
+    std::vector<uint16_t> vals(n);
+    std::mt19937 rng(11);
+    std::normal_distribution<float> g(0.f, 0.02f);
+    for (uint64_t i = 0; i < n; ++i) {
+        const float x = i % 4096 < 32 ? 0.f : g(rng);   // an all-zero block too
+        uint32_t u;
+        std::memcpy(&u, &x, 4);
+        vals[i] = (uint16_t) (u >> 16);
+    }
+    const std::string path = (std::filesystem::current_path() / "loader_q8_test.bin").string();
+    {
+        std::vector<uint8_t> pad(off, 0x5a);
+        std::FILE* fp = basalt::platform::open_file_utf8(path, "wb");
+        std::fwrite(pad.data(), 1, pad.size(), fp);
+        std::fwrite(vals.data(), 2, vals.size(), fp);
+        std::fclose(fp);
+    }
+    std::vector<uint8_t> want(n / 32 * 34);
+    for (uint64_t b = 0; b < n / 32; ++b) {   // ggml's quantize_row_q8_0_ref
+        float amax = 0.f, x[32];
+        for (int i = 0; i < 32; ++i) {
+            const uint32_t u = (uint32_t) vals[b * 32 + i] << 16;
+            std::memcpy(&x[i], &u, 4);
+            amax = std::max(amax, std::fabs(x[i]));
+        }
+        const float d = amax / 127.f, id = d ? 1.f / d : 0.f;
+        const uint16_t dh = basalt::kernels::f16_from_f32(d);
+        std::memcpy(&want[b * 34], &dh, 2);
+        for (int i = 0; i < 32; ++i) want[b * 34 + 2 + i] = (uint8_t) (int8_t) roundf(x[i] * id);
+    }
+    check(conv_out_bytes(Conv::Bf16ToQ8_0, n * 2) == want.size(), "q8_0 output bytes");
+    for (const bool to_dev : {false, true}) {
+        if (to_dev && !has_device()) continue;
+        std::vector<uint8_t> got(want.size());
+        void* dev = nullptr;
+        if (to_dev && cudaMalloc(&dev, got.size()) != cudaSuccess) {
+            check(false, "q8_0 device buffer");
+            continue;
+        }
+        LoadPlan plan;
+        LoadItem it;
+        it.file = plan.file(path);
+        it.off = off;
+        it.bytes = n * 2;
+        if (to_dev) it.dev = dev;
+        else it.host = got.data();
+        it.conv = Conv::Bf16ToQ8_0;
+        plan.add(it);
+        Loader loader;
+        std::string err;
+        check(loader.run(plan, err), "q8_0 run");
+        if (to_dev) {
+            cudaMemcpy(got.data(), dev, got.size(), cudaMemcpyDeviceToHost);
+            cudaFree(dev);
+        }
+        check(got == want, to_dev ? "q8_0 blocks on the device" : "q8_0 blocks in host memory");
+    }
+    {   // a range that is not whole blocks
+        std::vector<uint8_t> out(64);
+        LoadPlan plan;
+        LoadItem it;
+        it.file = plan.file(path);
+        it.bytes = 100;
+        it.host = out.data();
+        it.conv = Conv::Bf16ToQ8_0;
+        plan.add(it);
+        Loader loader;
+        std::string err;
+        check(!loader.run(plan, err), "a q8_0 range of partial blocks is refused");
+    }
+    std::filesystem::remove(path);
 }
 
 void errors(const TestFile& f) {
@@ -315,6 +398,71 @@ void memory_sources(const TestFile& f) {
         std::string err;
         check(loader.run(plan, err) && std::memcmp(second.data(), f.bytes.data() + 333, kLen) == 0,
               "a host copy of a host read of the same plan");
+    }
+}
+
+// a plan's steps run once its reads have landed and before its copies from memory; an appended plan brings its steps,
+// a plan of steps alone runs them, and a step that fails fails the run
+void steps(const TestFile& f) {
+    for (int threads : {1, 8}) {
+        constexpr uint64_t kLen = (20u << 20) + 77;
+        std::vector<uint8_t> first(kLen), second(kLen, 0xEE);
+        LoadPlan plan;
+        LoadItem copy;
+        copy.from = first.data();
+        copy.bytes = kLen;
+        copy.host = second.data();
+        copy.count = 0;
+        plan.add(copy);
+        LoadPlan reads;
+        LoadItem read;
+        read.file = reads.file(f.path);
+        read.off = 333;
+        read.bytes = kLen;
+        read.host = first.data();
+        reads.add(read);
+        int ran = 0;
+        bool landed = false, before_copy = false;
+        reads.after_reads([&](std::string&) {
+            ++ran;
+            landed = std::memcmp(first.data(), f.bytes.data() + 333, kLen) == 0;
+            before_copy = second[0] == 0xEE && second[kLen - 1] == 0xEE;
+            return true;
+        });
+        plan.append(reads);
+        check(plan.steps().size() == 1, "an appended plan brings its steps");
+        Loader loader(threads);
+        std::string err;
+        check(loader.run(plan, err), "a run with a step");
+        check(ran == 1 && landed && before_copy, "a step runs once, after the reads and before the copies");
+        check(std::memcmp(second.data(), f.bytes.data() + 333, kLen) == 0, "the copies after a step");
+    }
+    {
+        LoadPlan only;
+        bool ran = false;
+        only.after_reads([&](std::string&) { ran = true; return true; });
+        Loader loader;
+        std::string err;
+        check(!only.empty() && loader.run(only, err) && ran, "a plan of steps alone runs them");
+    }
+    {
+        std::vector<uint8_t> dst(4096), out(4096, 0xEE);
+        LoadPlan plan;
+        LoadItem read;
+        read.file = plan.file(f.path);
+        read.bytes = dst.size();
+        read.host = dst.data();
+        plan.add(read);
+        LoadItem copy;
+        copy.from = dst.data();
+        copy.bytes = dst.size();
+        copy.host = out.data();
+        copy.count = 0;
+        plan.add(copy);
+        plan.after_reads([](std::string& e) { e = "step refused"; return false; });
+        Loader loader;
+        std::string err;
+        check(!loader.run(plan, err) && err == "step refused" && out[0] == 0xEE, "a failed step fails the run before the copies");
     }
 }
 
@@ -508,6 +656,61 @@ void device(const TestFile& f) {
     }
 }
 
+// A start's pass reads the card's share first though the plan queued its RAM item first: one worker, so the order is the
+// order the bytes land in, read back from the bar's lines (`into cuda0`, `weights`, `into ram`).  Last: it announces a
+// start's total, which every later placement would count against.
+void cards_first(const TestFile& f) {
+    if (!has_device()) return;
+    constexpr uint64_t kLen = 16u << 20;   // one staging piece each: every placement is a line of the bar
+    void* d = nullptr;
+    uint8_t* h = (uint8_t*) basalt::platform::alloc_aligned(kLen, 4096);
+    check(cudaMalloc(&d, kLen) == cudaSuccess && h != nullptr, "cards first: buffers");
+    LoadPlan plan;
+    const int file = plan.file(f.path);
+    LoadItem ram;
+    ram.file = file;
+    ram.off = 8192;
+    ram.bytes = kLen;
+    ram.host = h;
+    plan.add(ram);
+    LoadItem card = ram;
+    card.off = 4096 * 3 + 5;
+    card.host = nullptr;
+    card.dev = d;
+    plan.add(card);
+    const std::string path = (std::filesystem::current_path() / "loader_test_bar.txt").string();
+    std::fflush(stderr);
+    check(std::freopen(path.c_str(), "w", stderr) != nullptr, "cards first: capture the bar");
+    Loader loader(1);
+    std::string err;
+    const bool ok = place_start(loader, plan, err);
+    std::fflush(stderr);
+    const std::string after = path + ".after";   // let go of the file before reading it (Windows)
+    check(std::freopen(after.c_str(), "w", stderr) != nullptr, "cards first: release the bar");
+    check(ok, "cards first: run");
+    std::vector<uint8_t> back(kLen);
+    check(cudaMemcpy(back.data(), d, kLen, cudaMemcpyDeviceToHost) == cudaSuccess &&
+              std::memcmp(back.data(), f.bytes.data() + card.off, kLen) == 0 && std::memcmp(h, f.bytes.data() + ram.off, kLen) == 0,
+          "cards first: bytes");
+    std::ifstream in(path);
+    std::vector<std::string> seq;   // "cuda0", "ram" and the weights counts, in order
+    for (std::string l; std::getline(in, l);) {
+        unsigned long long a = 0, b = 0;
+        char into[32] = {};
+        if (l == "basalt load: stages cuda0 ram") seq.push_back("stages");
+        else if (std::sscanf(l.c_str(), "basalt load: into %31s", into) == 1) seq.push_back(into);
+        else if (std::sscanf(l.c_str(), "basalt load: weights %llu %llu", &a, &b) == 2) seq.push_back(std::to_string(a));
+    }
+    in.close();
+    const std::vector<std::string> want = {"0", "stages", "cuda0", std::to_string(kLen), "ram", std::to_string(2 * kLen)};
+    check(seq == want, "cards first: the card's bytes land first, then the bar reads ram");
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    std::filesystem::remove(after, ec);
+    cudaFree(d);
+    basalt::platform::free_aligned(h);
+}
+
 }  // namespace
 
 int main() {
@@ -516,12 +719,15 @@ int main() {
     host_ranges(f, 8);
     coalescing(f);
     conversions(f);
+    q8_0_blocks();
     errors(f);
     host_aligned(f);
     adjacent_device_allocations();
     memory_sources(f);
+    steps(f);
     descriptor(f);
     device(f);
+    cards_first(f);
     std::printf("loader_test: %s\n", fails ? "FAIL" : "ok");
     return fails ? 1 : 0;
 }
