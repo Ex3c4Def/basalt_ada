@@ -83,6 +83,20 @@ python3 tools/convert/convert.py --sections-from Qwen3.8-FN-NVFP4.basalt --check
     --out Qwen3.8-FN-NVFP4-QAD.basalt --name "Qwen3.8-Flash-Next NVFP4-QAD"
 ```
 
+NVIDIA's FP4-Local export ([nvidia/Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local),
+revision `b9ce18a6`, about 102 GB) converts with the same command. Its shards sit in a `tensors/` folder that
+`model.safetensors.index.json` names; the routed experts' scales are CSF-compressed (`weight_scale.nvfp4_csf_fixed` and
+`.nvfp4_csf_exceptions`) and are decoded back to the plain scale bytes; the norms are F32; the n-gram table is NVFP4 (code x
+scale x table scale) and becomes Q8_0 like the FP8 one. Output is about 123 GiB. Unlike the QAD export it does not lower PPL.
+On one RTX 4090 at 450 W (100 chunks, int8 KV), against the NVFP4 pack: PPL 3.3066 against 3.3087, KLD 0.0892 against
+0.0624, same top-1 90.15% against 92.07%, decode 204 against 201 tok/s (within run-to-run spread).
+
+```sh
+hf download nvidia/Qwen3.8-Flash-Next-FP4-Local --revision b9ce18a6 --local-dir fp4local
+python3 tools/convert/convert.py --sections-from Qwen3.8-FN-NVFP4.basalt --checkpoint fp4local \
+    --out Qwen3.8-FN-FP4-Local.basalt --name "Qwen3.8-Flash-Next FP4-Local"
+```
+
 ## Qwen3.8-27B pack
 
 The published pack comes from QUASAR's quantization-aware NVFP4 checkpoint
