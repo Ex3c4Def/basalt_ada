@@ -1,8 +1,11 @@
 """Tests for convert.py and model_sections.py on a tiny synthetic model, drafter and side files.
 
     python3 -m unittest discover -s tools/convert -p 'test_convert.py'"""
+import contextlib
 import hashlib
+import io
 import json
+import re
 import struct
 import subprocess
 import sys
@@ -96,6 +99,13 @@ class ConvertTest(unittest.TestCase):
 
     def model(self):
         return ModelFile(str(self.t / "out.basalt"))
+
+    def planned(self, **kw):
+        """Section name -> size, from the listing a --dry-run prints."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            convert.convert(self.args(dry_run=True, **kw))
+        return {m.group(1): int(m.group(3)) for m in re.finditer(r"^ {9}(\S+) +(\d+) +(\d+)$", out.getvalue(), re.M)}
 
     # ---------------------------------------------------------------- sections
     def test_sections(self):
@@ -202,6 +212,13 @@ class ConvertTest(unittest.TestCase):
             u16 = (a.view(np.uint32) >> 16).astype(np.uint16).reshape(rows, cols)
             self.assertEqual(t[name][:2], (rows, cols))
             self.assertEqual(t[name][3], H.quantize(u16), name)
+
+    def test_a_dry_run_plans_the_sections_a_build_writes(self):
+        planned = self.planned()
+        self.assertFalse((self.t / "out.basalt").exists() or (self.t / "out.basalt.partial").exists())
+        convert.convert(self.args())
+        m = self.model()
+        self.assertEqual(planned, {k: m.sections[k][1] for k in m.names()})
 
     # ---------------------------------------------------------------- refusals and options
     def test_no_vision_and_overwrite(self):
@@ -346,6 +363,9 @@ class ConvertTest(unittest.TestCase):
         r = run("--mtp-source", str(self.t))
         self.assertEqual(r.returncode, 2)
         self.assertIn("--mtp-dense", r.stderr)
+        r = run("--dry-run")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("takes only", r.stderr)
 
 
 class DrafterTest(unittest.TestCase):
@@ -437,6 +457,8 @@ class DrafterTest(unittest.TestCase):
                              {"mtp/dense", "mtp/dense.index", "mtp/experts", "mtp/draft_vocab"})
             self.assertEqual(len(m.read("mtp/experts")), self.NE * 3 * (self.H * self.FF * 18 // 64))
             self.assertEqual(m.read("mtp/draft_vocab"), (t.t / "dv.bin").read_bytes())
+            self.assertEqual(t.planned(mtp_source=str(self.src), draft_vocab=str(t.t / "dv.bin"), force=True),
+                             {k: m.sections[k][1] for k in m.names()})
             (t.t / "dv.bin").write_bytes(np.array([0, 6], dtype="<i4").tobytes())      # 6 is outside the 6 tokens
             with self.assertRaises(SystemExit):
                 convert.convert(t.args(mtp_source=str(self.src), draft_vocab=str(t.t / "dv.bin"), force=True))
@@ -547,59 +569,6 @@ class PleFp8Test(unittest.TestCase):
                 S.PleFp8([str(a), str(b)])
 
 
-class PleNvfp4Test(unittest.TestCase):
-    """The NVFP4 n-gram table (FP4-Local) as Q8_0 rows: values are E2M1 code x E4M3 scale per 16 x the table scale,
-    value 2i in the low nibble of byte i; the Q8_0 values stay within about half a step of them."""
-
-    @staticmethod
-    def values(codes, scales, scale2):
-        nib = np.empty((codes.shape[0], S.PLE_DIM), np.uint8)
-        nib[:, 0::2], nib[:, 1::2] = codes & 15, codes >> 4
-        mag = np.array([0, .5, 1, 1.5, 2, 3, 4, 6], np.float64)[nib & 7] * np.where(nib & 8, -1, 1)
-        return mag * np.repeat(S.fp8_e4m3_table()[scales].astype(np.float64), 16, axis=1) * scale2
-
-    def shard(self, rng, rows):
-        return (rng.integers(0, 256, size=(rows, S.PLE_DIM // 2), dtype=np.uint8),
-                rng.integers(0x20, 0x60, size=(rows, S.PLE_DIM // 16), dtype=np.uint8))
-
-    def test_q8_0_rows(self):
-        rng = np.random.default_rng(3)
-        codes, scales = self.shard(rng, 6)
-        got = S.nvfp4_rows_to_q8_0(codes, scales, 0.03)
-        self.assertEqual(len(got), 6 * S.PLE_DIM // 32 * 34)
-        deq = ggufq.dequantize(np.frombuffer(got, dtype=np.uint8), ggufq.GGMLQuantizationType.Q8_0).reshape(-1, 32)
-        ref = self.values(codes, scales, np.float32(0.03)).reshape(-1, 32)
-        step = np.abs(ref).max(axis=1, keepdims=True) / 127.0
-        self.assertTrue((np.abs(deq - ref) <= step * 0.6 + 1e-9).all())
-
-    def test_reads_safetensors_shards(self):
-        rng = np.random.default_rng(4)
-        stem = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding."
-        shards = [self.shard(rng, r) for r in (3, 5)]
-        s2 = np.array([0.0625], "<f4")
-        tensors = {stem + "weight_scale_2": ("F32", [1], s2.tobytes())}
-        for i, (c, s) in enumerate(shards):
-            tensors[f"{stem}shard_{i}.weight"] = ("U8", list(c.shape), c.tobytes())
-            tensors[f"{stem}shard_{i}.weight_scale"] = ("F8_E4M3", list(s.shape), s.tobytes())
-        want = b"".join(S.nvfp4_rows_to_q8_0(c, s, 0.0625) for c, s in shards)
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "t.safetensors"
-            head, data, at = {}, b"", 0
-            for k, (dt, shape, raw) in tensors.items():
-                head[k] = {"dtype": dt, "shape": shape, "data_offsets": [at, at + len(raw)]}
-                data += raw
-                at += len(raw)
-            hb = json.dumps(head).encode()
-            path.write_bytes(struct.pack("<Q", len(hb)) + hb + data)
-            ple = S.ple_reader([str(path)])
-            self.assertIsInstance(ple, S.PleNvfp4)
-            self.assertEqual((ple.rows, ple.scale, ple.src_type), (8, 0.0625, "NVFP4"))
-            ple.chunk_rows = 2
-            got = b"".join(S._ple_job(j) for j in ple.jobs())
-            self.assertEqual(len(got), ple.nbytes)
-            self.assertEqual(got, want)
-
-
 class BoundedImapTest(unittest.TestCase):
     def test_order_and_depth(self):
         class Pool:
@@ -699,6 +668,70 @@ class Q6KRequantTest(unittest.TestCase):
             self.assertEqual(g[tb["offset"]:tb["offset"] + tb["bytes"]], qb)
             deq = self.dequant(g[ta["offset"]:ta["offset"] + ta["bytes"]]).reshape(a.shape)
             self.assertLess(np.sqrt(((deq - a) ** 2).mean()), 0.03 * a.std())
+
+
+class Qwen4ExpDefaultNameTest(unittest.TestCase):
+    """Qwen4Exp.default_name takes the pack name and its quant from the GGUF file name (both the plain and the
+    --sections-from path); an unrecognised name carries no quant rather than a guessed one."""
+
+    def setUp(self):
+        self.arch = convert.A.for_architecture("qwen4exp")
+
+    def name(self, gguf, sections_from=False):
+        return self.arch.default_name(gguf, {}, sections_from)
+
+    def test_shard_quant_names_both_paths(self):
+        gguf = "Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
+        self.assertEqual(self.name(gguf), "Qwen3.8-Flash-Next UD-Q4_K_XL")
+        self.assertEqual(self.name(gguf, sections_from=True), "Qwen3.8-Flash-Next UD-Q4_K_XL")
+
+    def test_iq3_shard_plain_name_matches_the_sections_from_name(self):
+        gguf = "Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf"
+        self.assertEqual(self.name(gguf), "Qwen3.8-Flash-Next UD-IQ3_XXS")
+        self.assertEqual(self.name(gguf, sections_from=True), "Qwen3.8-Flash-Next UD-IQ3_XXS")
+
+    def test_single_file_quant(self):
+        self.assertEqual(self.name("Qwen3.8-Flash-Next-Q8_0.gguf"), "Qwen3.8-Flash-Next Q8_0")
+
+    def test_sections_from_single_file_quant(self):
+        self.assertEqual(self.name("Qwen3.8-Flash-Next-Q8_0.gguf", sections_from=True), "Qwen3.8-Flash-Next Q8_0")
+
+    def test_dot_separated_tag(self):
+        self.assertEqual(self.name("Qwen3.8-Flash-Next.Q4_K_M.gguf"), "Qwen3.8-Flash-Next Q4_K_M")
+
+    def test_lowercase_name_keeps_the_tag_case(self):
+        self.assertEqual(self.name("qwen3.8-flash-next-q4_k_m.gguf"), "Qwen3.8-Flash-Next q4_k_m")
+
+    def test_uppercase_extension_and_shard(self):
+        self.assertEqual(self.name("Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.GGUF"), "Qwen3.8-Flash-Next UD-Q4_K_XL")
+
+    def test_shard_suffix_of_any_digit_count(self):
+        self.assertEqual(self.name("Qwen3.8-Flash-Next-UD-Q4_K_XL-1-of-4.gguf"), "Qwen3.8-Flash-Next UD-Q4_K_XL")
+
+    def test_shard_suffix_uppercase_of(self):
+        self.assertEqual(self.name("Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-OF-00004.gguf"), "Qwen3.8-Flash-Next UD-Q4_K_XL")
+
+    def test_unrelated_name_has_no_quant(self):
+        self.assertEqual(self.name("model.gguf"), "Qwen3.8-Flash-Next")
+        self.assertEqual(self.name("model.gguf", sections_from=True), "Qwen3.8-Flash-Next")
+
+    def test_only_the_file_name_is_used(self):
+        gguf = "/models/unsloth/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
+        self.assertEqual(self.name(gguf), "Qwen3.8-Flash-Next UD-Q4_K_XL")
+
+
+class GgufStemTest(unittest.TestCase):
+    """arch.gguf_stem: the file name alone, a trailing `.gguf` (any case) and a shard suffix (any case) of any digit
+    count stripped."""
+
+    def test_stems(self):
+        self.assertEqual(convert.A.gguf_stem("/models/unsloth/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.GGUF"),
+                         "Qwen3.8-Flash-Next-UD-Q4_K_XL")
+        self.assertEqual(convert.A.gguf_stem("Qwen3.8-Flash-Next-UD-Q4_K_XL-1-of-4.gguf"), "Qwen3.8-Flash-Next-UD-Q4_K_XL")
+        self.assertEqual(convert.A.gguf_stem("Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-OF-00004.gguf"),
+                         "Qwen3.8-Flash-Next-UD-Q4_K_XL")
+        self.assertEqual(convert.A.gguf_stem("model.gguf"), "model")
+        self.assertEqual(convert.A.gguf_stem("model"), "model")
 
 
 if __name__ == "__main__":

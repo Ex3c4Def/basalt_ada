@@ -252,8 +252,7 @@ public:
         if (!make_bufs(dec_, kMaxWindow, err)) return false;
         use(dec_);
         // DFLY HOOK: the drafter's tap and scratch (nothing without a drafter in the pack)
-        if (!dfly_.init(m_.dfly(), (int) (g_.idx_top_k + g_.idx_pool), ctx, m_.dfly() ? (const uint16_t*) m_.tensor("output.weight")->ptr : nullptr,
-                        [this](int32_t t, float* o) { return m_.embedding_row(t, o); }, m_.diag_dump(), fp8(), err))
+        if (!dfly_.init(m_.dfly(), (int) (g_.idx_top_k + g_.idx_pool), ctx, [this](int32_t t, float* o) { return m_.embedding_row(t, o); }, m_.diag_dump(), fp8(), err))
             return false;
         return true;
     }
@@ -375,6 +374,7 @@ public:
         t_cpu_wait_ms_ = t_peer_wait_ms_ = t_gpu_wait_ms_ = 0;
         t_pre_ms_ = t_moe_ms_ = t_build_ms_ = t_issue_ms_ = t_att_ms_ = t_ffn_ms_ = 0;
         t_eng_ms_ = 0;
+        t_eng_read_ms_ = t_eng_norm_ms_ = 0;
         t_ring_ms_ = 0;
         if (tier_ && total < kRingRows) {
             int want = kMaxWindow;
@@ -435,7 +435,13 @@ public:
         if (!big_.rows) return;
         ring_join();
         cudaStreamSynchronize(stream_);
-        basalt::log::info("basalt hy4flash", "prompt time: %.0f ms queued ahead of the MoE (attention, dense), %.0f ms in the MoE (%.0f ms sorting the pairs, %.0f ms issuing the launches), %.0f ms in the Engram's host step; host time in attention() %.0f ms, in ffn() %.0f ms, issuing the ring copies %.0f ms; expert rows on the second card %lld, on the CPU %lld", t_pre_ms_, t_moe_ms_, t_build_ms_, t_issue_ms_, t_eng_ms_, t_att_ms_, t_ffn_ms_, t_ring_ms_.load(), (long long) n_peer_rows_, (long long) n_cpu_rows_);
+        basalt::log::info("basalt hy4flash", "prompt time: %.0f ms queued ahead of the MoE (attention, dense), "
+                          "%.0f ms in the MoE (%.0f ms sorting the pairs, %.0f ms issuing the launches), "
+                          "%.0f ms in the Engram's host step (%.0f ms waiting for rows, %.0f ms normalizing); "
+                          "host time in attention() %.0f ms, in ffn() %.0f ms, issuing the ring copies %.0f ms; "
+                          "expert rows on the second card %lld, on the CPU %lld",
+                          t_pre_ms_, t_moe_ms_, t_build_ms_, t_issue_ms_, t_eng_ms_, t_eng_read_ms_, t_eng_norm_ms_,
+                          t_att_ms_, t_ffn_ms_, t_ring_ms_.load(), (long long) n_peer_rows_, (long long) n_cpu_rows_);
         basalt::log::info("basalt hy4flash", "prompt experts: staged from the card %lld, from RAM over the bus %lld, from the second card %lld, on the CPU %lld (its thread %.0f ms, waited for %.0f ms), second card's share waited for %.0f ms, the stream after the launches %.0f ms",
                           (long long) n_stage_dev_, (long long) n_stage_bus_, (long long) n_stage_peer_, (long long) n_cpu_exp_, t_cpu_run_ms_.load(), t_cpu_wait_ms_, t_peer_wait_ms_, t_gpu_wait_ms_);
         use(dec_);
@@ -484,6 +490,12 @@ public:
         if (r.n_tokens < 1) return {model::Status::Error, "hy4flash: an empty window"};
         std::string err;
         release_prompt();
+        // the lossy routing flags apply to decode windows only: prompts route as the model does
+        struct Lossy {
+            core::ExpertTier*& t;
+            ~Lossy() { t = nullptr; }
+        } lossy{lossy_};
+        lossy_ = tier_ && tier_->route_lossy() ? tier_.get() : nullptr;
         dfly_.begin_window(r.pos);   // DFLY HOOK
         for (int t0 = 0; t0 < r.n_tokens; t0 += kMaxWindow) {
             const int n = std::min(kMaxWindow, r.n_tokens - t0);
@@ -1512,17 +1524,22 @@ private:
     }
 
     bool engram_step(int l, int64_t pos0, int R, const int32_t* tokens, std::string& err, int off = 0) {
-        const double te = now_ms();
-        struct Lap {
-            double& acc;
-            double t;
-            ~Lap() { acc += now_ms() - t; }
-        } lap{t_eng_ms_, te};
         const EngramInfo& en = m_.pack().engram;
         int e = -1;
         for (size_t k = 0; k < en.layers.size(); ++k)
             if (en.layers[k] == l) e = (int) k;
         if (e < 0) return true;
+        // The prompt line reports a prompt, so a decode that follows one adds nothing to it.
+        const bool time_prompt = big_.rows != 0;
+        struct Lap {
+            double* acc;
+            double start;
+            ~Lap() { if (acc) *acc += now_ms() - start; }
+        } lap{time_prompt ? &t_eng_ms_ : nullptr, time_prompt ? now_ms() : 0};
+        const auto collect = [&](ngram::PleReader::Ticket ticket) {
+            Lap wait{time_prompt ? &t_eng_read_ms_ : nullptr, time_prompt ? now_ms() : 0};
+            return m_.engram_reader().collect(ticket, err);
+        };
         const int n_cols = en.n_cols(), W = en.row_values;
         static const std::vector<float> lut = [] {
             std::vector<float> t(256);
@@ -1535,7 +1552,7 @@ private:
         const uint8_t* raw = nullptr;
         if (pf) {
             if (!pf->collected) {
-                if (!m_.engram_reader().collect(pf->tk, err)) return false;
+                if (!collect(pf->tk)) return false;
                 pf->collected = true;
             }
             for (int t = 0; t < R; ++t) h_evalid_[t] = pf->valid[(size_t) (off + t)];
@@ -1552,7 +1569,7 @@ private:
             own_raw.resize((size_t) R * n_cols * W);
             ngram::PleReader& rd = m_.engram_reader();
             const ngram::PleReader::Ticket tk = rd.issue(ids.data(), ids.size(), own_raw.data());
-            if (!rd.collect(tk, err)) return false;
+            if (!collect(tk)) return false;
             raw = own_raw.data();
         }
         if (lookup_host_.empty()) lookup_host_.resize((size_t) n_cols * W * en.layers.size());
@@ -1562,6 +1579,7 @@ private:
             cudaMemcpy(nrm, T(l, "engram_lookup_norm.weight")->ptr, (size_t) n_cols * W * 4, cudaMemcpyDeviceToHost);
             lookup_loaded_[(size_t) e] = true;
         }
+        const double norm_start = time_prompt ? now_ms() : 0;
         for (int t = 0; t < R; ++t) {
             const float valid = h_evalid_[t];
             for (int c = 0; c < n_cols; ++c) {
@@ -1576,6 +1594,7 @@ private:
                 for (int d = 0; d < W; ++d) row[d] = row[d] * r * nrm[(size_t) c * W + d] * valid;
             }
         }
+        if (time_prompt) t_eng_norm_ms_ += now_ms() - norm_start;
         put_f32(erows_, h_erows_, (int64_t) R * n_cols * W);
         put_f32(evalid_, h_evalid_, R);
         if (!eng_ev_) cudaEventCreateWithFlags(&eng_ev_, cudaEventDisableTiming);
@@ -1688,7 +1707,16 @@ private:
         ra.k = K;
         ra.weight_scale = g_.expert_scale;
         ra.gate = bk::RouterGate::Sigmoid;
+        const bool lossy = lossy_ && !prompt;
+        if (lossy) {   // a decode window with the lossy routing flags: the experts the GPUs hold
+            ra.held = lossy_->held_tabs(l - g_.n_dense);
+            ra.prior = lossy_->route_prior();
+        }
         bk::router(xn_, F(l, "ffn_gate_inp.weight"), F(l, "exp_probs_b.bias"), R, ra, rlog_, ids_, rw_, stream_);
+        if (lossy && lossy_->route_tail_skip() > 0)   // each group of rows the tier places together
+            for (int g0 = 0; g0 < R; g0 += kMaxWindow)
+                bk::route_tail_skip(ids_ + (size_t) g0 * K, rw_ + (size_t) g0 * K, ra.held, std::min(kMaxWindow, R - g0) * K, K,
+                                    lossy_->route_tail_skip(), g_.n_expert, lossy_->route_counts(), stream_);
         quant_n(R);
         gemm_n(T(l, "ffn_routed_down.weight"), xlat_, L, R);
         if (!prompt) publish(0, std::min(kMaxWindow, R));
@@ -2072,7 +2100,7 @@ private:
         for (int t = 0; t < G; ++t)
             for (int k = 0; k < K; ++k) {
                 const int32_t e = h_ids_[t * K + k];
-                if (e < 0 || e >= g_.n_expert) {
+                if ((e < 0 && !(e == -1 && lossy_)) || e >= g_.n_expert) {   // -1: --route-tail-skip dropped it
                     err = "the router picked expert " + std::to_string(e);
                     return false;
                 }
@@ -2082,11 +2110,12 @@ private:
                     uniq[nu++] = e;
                     use[u] = core::ExpertTier::Use{};
                 }
+                uidx[t * K + k] = u;
+                if (e == -1) continue;   // --route-tail-skip dropped it: no rows (a token may drop several)
                 core::ExpertTier::Use& us = use[u];
                 us.tok[us.nt] = t;
                 us.row[us.nt] = t * K + k;
                 ++us.nt;
-                uidx[t * K + k] = u;
             }
         core::ExpertTier::Lookup& lk = pd.lk;
         if (!tier_->lookup(tl, uniq, nu, lk, err)) return false;
@@ -2100,7 +2129,7 @@ private:
         }
         bool on_peer = false;
         for (int i = 0; i < nu; ++i) {
-            pd.cpu = pd.cpu || (!lk.dev[i] && !lk.peer[i] && !lk.reading[i]);
+            pd.cpu = pd.cpu || (!lk.dev[i] && !lk.peer[i] && !lk.reading[i] && !lk.dropped[i]);
             pd.reading = pd.reading || lk.reading[i];
             on_peer = on_peer || lk.peer[i];
         }
@@ -2138,7 +2167,9 @@ private:
         int ne = 0;
         const int nhits = make_plan(put.plan, false, ne);
         for (int r = 0; r < G * K; ++r)
-            put.rows[r] = (unsigned long long) (lk.dev[uidx[r]] ? ex_rows_ + (size_t) r * L : d_rows_ + (size_t) r * L);
+            put.rows[r] = (unsigned long long) (lk.dev[uidx[r]]       ? ex_rows_ + (size_t) r * L
+                                                : lk.dropped[uidx[r]] ? tier_->zero_row()
+                                                                      : d_rows_ + (size_t) r * L);
         put_words(&put, ex_plan_, (int) ((offsetof(WindowPut, rows) + (size_t) G * K * 8) / 4), st);
         if (nhits) launch(ex_plan_, nhits, ne);
         if (n_fetched) {
@@ -2252,6 +2283,7 @@ private:
         hist_.insert(hist_.end(), tokens, tokens + R);
         place_rope(pos0, R);   // [vision]
         if (tier_) tier_->begin_token(std::min(R, kMaxWindow));
+        if (lossy_) lossy_->publish_held(stream_);   // ahead of the rows' first router
         struct Drain {
             Session* s;
             ~Drain() { s->drain_prefetch(); }
@@ -2318,7 +2350,7 @@ private:
             bk::rms_norm_rows(cur_, (const float*) m_.tensor("output_norm.weight")->ptr, fin_, head_rows, E, g_.rms_eps, stream_);
             dfly_.hidden(R - head_rows, head_rows, fin_, stream_);   // DFLY HOOK
             const DevTensor* head = m_.tensor("output.weight");
-            bk::bf16_gemv_fp32_mmvf_multi(fin_, E, (const uint16_t*) head->ptr, logits_, g_.n_vocab, E, g_.n_vocab, head_rows, stream_);
+            gemm(head, fin_, logits_, E, g_.n_vocab, head_rows);
             if (!m_.diag_dump().empty()) {
                 dump("result_norm", fin_, (int64_t) head_rows * E);
                 dump("result_output", logits_, (int64_t) head_rows * g_.n_vocab);
@@ -2520,6 +2552,7 @@ private:
     // the joiner thread (moe_group hands it a group's CPU and second-card share; join_moe waits for its result)
     bool use_joiner_ = true;
     bool use_graphs_ = true;
+    core::ExpertTier* lossy_ = nullptr;   ///< in a decode window with --route-tail-skip / --route-prior on: the tier
     std::thread joiner_;
     std::mutex jm_;
     std::condition_variable jcv_;
@@ -2563,6 +2596,7 @@ private:
     int last_rows_ = 0;
     // prompt timing (host wall time at the sync points): the work queued before a layer's MoE, the MoE itself, the Engram's reads
     double t_pre_ms_ = 0, t_moe_ms_ = 0, t_eng_ms_ = 0, t_build_ms_ = 0, t_issue_ms_ = 0, t_att_ms_ = 0, t_ffn_ms_ = 0;
+    double t_eng_read_ms_ = 0, t_eng_norm_ms_ = 0;
     std::atomic<double> t_ring_ms_{0};
     static double now_ms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 };

@@ -531,31 +531,7 @@ def fp8_rows_to_q8_0(raw: np.ndarray, scale: float) -> bytes:
     return q8_0(x)
 
 
-E2M1_VALUES = np.array([0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6], np.float32)
-
-
-def nvfp4_rows_to_q8_0(codes: np.ndarray, scales: np.ndarray, scale2: float) -> bytes:
-    """Rows of PLE_DIM NVFP4 values (Model Optimizer's: value 2i in the low nibble of byte i, one E4M3 scale per 16,
-    times the table's FP32 scale) -> Q8_0 rows (5 blocks of 34 bytes each). Code x scale is exact in float32; the
-    table scale rounds once."""
-    rows = codes.size // (PLE_DIM // 2)
-    c = codes.reshape(rows, PLE_DIM // 2)
-    nib = np.empty((rows, PLE_DIM), np.uint8)
-    nib[:, 0::2] = c & 15
-    nib[:, 1::2] = c >> 4
-    s = np.repeat(fp8_e4m3_table()[scales.reshape(rows, PLE_DIM // 16)], 16, axis=1)
-    x = E2M1_VALUES[nib] * s * np.float32(scale2)
-    if not np.isfinite(x).all():
-        raise ConvertError("the NVFP4 table holds a non-finite value")
-    return q8_0(x.reshape(-1))
-
-
 def _ple_job(args):
-    if args[0] == "nvfp4":
-        _, path, off, spath, soff, rows, scale2 = args
-        codes = np.fromfile(path, dtype=np.uint8, count=rows * PLE_DIM // 2, offset=off)
-        scales = np.fromfile(spath, dtype=np.uint8, count=rows * PLE_DIM // 16, offset=soff)
-        return nvfp4_rows_to_q8_0(codes, scales, scale2)
     path, off, rows, scale = args
     raw = np.fromfile(path, dtype=np.uint8, count=rows * PLE_DIM, offset=off)
     return fp8_rows_to_q8_0(raw, scale)
@@ -644,6 +620,9 @@ class PleFp8:
         self.rows = sum(r for _, _, r in self.shards)
         self.row_bytes = PLE_DIM // 32 * 34
         self.nbytes = self.rows * self.row_bytes
+        self.conversion = {"src_type": "F8_E4M3", "dst_type": "Q8_0",
+                           "method": "fp8 code x per-tensor BF16 scale, Q8_0 blocks of 32 (ggml reference rounding)",
+                           "scale": self.scale}
 
     def jobs(self):
         for path, off, rows in self.shards:
@@ -654,80 +633,6 @@ class PleFp8:
     def chunks(self, pool, depth: int = 16):
         """The Q8_0 rows in order, made on `pool` with at most `depth` chunks in flight."""
         yield from bounded_imap(pool, _ple_job, self.jobs(), depth)
-
-    src_type = "F8_E4M3"
-    method = "fp8 code x per-tensor BF16 scale, Q8_0 blocks of 32 (ggml reference rounding)"
-
-
-class PleNvfp4:
-    """The PLE n-gram table of a checkpoint that stores it as NVFP4 shards (nvidia/Qwen3.8-Flash-Next-FP4-Local,
-    `ple_embedding_dtype: nvfp4`): `...ngram_embedding.shard_K.weight` U8 [rows, 80] and `.weight_scale` F8_E4M3
-    [rows, 10] per shard, one F32 `...ngram_embedding.weight_scale_2` for the table; as Q8_0 rows like PleFp8's."""
-
-    src_type = "NVFP4"
-    method = "nvfp4: E2M1 code x E4M3 scale per 16 x the table's FP32 scale, Q8_0 blocks of 32 (ggml reference rounding)"
-
-    def __init__(self, paths, chunk_rows: int = 65536):
-        if isinstance(paths, (str, pathlib.Path)):
-            paths = [paths]
-        self.paths, self.chunk_rows = [pathlib.Path(p) for p in paths], chunk_rows
-        scale2, codes, scales = None, {}, {}
-        for path in self.paths:
-            head, base = read_safetensors_header(path)
-            for k, t in head.items():
-                if k.endswith("ngram_embedding.weight_scale_2"):
-                    if scale2 is not None:
-                        raise ConvertError(f"{path}: a second ngram_embedding.weight_scale_2")
-                    if t["dtype"] != "F32" or t["shape"] not in ([], [1]):
-                        raise ConvertError(f"{path}: the PLE table scale is not one F32 value")
-                    scale2 = float(np.fromfile(path, dtype="<f4", count=1, offset=base + t["data_offsets"][0])[0])
-                    continue
-                m = re.search(r"ngram_embedding\.shard_(\d+)\.(weight|weight_scale)$", k)
-                if not m:
-                    continue
-                i, part = int(m.group(1)), m.group(2)
-                cols, dt = (PLE_DIM // 2, "U8") if part == "weight" else (PLE_DIM // 16, "F8_E4M3")
-                if t["dtype"] != dt or len(t["shape"]) != 2 or t["shape"][1] != cols:
-                    raise ConvertError(f"{path}: shard {i} {part} is {t['dtype']} {t['shape']}, not {dt} [rows, {cols}]")
-                into = codes if part == "weight" else scales
-                if i in into:
-                    raise ConvertError(f"{path}: PLE shard {i} {part} is in two files")
-                into[i] = (path, base + t["data_offsets"][0], t["shape"][0])
-        if scale2 is None:
-            raise ConvertError("no ngram_embedding.weight_scale_2 in " + ", ".join(str(p) for p in self.paths))
-        if not codes or set(codes) != set(scales):
-            raise ConvertError("the PLE shards' codes and scales do not pair up")
-        missing = sorted(set(range(max(codes) + 1)) - set(codes))
-        if missing:
-            raise ConvertError(f"the PLE table lacks shards {missing[:8]} of {max(codes) + 1}")
-        for i in codes:
-            if codes[i][2] != scales[i][2]:
-                raise ConvertError(f"PLE shard {i}: {codes[i][2]} rows of codes, {scales[i][2]} of scales")
-        self.scale = scale2
-        self.shards = [(codes[i], scales[i]) for i in range(max(codes) + 1)]
-        self.rows = sum(c[2] for c, _ in self.shards)
-        self.row_bytes = PLE_DIM // 32 * 34
-        self.nbytes = self.rows * self.row_bytes
-
-    def jobs(self):
-        for (path, off, rows), (spath, soff, _) in self.shards:
-            for r in range(0, rows, self.chunk_rows):
-                n = min(self.chunk_rows, rows - r)
-                yield ("nvfp4", str(path), off + r * (PLE_DIM // 2), str(spath), soff + r * (PLE_DIM // 16), n, self.scale)
-
-    def chunks(self, pool, depth: int = 16):
-        """The Q8_0 rows in order, made on `pool` with at most `depth` chunks in flight."""
-        yield from bounded_imap(pool, _ple_job, self.jobs(), depth)
-
-
-def ple_reader(paths):
-    """The n-gram table reader for these files: NVFP4 shards when they hold a `ngram_embedding.weight_scale_2`
-    (PleNvfp4), else FP8 shards (PleFp8)."""
-    for p in paths:
-        head, _ = read_safetensors_header(p)
-        if any(k.endswith("ngram_embedding.weight_scale_2") for k in head):
-            return PleNvfp4(paths)
-    return PleFp8(paths)
 
 
 # ------------------------------------------------------------------ Q6_K requantization of the dense projections

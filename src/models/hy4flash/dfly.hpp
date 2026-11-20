@@ -117,6 +117,7 @@ public:
     const void *eh_proj = nullptr, *hc_gate = nullptr, *hc_up = nullptr, *hc_down = nullptr;   // Q8_0
     const float *enorm = nullptr, *hnorm = nullptr, *fuse_gate = nullptr, *hc_hidden_norm = nullptr, *hc_embed_norm = nullptr,
                 *final_norm = nullptr, *conf_w = nullptr, *conf_b = nullptr;
+    const void* head_q8 = nullptr;   ///< the target's Q8_0 head (the model's tensor): the drafts read it as the target does
 
 private:
     std::map<std::string, void*> slots_;
@@ -171,7 +172,6 @@ public:
     struct Env {
         const DflyWeights* w = nullptr;
         int device = 0;
-        const uint16_t* head = nullptr;                          ///< the target's output matrix, BF16 [vocab][E]
         std::function<bool(int32_t, float*)> embed;              ///< a token's embedding row (E floats, host)
         int sel_cap = 2056;                                      ///< cells of a selection
         bool fp8 = false;                                        ///< the target's caches hold --kv fp8 rows (kFp8RowBytes)
@@ -207,7 +207,7 @@ public:
     /// `dump` (--diag-dump's directory, may be empty): each block's inputs (the source row's hidden state, the cache rows it attends)
     /// are written there for the first few blocks, to compare with a reference.
     /// `fp8`: the target's sparse caches hold --kv fp8 rows.
-    bool init(const DflyWeights* w, int sel_cap, int64_t ctx, const uint16_t* head, std::function<bool(int32_t, float*)> embed,
+    bool init(const DflyWeights* w, int sel_cap, int64_t ctx, std::function<bool(int32_t, float*)> embed,
               const std::string& dump, bool fp8, std::string& err);
     bool on() const { return runner_ != nullptr; }
     void begin_window(int64_t pos0) { if (tap_) tap_->begin_window(pos0); }
@@ -233,7 +233,6 @@ private:
     int row0_ = -1, pending_ = 0, dumped_ = 0, dump_n_ = 0;
     int64_t dump_pos_ = -1;
     int32_t dump_anchor_ = 0;
-    const uint16_t* head_ = nullptr;
     std::function<bool(int32_t, float*)> embed_;
     std::string dump_;
     int64_t ctx_ = 0;

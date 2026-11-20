@@ -94,8 +94,8 @@ double max_rel(const std::vector<float>& got, const std::vector<double>& want) {
 // ---- the kernels ---------------------------------------------------------------------------------------------------------
 
 void test_kernels() {
+    for (int H : {3, 32})
     for (int rows : {1, 3, 6, 8}) {
-        const int H = 3;
         const Mat kvb = rand_mat((uint64_t) H * kDflyKvbHead, kDflyRank, 0.05f);
         std::vector<float> q((size_t) rows * H * 256), olat((size_t) rows * H * kDflyRank);
         for (float& x : q) x = gauss(1.f);
@@ -123,9 +123,38 @@ void test_kernels() {
                 }
             }
         const double ea = max_rel(download(dqa, wa.size()), wa), eo = max_rel(download(dout, wo.size()), wo);
-        std::printf("kernels rows %d: absorb_k %.2e expand_v %.2e\n", rows, ea, eo);
+        std::printf("kernels heads %d rows %d: absorb_k %.2e expand_v %.2e\n", H, rows, ea, eo);
         CHECK(ea < 1e-5 && eo < 1e-5);
         cudaFree(dkvb); cudaFree(dq); cudaFree(dol); cudaFree(dqa); cudaFree(dout);
+    }
+    {   // absorb_k at the drafter's geometry: microseconds a call and the key rows' bytes over that time
+        const int H = 32;
+        const Mat kvb = rand_mat((uint64_t) H * kDflyKvbHead, kDflyRank, 0.05f);
+        std::vector<float> q((size_t) 8 * H * 256, 0.5f);
+        uint16_t* dkvb = upload(kvb.bits);
+        float *dq = upload(q), *dqa = nullptr;
+        cudaMalloc(&dqa, (size_t) 8 * H * kDflyRank * 4);
+        cudaStream_t bs = nullptr;
+        cudaStreamCreate(&bs);
+        cudaEvent_t e0, e1;
+        cudaEventCreate(&e0);
+        cudaEventCreate(&e1);
+        for (int rows : {1, 2, 4, 8}) {
+            constexpr int kCalls = 200;
+            dfly_absorb_k(dkvb, dq, H * 256, 256, rows, H, dqa, nullptr);
+            cudaEventRecord(e0, bs);
+            for (int i = 0; i < kCalls; ++i) dfly_absorb_k(dkvb, dq, H * 256, 256, rows, H, dqa, bs);
+            cudaEventRecord(e1, bs);
+            cudaEventSynchronize(e1);
+            float ms = 0;
+            cudaEventElapsedTime(&ms, e0, e1);
+            const double us = 1e3 * ms / kCalls, bytes = (double) H * kDflyNope * kDflyRank * 2;
+            std::printf("absorb_k heads %d rows %d: %.1f us a call, %.0f GB/s of key rows\n", H, rows, us, bytes / us / 1e3);
+        }
+        cudaEventDestroy(e0);
+        cudaEventDestroy(e1);
+        cudaStreamDestroy(bs);
+        cudaFree(dkvb); cudaFree(dq); cudaFree(dqa);
     }
     // gather (by cells, and by position) and the gated add
     std::vector<uint16_t> cache(50 * kDflyRowWidth);
@@ -337,10 +366,13 @@ void test_block() {
         }
     }
     Mat head = rand_mat((uint64_t) d.vocab, (uint64_t) E, 2.0f / std::sqrt((float) E));
+    head.q8.resize((size_t) d.vocab * E / 32 * 34);   // the drafts' head, as the loader rounds it (core::Conv::Bf16ToQ8_0)
+    basalt::core::quantize_bf16_q8_0(head.bits.data(), head.bits.size(), head.q8.data());
+    void* dhead_q8 = upload(head.q8);
+    w.head_q8 = dhead_q8;
     std::vector<float> embed((size_t) d.vocab * E);
     for (float& x : embed) x = gauss(1.f);
     Ref r2{d, std::move(rm), std::move(rf), embed, head};
-    uint16_t* dhead = upload(head.bits);
 
     // the target: caches, the tap's row, selections (a list for layer 0, every position for layer 1)
     std::vector<std::vector<uint16_t>> cache(2, std::vector<uint16_t>((size_t) ctx_rows * kDflyRowWidth));
@@ -363,7 +395,6 @@ void test_block() {
 
     DflyRunner::Env env;
     env.w = &w;
-    env.head = dhead;
     env.sel_cap = sel_cap;
     env.embed = [&](int32_t t, float* o) { std::memcpy(o, embed.data() + (size_t) t * E, (size_t) E * 4); return t >= 0 && t < d.vocab; };
     auto run = DflyRunner::create(env, err);

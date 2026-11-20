@@ -83,17 +83,22 @@ python3 tools/convert/convert.py --sections-from Qwen3.8-FN-NVFP4.basalt --check
     --out Qwen3.8-FN-NVFP4-QAD.basalt --name "Qwen3.8-Flash-Next NVFP4-QAD"
 ```
 
-NVIDIA's FP4-Local export ([nvidia/Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local),
-revision `b9ce18a6`, about 102 GB) converts with the same command. Its shards sit in a `tensors/` folder that
-`model.safetensors.index.json` names; the routed experts' scales are CSF-compressed (`weight_scale.nvfp4_csf_fixed` and
-`.nvfp4_csf_exceptions`) and are decoded back to the plain scale bytes; the norms are F32; the n-gram table is NVFP4 (code x
-scale x table scale) and becomes Q8_0 like the FP8 one. Output is about 123 GiB. Unlike the QAD export it does not lower PPL.
-On one RTX 4090 at 450 W (100 chunks, int8 KV), against the NVFP4 pack: PPL 3.3066 against 3.3087, KLD 0.0892 against
-0.0624, same top-1 90.15% against 92.07%, decode 204 against 201 tok/s (within run-to-run spread).
+## Flash-Next FP4-Local pack
+
+`--checkpoint` also reads Model Optimizer's FP4-Local layout, as in
+[nvidia/Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local): the shards sit in `tensors/`,
+the routed experts' scales are CSF stream pairs (`weight_scale.nvfp4_csf_fixed`, `weight_scale.nvfp4_csf_exceptions`), the
+projections are MXFP8, the norm weights F32 and the n-gram table NVFP4.
+
+- **Experts:** each CSF pair decodes to the UE4M3 scales bit for bit; codes and scales then move as in the NVFP4 pack.
+- **Projections:** MXFP8 values (E4M3 codes, one E8M0 scale per 32) widen to f32 exactly, then become Q6_K (Q8_0 where rows
+  are not whole blocks), or BF16 where the engine reads BF16, as in the QAD pack.
+- **N-gram table:** E2M1 code × UE4M3 block scale × `weight_scale_2`, stored as Q8_0 (one rounding).
+- **Drafter and vision:** copied from the base pack.
 
 ```sh
-hf download nvidia/Qwen3.8-Flash-Next-FP4-Local --revision b9ce18a6 --local-dir fp4local
-python3 tools/convert/convert.py --sections-from Qwen3.8-FN-NVFP4.basalt --checkpoint fp4local \
+hf download nvidia/Qwen3.8-Flash-Next-FP4-Local --revision b9ce18a6 --local-dir fp4-local
+python3 tools/convert/convert.py --sections-from Qwen3.8-FN-NVFP4.basalt --checkpoint fp4-local \
     --out Qwen3.8-FN-FP4-Local.basalt --name "Qwen3.8-Flash-Next FP4-Local"
 ```
 
@@ -172,8 +177,8 @@ python3 tools/convert/convert.py --verify Hy4-flash-NVFP4.basalt --gguf Hy4-flas
   bytes each; per matrix the tensor scale amax / (6 x 448), per 16 values the UE4M3 scale with the least squared error among half
   to four times amax / 6 (the 27B pack's rounding).
 - The BF16 projections (attention, latent, shared expert, dense FFN, Engram key/value, indexer, embedding) Q8_0 in ggml's reference
-  rounding; `--dense-q6k` makes the projections with whole 256-value rows Q6_K. The head stays BF16; norms, hc, router and biases
-  F32 as stored.
+  rounding; `--dense-q6k` makes the projections with whole 256-value rows Q6_K. The head stays BF16 (the engine rounds it to Q8_0 as it
+  loads); norms, hc, router and biases F32 as stored.
 - The Engram table: E4M3 codes (type 43), to nearest with ties to even, no scale; the exact fraction and RMS error go to
   `meta.quantized_from.engram`.
 - Tokenizer and chat template are the GGUF's, refused unless they equal `--hf-dir`'s. `vision/mmproj` and `dfly` hold the side files
