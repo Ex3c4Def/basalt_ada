@@ -286,13 +286,14 @@ the fallback so the trap is never launched.
   `basalt-bench -t conv,struct,prose --seed N -o json -- --kv int8 --resident-experts --exp solo_stage=1,stage_frac=F`
   against the same line without `--exp`.
 
-## Test once it builds
-1. Run the built `basalt` (see README.md for the command line; the binaries land in `build-ada`) on the user's NVFP4
-   pack. Ask the user for the model path and any flags. Start with a short prompt, greedy.
-2. Pass criteria: the GPU is accepted as sm_89, the model loads, prefill and decode finish, the text is coherent, and
-   there is no CUDA error. An illegal-instruction / launch-failure error means a `__trap()` stub was launched: rerun
-   with `CUDA_LAUNCH_BLOCKING=1` (and `compute-sanitizer` if available) to find the kernel, then find which runtime
-   predicate should have excluded it.
-3. Cross-check against the other engine in `C:\dev\llm_engine\strata-nvfp4` (same model, Ada-capable) for sanity,
-   not for bit equality. Its non-RTX-50 prefill mode is `STRATA_PREFILL_NVFP4=w4a8`.
-4. Report: what built, which fallbacks ran, tokens per second for prefill and decode, and any errors.
+## Upstream 0.5.0+58: the shared routing flags (merged 2026-11-20)
+- Nothing to port: no added line uses an sm_90+ feature or checks the compute capability. The changed kernels (the
+  router's `--route-prior` instance, `route_tail_skip.cu`, Hy4-flash's `absorb_k` with 32 KB of static shared memory)
+  build for 8.9 as they are. Upstream's FP4-Local reader (#444) replaces the fork's (dbb54997).
+- 450 W, DDR5-4800: CPU suite 94/94, GPU 134 pass / 11 skip / the 3 known fails; output identical to 4e274ca8 (fp16
+  and int8 KV, swaps off); sm_120 SASS of 26 files as upstream's. A/B, 2 rotated pairs, every run `ram-experts=59.5GB`:
+  decode_tps 201.3 against 201.3, prefill +0.1 / +0.2 %: a tie.
+
+## When a new build fails on the card
+An illegal-instruction or launch failure means a `__trap()` stub was launched: rerun with `CUDA_LAUNCH_BLOCKING=1`
+(and `compute-sanitizer`) to find the kernel, then the runtime predicate that should have excluded it.
