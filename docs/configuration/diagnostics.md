@@ -86,3 +86,6 @@ Binary: **CLI** = `bin/basalt` one-shot (`--tokens IDS`), **serve** = `--serve` 
 - `concur5_digest=1`: batch slots print a state digest per window.
 - `spec_log=1`: with `--draft-log`, also write each row's target distribution.
 - `host_ev=1`: print GPU time per window's verify, commit and draft, and the idle gap.
+- `solo_stage=1` (Flash-Next, one card): a solo decode window sends a share of each layer's CPU misses over PCIe to
+  the main card, as batch windows do. `stage_frac=F` makes the share floor(misses * F), `stage_min=N` stages nothing
+  below N misses; both also change the batch windows' share. The start log prints the share of 1 to 12 misses.

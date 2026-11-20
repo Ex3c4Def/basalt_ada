@@ -218,6 +218,20 @@ bool Verifier::dm_init(std::string& err) {
                 if (t < best) { best = t; kt[(size_t) m] = k; }
             }
         }
+        // --exp stage_frac=F: a fixed share instead, the host-planned dispatch's rule (floor(m * round(F * 256) / 256))
+        const double frac = exp_flag("stage_frac", -1.0);
+        if (frac >= 0.0) {
+            const int num = std::max(0, std::min(256, (int) (frac * 256.0 + 0.5)));
+            for (int m = 1; m <= kDmCap; ++m) kt[(size_t) m] = std::min(stage_slots, (m * num) >> 8);
+        }
+        // --exp stage_min=N: nothing staged below N misses
+        const int smin = (int) exp_flag("stage_min", 0.0);
+        for (int m = 1; m < std::min(smin, kDmCap + 1); ++m) kt[(size_t) m] = 0;
+        std::string ks;
+        for (int m = 1; m <= 12; ++m) ks += (m > 1 ? " " : "") + std::to_string(kt[(size_t) m]);
+        basalt::log::info("basalt verify", "staged share: blob %lld bytes, %d staging slots, staged of 1..12 misses: %s%s",
+                          (long long) blob, stage_slots, ks.c_str(),
+                          frac >= 0.0 || smin > 0 ? " (--exp stage_frac / stage_min)" : "");
         int st_least = 0, st_greatest = 0;   // the copy's blocks go first as the FFN read's leave the SMs
         bool sok = cudaMalloc((void**) &d->stage_src, (size_t) LE * 8) == cudaSuccess &&
                    cudaMemset(d->stage_src, 0, (size_t) LE * 8) == cudaSuccess &&
@@ -236,6 +250,11 @@ bool Verifier::dm_init(std::string& err) {
         d->stage_min = 1;
         while (d->stage_min < kDmCap && kt[(size_t) d->stage_min] == 0) ++d->stage_min;
     }
+    if (solo_stage_)
+        basalt::log::info("basalt verify", d->stage_src != nullptr ? "solo windows: a layer with %d+ CPU misses sends a "
+                                                                     "share of them over PCIe to CUDA0"
+                                                                   : "solo windows: no staged share here (%d)",
+                          d->stage_src != nullptr ? d->stage_min : (int) stage);
     std::string served;
     if (d->pdev >= 0) {
         served = ", the peer card served by a persistent kernel (" + std::to_string(d->pblocks) + " blocks";

@@ -271,6 +271,21 @@ the fallback so the trap is never launched.
   same acceptance and hit rates): decode_tps 202.2 against 203.0 (-0.4 %; pairs -0.2 and -0.6 %), conv / struct / prose
   -0.7 / -0.4 / -0.2 %, prefill 16K -1.0 %, 64K -0.1 %. A tie: the 16K figure moves more within one build (5367, 5436).
 
+## PCIe share of solo decode windows (experiment, 2026-11-20)
+- A solo window (one conversation decoding) sends no routed expert over PCIe; only batch windows stage a share of each
+  layer's CPU misses. `--exp solo_stage=1` stages in solo windows too, `stage_frac=F` takes floor(misses * F) (the
+  removed `--pcie-frac` rule, Strata's), `stage_min=N` nothing below N misses
+  ([experiment keys](docs/configuration/diagnostics.md)). Off it is the old path: the 8.9 route kernels' staged
+  instances are taken only with the switch.
+- NVFP4, 450 W, int8 KV, 60.9 GB RAM tier; basalt-bench, 8 sampled seeds, struct on 2; per-seed median against off,
+  conv / prose / struct: 0.1 -1.5 / -2.0 / -1.0 %, 0.2 +0.8 / -1.1 / +0.7 %, 0.3 -2.9 / -1.7 / +2.2 %, 0.35 with
+  `stage_min=6` +0.2 / -2.0 / +1.7 %; an earlier run: 0.35 -2.8 / -0.5 / +3.2 % (struct from engine_bench), 0.5
+  -13.7 / -9.2 %. No share wins. Only wide windows (struct, about 6 tokens a pass) gain; 0.1 hardly stages and still
+  loses: the stage kernel, the staged group launch and their join cost 0.2-0.5 ms a pass even when nothing is staged.
+- Staging changes the text (the CPU pool's rows and CUDA0's round differently), so retest over seeds:
+  `basalt-bench -t conv,struct,prose --seed N -o json -- --kv int8 --resident-experts --exp solo_stage=1,stage_frac=F`
+  against the same line without `--exp`.
+
 ## Test once it builds
 1. Run the built `basalt` (see README.md for the command line; the binaries land in `build-ada`) on the user's NVFP4
    pack. Ask the user for the model path and any flags. Start with a short prompt, greedy.

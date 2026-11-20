@@ -467,6 +467,7 @@ private:
     // batch windows (see init_slots)
     std::vector<SessionState*> slots_;
     bool batch_rec_ = false;               ///< record_window is capturing a batch window
+    bool solo_stage_ = false;              ///< solo windows take the staged share too (--exp solo_stage=1)
     int row_base_ = 0;                     ///< ... its hand-off rows start here (a pipeline group's own rows)
     bool last_batch_ = false;              ///< the last run was a batch window (set_plan_slot: one group)
     /// One window graph per (hand-off base, row count, doorbell variant) and one commit graph per row count.  Which

@@ -116,6 +116,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     const bool ext = d.plan != nullptr && d.plan->ext_kind != nullptr && n <= kMaxWindowEntries;
     if (ext) {
         for (int64_t i = 0; i < n; ++i) kind[i] = d.plan->ext_kind[i];
+        for (int64_t i = 0; i < n; ++i)   // the device's staged share: its distinct experts read over PCIe
+            if (kind[i] == 1) {
+                bool first = true;
+                for (int64_t j = 0; first && j < i; ++j) first = !(kind[j] == 1 && ids[j] == ids[i]);
+                d.pcie_experts += first;
+            }
     } else if (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap) {
         int64_t distinct[kMaxWindowEntries], first_of[kMaxWindowEntries];
         int nd = 0, nmiss = 0;

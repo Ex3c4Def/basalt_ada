@@ -126,7 +126,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     basalt::kernels::mid_chain_init();
     basalt::kernels::hc_read_ada_enable(exp_flag("hc_ada", 1) != 0);   // 0 hc8_gr's three kernels on 8.9
     basalt::kernels::hc_read_ada_init();
-    basalt::kernels::dec_moe_route_ada_enable(exp_flag("dm_route_ada", 1) != 0);   // 0 the route's one kernel on 8.9
+    solo_stage_ = exp_flag("solo_stage", 0) != 0;   // 1: solo windows send a share of the CPU misses over PCIe too
+    // dm_route_ada=0: the route's one kernel on 8.9
+    basalt::kernels::dec_moe_route_ada_enable(exp_flag("dm_route_ada", 1) != 0, solo_stage_);
     wt_ = &wt;
     g_ = &g;
     ss_ = &ss;

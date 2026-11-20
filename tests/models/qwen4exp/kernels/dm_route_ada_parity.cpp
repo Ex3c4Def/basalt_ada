@@ -98,8 +98,22 @@ int main(int argc, char** argv) {
     mapped<float>((size_t) RINGS * MT * H, &h_xm, &m_xm);
     mapped<uint8_t>((size_t) RINGS * MT * XQ_ROW, &h_xqm, &m_xqm);
     mapped<uint32_t>(64, &h_w, &m_w);
+    // the staged share: every 7th expert has no host address; split tables 1: floor(m * 90 / 256), 2: every miss
+    unsigned long long* d_src = dev_alloc<unsigned long long>(NE);
+    int32_t* d_kt = dev_alloc<int32_t>((size_t) 2 * (K::kDmCap + 1));
+    {
+        std::vector<unsigned long long> src(NE);
+        for (int e = 0; e < NE; ++e) src[(size_t) e] = e % 7 == 3 ? 0ull : 0x200000000000ull + (unsigned long long) e * (1ull << 20);
+        CK(cudaMemcpy(d_src, src.data(), src.size() * 8, cudaMemcpyHostToDevice));
+        std::vector<int32_t> kt((size_t) 2 * (K::kDmCap + 1), 0);
+        for (int m = 0; m <= K::kDmCap; ++m) {
+            kt[(size_t) m] = std::min(K::kDmStageMax, (m * 90) >> 8);
+            kt[(size_t) (K::kDmCap + 1 + m)] = std::min(K::kDmStageMax, m);
+        }
+        CK(cudaMemcpy(d_kt, kt.data(), kt.size() * 4, cudaMemcpyHostToDevice));
+    }
 
-    auto args = [&](int r, int T, int mode, bool rows, bool offs) {
+    auto args = [&](int r, int T, int mode, bool rows, bool offs, int stage = 0) {
         K::DmRouteArgs a;
         a.ids = d_ids + (size_t) r * K::kDmCap; a.x = d_x; a.n_tok = T; a.k = KK; a.n_embd = H; a.n_expert = NE; a.layer = r;
         a.res0 = d_res; a.cache_base = reinterpret_cast<const uint8_t*>(0x100000000000ull);
@@ -107,6 +121,10 @@ int main(int argc, char** argv) {
         a.plan = d_plan; a.xq = d_xq; a.ring_m = m_ring + r; a.x_m = m_xm + (size_t) r * MT * H;
         a.xq_m = m_xqm + (size_t) r * MT * XQ_ROW; a.rows = rows; a.host_seq_m = m_w; a.peer_seq_m = m_w + 16;
         a.ring = (uint32_t) r + 1; a.ctr = d_ctr; a.mode = mode; a.xq_pub = d_xq_pub;
+        if (stage > 0) {
+            a.stage_src = d_src;
+            a.stage_k = d_kt + (size_t) (stage - 1) * (K::kDmCap + 1);
+        }
         return a;
     };
     cudaStream_t s;
@@ -143,25 +161,32 @@ int main(int argc, char** argv) {
         size_t per[6] = {};
         const char* names[6] = {"plan", "xq", "ring", "x", "xq_m", "doorbells"};
         std::vector<int32_t> ids;
-        for (const bool rows : {false, true}) for (const bool offs : {false, true}) for (const int pct : {0, 50, 85, 100}) for (const int flaws : {0, 1, 2, 7}) {
+        size_t staged_cases = 0;
+        for (const int stage : {0, 1, 2}) for (const bool rows : {false, true}) for (const bool offs : {false, true}) for (const int pct : {0, 50, 85, 100}) for (const int flaws : {0, 1, 2, 7}) {
             for (int it = 0; it < iters; ++it) for (int T = 1; T <= MT; ++T) {
                 make_ids(ids, T, pct, flaws, rng);
                 CK(cudaMemcpy(d_ids, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice));
                 Snap ref, got;
                 K::dec_moe_route_ada_enable(false);
                 reset(T);
-                K::dec_moe_route(args(0, T, 2, rows, offs), s);
-                K::dec_moe_route(args(0, T, 1, rows, offs), s);
+                K::dec_moe_route(args(0, T, 2, rows, offs, stage), s);
+                K::dec_moe_route(args(0, T, 1, rows, offs, stage), s);
                 CK(cudaStreamSynchronize(s));
                 ref = snap(T);
-                K::dec_moe_route_ada_enable(true);
-                if (!K::dec_moe_route_ada(args(0, T, 1, rows, offs)) || !K::dec_moe_route_ada(args(0, T, 2, rows, offs))) {
+                if (stage > 0) {   // a case where the split moved entries off the CPU
+                    const K::DmRing* rr = reinterpret_cast<const K::DmRing*>(ref.ring.data());
+                    int nc = 0;
+                    for (int j = 0; j < T * KK; ++j) nc += rr->kind[j] < 0;
+                    staged_cases += rr->n_cpu == nc && nc < T * KK - rr->n_vram;
+                }
+                K::dec_moe_route_ada_enable(true, stage > 0);
+                if (!K::dec_moe_route_ada(args(0, T, 1, rows, offs, stage)) || !K::dec_moe_route_ada(args(0, T, 2, rows, offs, stage))) {
                     std::printf("the two kernels do not take T=%d\n", T);
                     ++bad;
                 }
                 reset(T);
-                K::dec_moe_route(args(0, T, 2, rows, offs), s);
-                K::dec_moe_route(args(0, T, 1, rows, offs), s);
+                K::dec_moe_route(args(0, T, 2, rows, offs, stage), s);
+                K::dec_moe_route(args(0, T, 1, rows, offs, stage), s);
                 CK(cudaStreamSynchronize(s));
                 got = snap(T);
                 const std::vector<uint8_t>* a[6] = {&ref.plan, &ref.xq, &ref.ring, &ref.xm, &ref.xqm, &ref.w};
@@ -175,7 +200,16 @@ int main(int argc, char** argv) {
                 ++cases;
             }
         }
-        std::printf("modes 1 and 2 vs dm_route_kernel: %zu cases, %zu differing bytes\n", cases, tot);
+        std::printf("modes 1 and 2 vs dm_route_kernel: %zu cases (%zu with staged entries), %zu differing bytes\n", cases,
+                    staged_cases, tot);
+        if (staged_cases == 0) { std::printf("  no case staged an entry\n"); ++bad; }
+        // without the staged switch a staged share keeps dm_route_kernel
+        K::dec_moe_route_ada_enable(true, false);
+        if (K::dec_moe_route_ada(args(0, 4, 1, false, false, 1)) || K::dec_moe_route_ada(args(0, 4, 2, false, false, 1))) {
+            std::printf("a staged share took the two kernels without the switch\n");
+            ++bad;
+        }
+        K::dec_moe_route_ada_enable(true);
         if (tot) {
             std::printf("  by output:");
             for (int k = 0; k < 6; ++k) std::printf(" %s %zu", names[k], per[k]);

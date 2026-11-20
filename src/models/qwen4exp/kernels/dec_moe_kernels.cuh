@@ -180,7 +180,9 @@ __device__ __forceinline__ void dm_ada_tiers(const DmRouteArgs& a, int32_t* s_id
     __syncthreads();
 }
 
-// Mode 1: block 0 plans CUDA0's groups, the other blocks go straight to the q8_1 rows.
+// Mode 1: block 0 plans CUDA0's groups, the other blocks go straight to the q8_1 rows.  kStage: with the staged share
+// (dm_stage_split), its entries kind 1 and out of the CPU's count.
+template <bool kStage>
 __global__ void __launch_bounds__(kDmThreads) dm_plan_ada_kernel(DmRouteArgs a) {
     const int tid = threadIdx.x;
     if (blockIdx.x != 0) {
@@ -193,6 +195,7 @@ __global__ void __launch_bounds__(kDmThreads) dm_plan_ada_kernel(DmRouteArgs a) 
     __shared__ int32_t s_ng, s_ne;
     const int n = a.n_tok * a.k;
     dm_ada_tiers(a, s_ids, s_kind, n, tid);
+    if constexpr (kStage) dm_stage_split(a, s_ids, s_kind, n, tid, s_first);
     DmPlan* p = a.plan;
     dm_group(s_ids, s_kind, n, 0, tid, s_first, s_cnt, s_gstart, s_gidx, s_pos, p->start, &s_ng, &s_ne);
     if (tid < n) {
@@ -212,12 +215,20 @@ __global__ void __launch_bounds__(kDmThreads) dm_plan_ada_kernel(DmRouteArgs a) 
         p->counts[0] = s_ng;
         p->counts[1] = s_ne;
         p->counts[2] = 0;
-        p->counts[3] = n - s_ne;
+        if constexpr (kStage) {
+            int nc = 0;
+            for (int j = 0; j < n; ++j) nc += s_kind[j] < 0;
+            p->counts[3] = nc;
+        } else {
+            p->counts[3] = n - s_ne;
+        }
     }
 }
 
 // Mode 2: block 0 publishes the header and x and rings the doorbells; the other blocks, launched only for `rows`, publish
-// the q8_1 rows for the warm-up's prediction, which may read them late without changing any output.
+// the q8_1 rows for the warm-up's prediction, which may read them late without changing any output.  kStage: the
+// staged share's entries kind 1, out of the CPU's count, and x published only when the CPU has entries.
+template <bool kStage>
 __global__ void __launch_bounds__(kDmThreads) dm_ring_ada_kernel(DmRouteArgs a) {
     const int tid = threadIdx.x;
     if (blockIdx.x != 0) {
@@ -235,20 +246,28 @@ __global__ void __launch_bounds__(kDmThreads) dm_ring_ada_kernel(DmRouteArgs a) 
     __shared__ int32_t s_ne;
     const int n = a.n_tok * a.k;
     dm_ada_tiers(a, s_ids, s_kind, n, tid);
+    if constexpr (kStage) {
+        __shared__ int32_t s_q[kDmCap];
+        dm_stage_split(a, s_ids, s_kind, n, tid, s_q);
+    }
     DmRing* r = a.ring_m;
     if (tid < n) {
         r->ids[tid] = s_ids[tid];
         r->kind[tid] = s_kind[tid];
     }
     if (tid == 0) {
-        int ne = 0;
+        int ne = 0, nc = 0;
         for (int j = 0; j < n; ++j) ne += s_kind[j] == 0;
-        s_ne = ne;
+        if constexpr (kStage)
+            for (int j = 0; j < n; ++j) nc += s_kind[j] < 0;
+        else
+            nc = n - ne;
+        s_ne = kStage ? n - nc : ne;   // the copy of x below runs when the CPU has entries
         r->n_tok = a.n_tok;
         r->layer = a.layer;
         r->n_vram = ne;
         r->n_peer = 0;
-        r->n_cpu = n - ne;
+        r->n_cpu = nc;
     }
     __syncthreads();
     if (s_ne < n)

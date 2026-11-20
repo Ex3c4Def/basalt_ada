@@ -99,10 +99,10 @@ struct DmRouteArgs {
 /// Blocks dec_moe_route launches for `n_tok` rows (the arrival counter advances by this much).
 int dec_moe_route_blocks(int n_tok, int n_embd);
 void dec_moe_route(const DmRouteArgs& a, void* stream);
-/// On compute capability 8.9, modes 1 and 2 without a peer, staged share or shared gate take two leaner kernels once
-/// enabled: the same plan, rows, ring and doorbells, except that the ring's q8_1 rows (`rows`) may land after its doorbell.
-/// `--exp dm_route_ada=0` keeps the one kernel.
-void dec_moe_route_ada_enable(bool on);
+/// On compute capability 8.9, modes 1 and 2 without a peer or shared gate take two leaner kernels once enabled: the same
+/// plan, rows, ring and doorbells, except that the ring's q8_1 rows (`rows`) may land after its doorbell.  A staged share
+/// takes them only with `staged` (--exp solo_stage=1), else the one kernel.  `--exp dm_route_ada=0` keeps the one kernel.
+void dec_moe_route_ada_enable(bool on, bool staged = false);
 /// Whether dec_moe_route takes those kernels for these arguments on the current device.
 bool dec_moe_route_ada(const DmRouteArgs& a);
 /// The staged share of one layer: the same split the ring's kinds make (a.stage_src, a.stage_k, a.res0, a.ids),

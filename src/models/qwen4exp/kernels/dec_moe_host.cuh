@@ -7,6 +7,7 @@ int dec_moe_route_blocks(int n_tok, int n_embd) { return 1 + (n_tok * n_embd + k
 
 namespace {
 bool g_dm_ada_on = false;
+bool g_dm_ada_stage = false;
 
 bool dm_ada_device() {
     static signed char known[16] = {};   // 0: not asked yet, 1: compute capability 8.9, -1: another
@@ -22,16 +23,20 @@ bool dm_ada_device() {
     return known[dev] > 0;
 }
 
-// the two kernels' case: no peer, no staged share, no shared gate, x in 16-byte units
+// the two kernels' case: no peer, no shared gate, x in 16-byte units (a staged share, when enabled, takes their kStage
+// instances)
 bool dm_ada_args(const DmRouteArgs& a) {
     auto al16 = [](const void* p) { return p != nullptr && ((uintptr_t) p & 15u) == 0; };
     return g_dm_ada_on && (a.mode == 1 || a.mode == 2) && a.res1 == nullptr && a.n_x == 0 && a.peer_cap == 0 &&
-           a.stage_src == nullptr && a.sh_gw == nullptr && !a.kinds && a.pub_ctr == nullptr && al16(a.x) && al16(a.x_m) &&
-           (!a.rows || al16(a.xq_m)) && dm_ada_device();
+           (a.stage_src == nullptr || (g_dm_ada_stage && a.stage_k != nullptr)) && a.sh_gw == nullptr && !a.kinds &&
+           a.pub_ctr == nullptr && al16(a.x) && al16(a.x_m) && (!a.rows || al16(a.xq_m)) && dm_ada_device();
 }
 }  // namespace
 
-void dec_moe_route_ada_enable(bool on) { g_dm_ada_on = on; }
+void dec_moe_route_ada_enable(bool on, bool staged) {
+    g_dm_ada_on = on;
+    g_dm_ada_stage = staged;
+}
 
 bool dec_moe_route_ada(const DmRouteArgs& a) { return dm_ada_args(a); }
 
@@ -42,8 +47,14 @@ void dec_moe_route(const DmRouteArgs& a, void* stream) {
     }
     const dim3 grid((unsigned) dec_moe_route_blocks(a.n_tok, a.n_embd));
     if (dm_ada_args(a)) {
-        if (a.mode == 1) dm_plan_ada_kernel<<<grid, kDmThreads, 0, (cudaStream_t) stream>>>(a);
-        else dm_ring_ada_kernel<<<a.rows ? grid : dim3(1), kDmThreads, 0, (cudaStream_t) stream>>>(a);
+        const dim3 rg = a.rows ? grid : dim3(1);
+        if (a.stage_src != nullptr) {
+            if (a.mode == 1) dm_plan_ada_kernel<true><<<grid, kDmThreads, 0, (cudaStream_t) stream>>>(a);
+            else dm_ring_ada_kernel<true><<<rg, kDmThreads, 0, (cudaStream_t) stream>>>(a);
+        } else {
+            if (a.mode == 1) dm_plan_ada_kernel<false><<<grid, kDmThreads, 0, (cudaStream_t) stream>>>(a);
+            else dm_ring_ada_kernel<false><<<rg, kDmThreads, 0, (cudaStream_t) stream>>>(a);
+        }
     } else {
         dm_route_kernel<<<grid, kDmThreads, 0, (cudaStream_t) stream>>>(a);
     }
