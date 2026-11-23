@@ -274,7 +274,7 @@ void usage(const std::string& engine) {
         "community row\n"
         "  --community        the fixed preset \"community-1\" for the public benchmark table: the three decode\n"
         "                     fixtures, a 16384-token prefill and a 65536-token prefill, once each, with int8 KV cache\n"
-        "                     where the model takes it, else fp8 where it takes that, else its own KV format (the row records the model and the\n"
+        "                     where the model takes it, else the KV format the model's adapter names for community rows, else its own default (the row records the model and the\n"
         "                     KV format used), and the engine's own defaults otherwise (no warm-up, no repetition, drafting at its\n"
         "                     default). The decode fixtures and each prefill run in their own fresh engine process, so\n"
         "                     every number is cold. Prints the table, adds the row to benchmarks.json and prints it; a row of the same\n"
@@ -805,11 +805,14 @@ int main(int argc, char** argv) {
         if (o.community) {
             community_model = asked == 0 ? basalt::program::plan_field(answer, "model") : std::string();
             community_arch = basalt::program::plan_field(answer, "arch");
+            const std::string adapter_kv = basalt::program::plan_field(answer, "community_kv");
             if (asked != 0) community_plan_err = plan_complaint(plan_log);   // read it before the probes below reuse the log
             // the cache format users run, when the engine accepts one of the flags for this model
             std::string unused;
             if (engine_plan(engine_bin, {"--model", abs_model, "--gpu", probe_gpu, "--kv", "int8"}, plan_log, unused) == 0) community_kv = "int8";
-            else if (engine_plan(engine_bin, {"--model", abs_model, "--gpu", probe_gpu, "--kv", "fp8"}, plan_log, unused) == 0) community_kv = "fp8";
+            // else the format the model's adapter names for community rows; a model that names none runs its default
+            else if (!adapter_kv.empty() &&
+                     engine_plan(engine_bin, {"--model", abs_model, "--gpu", probe_gpu, "--kv", adapter_kv}, plan_log, unused) == 0) community_kv = adapter_kv;
         }
         std::error_code rm_ec;
         fs::remove(plan_log, rm_ec);

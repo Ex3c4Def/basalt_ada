@@ -15,6 +15,20 @@ __device__ __forceinline__ float warp_sum(float v) {
     for (int m = 16; m; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
     return v;
 }
+__device__ __forceinline__ float warp_max(float v) {
+#pragma unroll
+    for (int m = 16; m; m >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, m));
+    return v;
+}
+// Two scales per head row: each half-warp covers 64 adjacent channels.
+__device__ __forceinline__ void int8_scales(const float (&v)[4], float f, int lane, float (&scale)[2]) {
+    float a = 0.f;
+#pragma unroll
+    for (int u = 0; u < 4; ++u) a = fmaxf(a, fabsf(v[u] * f));
+#pragma unroll
+    for (int m = 8; m; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, m));
+    scale[lane >> 4] = __half2float(__float2half_rn(a / 127.f));
+}
 
 __device__ __forceinline__ float tau_of(int p, float floor_, float alpha) {
     return 1.f + alpha * logf(fmaxf((float) (p + 1) / floor_, 1.f));
@@ -32,10 +46,11 @@ __device__ __forceinline__ float conv_in(const float* __restrict__ y, int64_t ld
     if (r - j >= 0) return y[(size_t) (r - j) * ld + c];
     return conv_ring(ring, ring_w, pos[r] - j, c);
 }
-// conv_in with row r's position pr in hand (read before the kernel's wait: the positions are staged before the window).
+// conv_in with row r's position pr in hand (read before the kernel's wait: the positions are staged before the window);
+// the window's rows of r's conversation start at row `first` (a batch window's segment, else 0).
 __device__ __forceinline__ float conv_in_at(const float* __restrict__ y, int64_t ld, const float* __restrict__ ring, int ring_w,
-                                            int pr, int r, int j, int c) {
-    if (r - j >= 0) return y[(size_t) (r - j) * ld + c];
+                                            int pr, int r, int j, int c, int first = 0) {
+    if (r - j >= first) return y[(size_t) (r - j) * ld + c];
     return conv_ring(ring, ring_w, pr - j, c);
 }
 
@@ -63,13 +78,12 @@ __device__ __forceinline__ void load_weights(const AttnPrep& a, int g, int w, in
 
 // Warp 0 (keys) or 1 (values) of head g for row r at position pr: channels g * kHeadDim + lane * 4.. of the convolved
 // row, `raw` their convolution inputs at the row's own position, and the factor the cache takes them scaled by (the key
-// clip, the value norm).
+// clip, the value norm). `ring`: the warp's ring of r's conversation; its rows of the window start at `first`.
 __device__ __forceinline__ void kv_row(const AttnPrep& a, int r, int pr, int g, int w, int lane, const float (&wt)[4][kConv],
-                                       float (&val)[4], float (&raw)[4], float& f) {
+                                       float (&val)[4], float (&raw)[4], float& f, const float* ring, int first, float (&scale)[2]) {
     const float* yall = w ? a.yv : a.yk;
     const int64_t ld = w ? a.ldv : a.ldk;
     const float* y = yall + (size_t) r * ld;
-    const float* ring = w ? a.v_ring : a.k_ring;
     const float inv_k = a.full ? (1.f / 3.f) : rsqrtf((float) kConv + 1.f);
     float ss = 0.f;
 #pragma unroll
@@ -79,7 +93,7 @@ __device__ __forceinline__ void kv_row(const AttnPrep& a, int r, int pr, int g, 
         raw[u] = 0.f;
 #pragma unroll
         for (int j = 0; j < kConv; ++j) {
-            const float x = conv_in_at(yall, ld, ring, kKvHeads * kHeadDim, pr, r, j, c);
+            const float x = conv_in_at(yall, ld, ring, kKvHeads * kHeadDim, pr, r, j, c, first);
             if (j == 0) raw[u] = x;
             float t = wt[u][j];
             if (a.full) t += y[kOffTaps + g * kConv + j];
@@ -90,61 +104,73 @@ __device__ __forceinline__ void kv_row(const AttnPrep& a, int r, int pr, int g, 
     }
     ss = warp_sum(ss);
     f = w == 0 ? fminf(a.qk_clip / (sqrtf(ss) + 1e-6f), 1.f) : rsqrtf(ss / (float) kHeadDim + a.eps);
+    if (a.int8) int8_scales(val, f, lane, scale);
 }
 
-// kv_row for the n (1 or 2) consecutive rows r0, r0 + 1 at positions pr0, pr0 + 1, every input loaded before the first
-// sum (the second row's older inputs are the first row's): each row's val, raw and f are kv_row's bits.
-__device__ __forceinline__ void kv_rows2(const AttnPrep& a, int r0, int n, int pr0, int g, int w, int lane,
-                                         const float (&wt)[4][kConv], float (&val)[2][4], float (&raw)[2][4], float (&f)[2]) {
+// kv_row for the n (1..N) consecutive rows r0.. at positions pr0.., every input loaded before the first sum (a row's older
+// inputs are the rows' before it): each row's val, raw and f are kv_row's bits.
+template <int N>
+__device__ __forceinline__ void kv_rows(const AttnPrep& a, int r0, int n, int pr0, int g, int w, int lane,
+                                        const float (&wt)[4][kConv], float (&val)[N][4], float (&raw)[N][4], float (&f)[N], float (&scale)[N][2]) {
     const float* yall = w ? a.yv : a.yk;
     const int64_t ld = w ? a.ldv : a.ldk;
     const float* ring = w ? a.v_ring : a.k_ring;
     const float inv_k = a.full ? (1.f / 3.f) : rsqrtf((float) kConv + 1.f);
-    // x[i]: the convolution input at position pr0 + 1 - i (row r0 + 1 - i of the window, else the ring); x[0] only
-    // for a second row. Row r0 + k takes x[1 - k + j] as kv_row's tap j.
-    float x[kConv + 1][4], tp[2][kConv];
+    // x[i]: the convolution input at position pr0 + N - 1 - i (row r0 + N - 1 - i of the window, else the ring), zero for
+    // the rows past n. Row r0 + k takes x[N - 1 - k + j] as kv_row's tap j.
+    float x[kConv + N - 1][4], tp[N][kConv];
 #pragma unroll
-    for (int i = 0; i <= kConv; ++i) {
-        const int rq = r0 + 1 - i;
+    for (int i = 0; i < kConv + N - 1; ++i) {
+        const int rq = r0 + N - 1 - i;
 #pragma unroll
         for (int u = 0; u < 4; ++u) {
             const int c = g * kHeadDim + lane * 4 + u;
-            x[i][u] = i == 0 && n < 2 ? 0.f : rq >= 0 ? yall[(size_t) rq * ld + c] : conv_ring(ring, kKvHeads * kHeadDim, pr0 + 1 - i, c);
+            x[i][u] = N - 1 - i >= n ? 0.f : rq >= 0 ? yall[(size_t) rq * ld + c] : conv_ring(ring, kKvHeads * kHeadDim, pr0 + N - 1 - i, c);
         }
     }
 #pragma unroll
-    for (int k = 0; k < 2; ++k)
+    for (int k = 0; k < N; ++k)
 #pragma unroll
         for (int j = 0; j < kConv; ++j)
             tp[k][j] = a.full && k < n ? yall[(size_t) (r0 + k) * ld + kOffTaps + g * kConv + j] : 0.f;
 #pragma unroll
-    for (int k = 0; k < 2; ++k) {
+    for (int k = 0; k < N; ++k) {
         if (k >= n) break;
         float ss = 0.f;
 #pragma unroll
         for (int u = 0; u < 4; ++u) {
             float acc = 0.f;
-            raw[k][u] = x[1 - k][u];
+            raw[k][u] = x[N - 1 - k][u];
 #pragma unroll
             for (int j = 0; j < kConv; ++j) {
                 float t = wt[u][j];
                 if (a.full) t += tp[k][j];
-                acc = fmaf(t, x[1 - k + j][u], acc);
+                acc = fmaf(t, x[N - 1 - k + j][u], acc);
             }
             val[k][u] = (acc + raw[k][u]) * inv_k;
             ss = fmaf(val[k][u], val[k][u], ss);
         }
         ss = warp_sum(ss);
         f[k] = w == 0 ? fminf(a.qk_clip / (sqrtf(ss) + 1e-6f), 1.f) : rsqrtf(ss / (float) kHeadDim + a.eps);
+        if (a.int8) int8_scales(val[k], f[k], lane, scale[k]);
     }
 }
 
-__device__ __forceinline__ void store_kv(void* cache, bool fp8, size_t idx, float v) {
-    if (fp8) {
+__device__ __forceinline__ void store_kv(void* row, bool fp8, bool int8, size_t idx, float v, const float (&scale)[2], int lane) {
+    if (int8) {
+        const int group = (int) idx / 64;
+        const float s = scale[group];
+        const int q = s > 0.f ? max(-127, min(127, __float2int_rn(v / s))) : 0;
+        static_cast<int8_t*>(row)[idx] = (int8_t) q;
+        if (lane == group * 16)
+            reinterpret_cast<__half*>(static_cast<uint8_t*>(row) + kHeadDim)[group] = __float2half_rn(s);
+        if (idx == kHeadDim - 1)   // the last channel writes the row padding as zeros
+            for (int b = kHeadDim + 4; b < kKvInt8RowBytes; b += 4) *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(row) + b) = 0u;
+    } else if (fp8) {
         __nv_fp8_e4m3 q(v);
-        static_cast<uint8_t*>(cache)[idx] = *reinterpret_cast<uint8_t*>(&q);
+        static_cast<uint8_t*>(row)[idx] = *reinterpret_cast<uint8_t*>(&q);
     } else {
-        static_cast<__half*>(cache)[idx] = __float2half_rn(v);
+        static_cast<__half*>(row)[idx] = __float2half_rn(v);
     }
 }
 

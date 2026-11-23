@@ -14,6 +14,7 @@ from typing import Iterator
 from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStarting, EngineStuck, GpuBusy, ModelBusy, WakeBlocked
 from serve.engine.console import engine_facts, hardware_view
 from serve.engine.mock import Engine
+from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY
 from serve.frontend import ChatTemplate, Event, effort_kwargs, images_of, mark_think_literals, media_of, unmark_think_literals
 from serve.util import vram
 from serve.util.logbuf import LogBuffer
@@ -141,6 +142,13 @@ class Service:
         self.history = collections.deque(maxlen=500)    # finished requests, newest last
         self.requests_done = 0                           # finished requests since start
         self.totals = {"prompt": 0, "reused": 0, "written": 0, "prompt_ms": 0.0, "decode_ms": 0.0}   # their sums
+        from serve.prometheus import PromStats
+        self.prom = PromStats()                          # latency histograms & finish/draft totals for /metrics
+        self.totals_path = None                          # persistent counters file (None: this start only)
+        self.cost_input_per_million = 0.0                # what a million input tokens costs (US dollars)
+        self.cost_output_per_million = 0.0               # what a million output tokens costs
+        self.cost_cache_write_per_million = None          # cache write rate (None: use input rate)
+        self.cost_cache_hit_per_million = None             # cache hit rate (None: use input rate)
         self.last_timings = None                         # last request's timings
         self.last_request_at = None                      # last request start or finish
         self.started_at = time.time()
@@ -162,6 +170,58 @@ class Service:
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
+
+    _totals_broken = False   # disk errors: print once then stop trying
+
+    def load_totals(self, pricing_cli: set[str] | None = None) -> None:
+        """Read saved lifetime counters and pricing on startup.  Called once from server.py after
+        totals_path and cost_* fields are set.  CLI flags win over the file: a pricing field is
+        restored from the file only when the CLI did not explicitly set it."""
+        if not self.totals_path:
+            return
+        from serve.totals import totals_load_file, totals_add_saved
+        saved = totals_load_file(self.totals_path)
+        if saved:
+            with self.status_lock:
+                snap = {"since": int(self.started_at), "requests": self.requests_done, **self.totals}
+                merged = totals_add_saved(snap, saved)
+                for k in ("prompt", "reused", "written", "prompt_ms", "decode_ms"):
+                    if k in merged:
+                        self.totals[k] = merged[k]
+                if "requests" in merged:
+                    self.requests_done = merged["requests"]
+                if "since" in merged:
+                    self.started_at = merged["since"]
+            cli_set = pricing_cli or set()
+            field_to_cli = {"cost_input_per_million": "cost_in",
+                            "cost_output_per_million": "cost_out",
+                            "cost_cache_write_per_million": "cost_cache_write",
+                            "cost_cache_hit_per_million": "cost_cache_hit"}
+            for field, cli_name in field_to_cli.items():
+                if cli_name in cli_set:
+                    continue
+                file_val = saved.get(field)
+                if file_val is not None and isinstance(file_val, (int, float)):
+                    setattr(self, field, float(file_val))
+
+    def _save_totals(self) -> None:
+        """Write the lifetime counters to disk after a request finishes.  Call with status_lock held."""
+        if not self.totals_path or self._totals_broken:
+            return
+        from serve.totals import totals_write_file, totals_with_cost
+        try:
+            snap = {"since": int(self.started_at), "requests": self.requests_done, **self.totals}
+            totals_with_cost(snap, self.cost_input_per_million, self.cost_output_per_million,
+                             self.cost_cache_write_per_million, self.cost_cache_hit_per_million)
+            # Save the raw cache rates, not the resolved ones: a None rate stays null in the
+            # file so it does not override "same as input" on reload.
+            snap["cost_cache_write_per_million"] = self.cost_cache_write_per_million
+            snap["cost_cache_hit_per_million"] = self.cost_cache_hit_per_million
+            totals_write_file(self.totals_path, snap)
+        except OSError as e:
+            if not self._totals_broken:
+                self._totals_broken = True
+                print(f"[server] warning: could not write totals to {self.totals_path}: {e}", flush=True)
 
     def reasoning_budget(self, req, *, use_default: bool = True) -> int | None:
         """The request's thinking budget in tokens, or None (0 or less: none); ValueError for a non-integer.
@@ -377,6 +437,9 @@ class Service:
             if not self.loaded():
                 self.vram_reserve = reserve_mib
                 out = {"status": "not loaded", "reserve_mib": reserve_mib, "note": "applied when the model loads"}
+            elif getattr(self.engine, "asleep", False) is True:   # its process is suspended: a command would never be read
+                self.vram_reserve = reserve_mib
+                out = {"status": "asleep", "reserve_mib": reserve_mib, "note": "applied when the model wakes"}
             else:
                 got = self.engine.vram(reserve_mib)
                 self.vram_reserve = reserve_mib
@@ -496,6 +559,11 @@ class Service:
             return
         print(f"[server] model awake in {time.time() - t:.1f} s (driver restore {self.engine.restore_s:.1f} s)",
               flush=True)
+        if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # a POST /v1/vram that came while it slept
+            try:
+                self.engine.vram(self.vram_reserve)
+            except (ValueError, EngineDied) as e:
+                print(f"[server] warning: VRAM reserve of {self.vram_reserve} MiB not applied ({e})", flush=True)
 
     WAKE_VRAM_WAIT_S = 15.0                              # for memory just released elsewhere
 
@@ -815,6 +883,9 @@ class Service:
             decoding = any(st.get("first_token") is not None for st, _ in self.live_reqs.values())
             hist = list(self.history)
             totals = {"since": int(self.started_at), "requests": self.requests_done, **self.totals}
+            from serve.totals import totals_with_cost
+            totals_with_cost(totals, self.cost_input_per_million, self.cost_output_per_million,
+                             self.cost_cache_write_per_million, self.cost_cache_hit_per_million)
         busy = bool(s.get("busy"))
         if self.loading:
             state = "loading"
@@ -854,6 +925,11 @@ class Service:
                 "totals": totals, "conversation": dict(getattr(self.engine, "conversation", None) or {}),
                 "hardware": hardware_view(tel["now"], tel["static"], info, cards, l3), "hardware_static": tel["static"],
                 "history": tel["history"]}
+
+    def prom_snapshot(self) -> dict:
+        """Thread-safe snapshot of Prometheus counters and latency histograms."""
+        with self.status_lock:
+            return self.prom.snapshot()
 
     def _drop_stale_best(self) -> None:
         """A best is a fact about the engine that produced it: a restarted engine (another model, other flags, a
@@ -926,6 +1002,7 @@ class Service:
     def render_prompt(self, messages, tools, kwargs) -> str:
         """Render the template. With `effort_end`, a non-default effort is rendered as the default up to the answer
         (same prefix, cache kept) and follows as a short system turn right before it."""
+        kwargs = self.minimal_off(kwargs)
         if kwargs.get("reasoning_effort") not in (None, ""):
             kwargs = dict(kwargs, reasoning_effort=self.dialect.effort_level(kwargs["reasoning_effort"]))
         kwargs = self.dialect.template_kwargs(kwargs)
@@ -951,9 +1028,16 @@ class Service:
             return prompt, []
         return unmark_think_literals(prompt, self.literals)
 
+    def minimal_off(self, kwargs: dict) -> dict:
+        """`minimal` as thinking off, for a template without that level."""
+        if kwargs.get("reasoning_effort") != "minimal" or self.dialect.minimal_effort:
+            return kwargs
+        return {**{k: v for k, v in kwargs.items() if k != "reasoning_effort"}, "enable_thinking": False}
+
     def thinking_kwargs(self, kwargs: dict) -> dict:
         """The request's template kwargs, with the server's default effort when it names no effort and no thinking
-        switch (a request's budget already named a level)."""
+        switch (a request's budget already named a level); `minimal` is thinking off for a template without that level."""
+        kwargs = self.minimal_off(kwargs)
         if self.reasoning_effort is None or "reasoning_effort" in kwargs or "enable_thinking" in kwargs:
             return kwargs
         return {**kwargs, **effort_kwargs(self.reasoning_effort)}
@@ -1272,6 +1356,9 @@ class Service:
         (serve/api/logprobs.py)."""
         if live is not None:
             live.thinking = bool(thinking)
+        if not thinking and self.dialect.thinks_in_blocks and isinstance((sampling or {}).get(GRAMMAR_KEY), dict):
+            # the grammar guard lets a reply of blocks think only when the request does
+            sampling = {**sampling, GRAMMAR_KEY: dict(sampling[GRAMMAR_KEY], think=False)}
         budget = self.reasoning_budget(sampling) if thinking else None
         budget_req = sampling
         budget_ready = False
@@ -1323,6 +1410,7 @@ class Service:
         st = {} if par else self.status
         rate = collections.deque(maxlen=RATE_SAMPLES) if par else self.rate
         wait_key = object()                             # this request's entry in self.waiting
+        arrived = getattr(self.request_ctx, "arrived", None) or time.time()
         with self.status_lock:
             self.status["queued"] += 1
             if not par:
@@ -1400,12 +1488,11 @@ class Service:
                     # answer now stops an engine that takes `stop_soon` at its own pace (see the pass below)
                     soft_stops = live is not None and "stop_soon" in inspect.signature(self.engine.generate).parameters
                     closed_early = False                # the thinking was already closed once
+                    pt_settled = False                  # the engine's PT line was applied to the total cap
                     run_id, run_n = None, 0             # the token the thinking is repeating, and how often in a row
                     for ev in opening:
                         yield "event", ev
                     while True:
-                        if isinstance(ids, PromptText) and ids.max_new:
-                            max_new = ids.max_new       # settled by the engine at PT (a clipped cap)
                         # answer now stops the engine at its own pace: the tokens it still writes are kept, so the
                         # next pass extends exactly what it holds and reads only the close
                         soft = threading.Event() if soft_stops else None
@@ -1435,16 +1522,21 @@ class Service:
                             # a held-back tool argument can leave the stream silent for long: ping after a quiet spell
                             last_out = time.monotonic()
                             for t in gen:
-                                # The engine settles a text prompt's output cap before its first token.
-                                if isinstance(ids, PromptText) and ids.max_new:
-                                    max_new = ids.max_new
+                                # The engine settles a text prompt's output cap before its first token. It answers
+                                # with the cap of this pass: only a number below what the pass asked for is a clip
+                                # (the context's room), and it lowers the total. A pass capped by the thinking budget
+                                # comes back as the budget and must not replace the client's cap.
+                                if isinstance(ids, PromptText) and ids.n is not None and not pt_settled:
+                                    pt_settled = True
+                                    if ids.max_new and ids.max_new < cap:
+                                        max_new = min(max_new, n_pass0 + ids.max_new)
                                 if thinking and not budget_ready and (not isinstance(ids, PromptText) or ids.n is not None):
                                     budget = self.answer_budget(budget_req, max_new, budget)
                                     budget_ready = True
                                 if t is None:               # heartbeat
                                     if isinstance(ids, PromptText) and ids.n is not None and st.get("prompt_tokens") != ids.n:
                                         with self.status_lock:  # the engine has counted the prompt
-                                            st.update(prompt_tokens=ids.n, max_tokens=ids.max_new or max_new)
+                                            st.update(prompt_tokens=ids.n, max_tokens=max_new)
                                     last_print = self._progress(last_print, st=st)
                                     last_out = time.monotonic()
                                     yield "ping", None
@@ -1664,16 +1756,25 @@ class Service:
                                              ("prompt_ms", last.get("prompt_ms") or 0.0),
                                              ("decode_ms", last.get("decode_ms") or 0.0)):
                                 self.totals[key] += add
+                            self._save_totals()
                             if st.get("slot") is not None:
                                 self.slot_last[st["slot"]] = {"ctx": seen + n, "offered": last.get("drafts_offered"),
                                                               "accepted": last.get("drafts_accepted"), "at": time.time()}
                             ft = st.get("first_token")
                             ttft = ft - st["started"] if ft and st.get("started") else None
+                            now_done = time.time()
+                            self.prom.record(
+                                finish=finish,
+                                ttft_s=(ft - arrived) if ft else None,
+                                duration_s=now_done - arrived,
+                                decode_ms=last.get("decode_ms"), output_tokens=n,
+                                drafts_offered=last.get("drafts_offered"), drafts_accepted=last.get("drafts_accepted"),
+                            )
                             windows, window_tokens = st.get("windows") or 0, st.get("window_tokens") or 0
                             dl = window_tokens / windows if windows else None
                             self.history.append({
                                 "id": f"r_{self.requests_done:04d}", "path": path, "slot": self._slot_of(st),
-                                "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
+                                "time": started, "duration_s": round(now_done - started, 1), "finish": finish,
                                 "prompt_tokens": seen, "reused": last.get("reused"), "output_tokens": n,
                                 "prompt_ms": last.get("prompt_ms"),
                                 "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
