@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Iterator
 
 from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStarting, EngineStuck, GpuBusy, ModelBusy, WakeBlocked
+from serve.engine.console import engine_facts, hardware_view
 from serve.engine.mock import Engine
 from serve.frontend import ChatTemplate, Event, effort_kwargs, images_of, mark_think_literals, media_of, unmark_think_literals
 from serve.util import vram
@@ -744,17 +745,28 @@ class Service:
             last = {k: dict(v) for k, v in self.slot_last.items()}
         reading = [i for i, (st, _) in by_slot.items() if st.get("first_token") is None]
         progress = getattr(self.engine, "progress", None)
+        console = getattr(self.engine, "console", None)
+        with self.status_lock:      # each slot's last request's start, for an idle slot's console figures
+            last_start = {}
+            for r in self.history:
+                if r.get("slot") is not None:
+                    last_start[r["slot"]] = r["time"]
         rows = []
         for i in range(total):
             held = dict(last.get(i, {}))
             bd = (getattr(self.engine, "slot_drafts", None) or {}).get(i)
             if bd and bd[2] >= held.get("at", 0):      # a batch slot's own counts, when newer than a solo request's
                 held.update(accepted=bd[0], offered=bd[1])
+            cons = console.slot(i, by_slot[i][0].get("started") if i in by_slot else last_start.get(i)) \
+                if console is not None else {"accept_pos": None, "accept_hist": None, "hit": None}
             row = {"id": i, "n_ctx": self.engine.max_context, "is_processing": i in by_slot, "state": "idle",
                    "api": None, "model": None, "tok_s": 0.0, "generated": 0, "max_tokens": None, "prompt_tokens": 0,
                    "prefill_done": 0, "reused": None, "ttft_s": None, "draft_len": None,
                    "ctx_used": held.get("ctx", 0), "drafts_offered": held.get("offered"),
-                   "drafts_accepted": held.get("accepted")}       # draft counts are the slot's last finished request's
+                   "drafts_accepted": held.get("accepted"),       # draft counts are the slot's last finished request's
+                   "started": None, "path": None, "prompt_ms": None,
+                   # the engine's own figures of the slot's current or last request (STATS)
+                   **cons}
             if view:
                 row["ctx_used"] = view[i]["held"]
             if i in by_slot:
@@ -770,7 +782,11 @@ class Service:
                            prompt_tokens=prompt, prefill_done=done, ctx_used=prompt + gen, reused=st.get("reused"),
                            ttft_s=round(st["first_token"] - st["started"], 2) if decoding and st.get("started")
                            else None,
-                           draft_len=round(win_tokens / windows, 2) if windows else None)
+                           draft_len=round(win_tokens / windows, 2) if windows else None,
+                           started=st.get("started"), path=st.get("path"), prompt_ms=st.get("prompt_ms"),
+                           # a running request's own drafts (the engine's XSLOT counts), none before its first window
+                           drafts_offered=row.get("drafts_offered") if console is None or "drafts_offered" in cons else None,
+                           drafts_accepted=row.get("drafts_accepted") if console is None or "drafts_accepted" in cons else None)
             rows.append(row)
         return rows, queue
 
@@ -823,6 +839,7 @@ class Service:
         info = dict(getattr(self.engine, "info", {}) or {})
         experts_total = info.get("spill_total")          # every routed (layer, expert) pair, on the SSD or not
         spill = spill_of(info)
+        cards, l3 = engine_facts(info)
         # a start under way reads 0; the last READY's context stands in until the new one arrives
         engine = {"model": self.model, "max_context": self.engine.max_context or getattr(self.engine, "known_ctx", 0), **info,
                   "spill": spill, "expert_total": experts_total if isinstance(experts_total, int) else None}
@@ -831,9 +848,12 @@ class Service:
         with self.status_lock:
             self._drop_stale_best()
             best = {k: dict(v) for k, v in self.best.items()}
+        console = getattr(self.engine, "console", None)
         return {"engine": engine, "live": live, "requests": hist[::-1][:REQUESTS_SHOWN], "best": best,
+                "experts_map": console.expert_map() if console is not None else None,
                 "totals": totals, "conversation": dict(getattr(self.engine, "conversation", None) or {}),
-                "hardware": tel["now"], "hardware_static": tel["static"], "history": tel["history"]}
+                "hardware": hardware_view(tel["now"], tel["static"], info, cards, l3), "hardware_static": tel["static"],
+                "history": tel["history"]}
 
     def _drop_stale_best(self) -> None:
         """A best is a fact about the engine that produced it: a restarted engine (another model, other flags, a
@@ -1165,6 +1185,14 @@ class Service:
                 s["run_windows"], s["run_tokens"] = run_windows()
             if s.get("first_token") is None:
                 s["first_token"] = time.time()
+                # the read time as the engine's last progress line has it; its DONE line gives the exact one later
+                progress = getattr(self.engine, "prompt_progress", None)
+                pp = (progress() or {}) if callable(progress) else {}
+                ms = pp.get("ms")
+                s["prompt_ms"] = round(ms, 1) if isinstance(ms, (int, float)) else s.get("prompt_ms")
+                # the reused prefix as the engine's RESUME line said it, until its DONE line gives it
+                if s.get("reused") is None and isinstance(pp.get("cache"), int):
+                    s["reused"] = min(pp["cache"], int(s.get("prompt_tokens") or pp["cache"]))
             (self.rate if rate is None else rate).append((time.time(), n))   # live rate window
             for ev in evs:
                 if ev.kind == "reasoning":
@@ -1288,6 +1316,7 @@ class Service:
         # identity token: only a DONE line replaces engine.last, so a request without one records no stale figures
         engine_last0 = getattr(self.engine, "last", None)
         counted_last = engine_last0                     # the `last` whose windows are in st: a pass without a DONE adds none
+        timed_last = engine_last0                       # the `last` whose decode time is in st
         path = getattr(self.request_ctx, "path", None)   # the API path serving this request
         # parallel requests keep their own status and rate window; otherwise self.status / self.rate
         par = bool(getattr(self.engine, "batch", 0))
@@ -1353,6 +1382,8 @@ class Service:
                     with self.status_lock:
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
+                                  path=path, prompt_ms=None, decode_ms=None, decoded=None, passes=None, windows=None,
+                                  window_tokens=None,
                                   max_tokens=max_new, slot=None, reused=None, thread=threading.get_ident(),
                                   api="anthropic" if path == "/v1/messages" else "openai",
                                   model=getattr(self.request_ctx, "model", None) or self.model)
@@ -1518,6 +1549,13 @@ class Service:
                                 st["windows"] = (st.get("windows") or 0) + run_last["windows"]
                                 st["window_tokens"] = (st.get("window_tokens") or 0) + n - n_pass0
                                 counted_last = run_last
+                            if isinstance(run_last, dict) and run_last is not timed_last and run_last.get("decode_ms"):
+                                # a request that took several passes (a thinking budget closed, answer now) decoded in all
+                                # of them: its rate is every pass's tokens over every pass's time, not the last pass's
+                                st["decode_ms"] = (st.get("decode_ms") or 0.0) + float(run_last["decode_ms"])
+                                st["decoded"] = (st.get("decoded") or 0) + int(run_last.get("generated") or 0)
+                                st["passes"] = (st.get("passes") or 0) + 1
+                                timed_last = run_last
                         if isinstance(run_last, dict) and run_last is not engine_last0 and run_last.get("finish") == "error":
                             finish = "error"          # the engine ended the request itself: the grammar allowed no token
                             err = "the grammar allowed no token to continue the reply; the engine log has the state"
@@ -1527,6 +1565,9 @@ class Service:
                                 and run_last.get("reused") is not None:
                             reused0 = min(int(run_last["reused"]), len(ids))    # later passes extend this reply
                             prompt_ms0 = run_last.get("prompt_ms")    # the prompt is read in that run only
+                            if prompt_ms0 is not None:
+                                with self.status_lock:
+                                    st["prompt_ms"] = prompt_ms0
                         if drained and capped and not wrap and n - n_pass0 >= cap and n < max_new and not cancel.is_set():
                             if parser.state == "reasoning" and thought >= budget and not parser.buf and not detok.pending():
                                 wrap = True             # the budget's last token: close the thinking
@@ -1604,6 +1645,8 @@ class Service:
                             # same object as before: no DONE arrived
                             last = dict(getattr(self.engine, "last", {}) or {}) \
                                 if getattr(self.engine, "last", None) is not engine_last0 else {}
+                            if (st.get("passes") or 0) > 1 and last.get("decode_ms") is not None:
+                                last["decode_ms"], last["generated"] = st["decode_ms"], st["decoded"]
                             if reused0 is not None and last.get("reused") is not None:
                                 last["reused"] = reused0
                                 if prompt_ms0 is not None:

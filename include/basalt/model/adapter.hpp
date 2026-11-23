@@ -184,8 +184,13 @@ public:
             if (Result r = peers[i]->draft_begin(anchors[i], pos[i], n[i]); !r.ok()) return r;
         return {};
     }
-    /// The drafts draft_begin started: `n` tokens and each one's estimated chance of acceptance, at most `max_n`.
-    virtual Result draft_end(int32_t* ids, float* conf, int max_n, int& n) { (void) ids; (void) conf; (void) max_n; (void) n; return {Status::NotImplemented, "this model has no drafter"}; }
+    /// Whether draft `j` (from 0) of `n` can be in the next window, from the chances of drafts 0..j (the later ones not
+    /// known yet).
+    using DraftNeed = std::function<bool(const float* chance, int j, int n)>;
+    /// The drafts draft_begin started: `n` tokens and each one's estimated chance of acceptance, at most `max_n`. A
+    /// session that makes its drafts in turn may stop before the first draft `need` rules out (when set): no window
+    /// would verify it, so only its time is at stake.
+    virtual Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed& need) { (void) ids; (void) conf; (void) max_n; (void) n; (void) need; return {Status::NotImplemented, "this model has no drafter"}; }
     /// Rows row0..row0+n of the last decoded window: picks[t]'s log probability and the row's `top` likeliest tokens,
     /// kernels::kLogprobStride floats a row to the host `out` (basalt/kernels/logprobs.hpp).
     virtual Result row_logprobs(int row0, int n, const int32_t* picks, int top, float* out) { (void) row0; (void) n; (void) picks; (void) top; (void) out; return {Status::NotImplemented, "this model keeps no logits"}; }
@@ -225,6 +230,17 @@ public:
     /// read from the file.
     struct ExpertCounts { int64_t hits = 0, lookups = 0, offloaded = 0, files = 0; };
     virtual ExpertCounts expert_counts() const { return {}; }
+    /// The experts each GPU holds now (CUDA ordinal, slots, their VRAM bytes); empty without routed experts.
+    struct CardExperts { int device = 0; int64_t slots = 0; uint64_t bytes = 0; };
+    virtual std::vector<CardExperts> experts_by_card() const { return {}; }
+    /// The VRAM the session's KV cache takes on its card now; -1 when the session does not say.
+    virtual int64_t kv_bytes() const { return -1; }
+    /// The server's expert map (core/expert_map.hpp): the sample's pairs of `total`, each one's home (core::ExpertHome) and its
+    /// decode lookups since the last call; the first call starts the counting. False without routed experts.
+    virtual bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) {
+        (void) total; (void) homes; (void) routed;
+        return false;
+    }
     /// Facts for the engine's INFO lines once the session is prepared: `key=value` words.
     virtual std::string info_words() const { return {}; }
     /// An elastic KV's ceiling (core/elastic_kv.hpp): the positions the session can back before the expert cache would go below

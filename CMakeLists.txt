@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.24)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures" FORCE)
 endif()
-project(basalt VERSION 0.5.0 LANGUAGES C CXX CUDA)
+project(basalt VERSION 0.5.5 LANGUAGES C CXX CUDA)
 add_compile_definitions(BASALT_VERSION="${PROJECT_VERSION}")
 
 set(CMAKE_CXX_STANDARD 20)
@@ -288,6 +288,57 @@ if(BUILD_TESTING)
 endif()
 endif()
 
+if(BASALT_MODEL_INKLING2)
+add_library(inkling2_kernels STATIC src/models/inkling2/kernels/ops.cu src/models/inkling2/kernels/attn.cu
+  src/models/inkling2/kernels/glue.cu src/models/inkling2/kernels/dspark.cu src/models/inkling2/kernels/attn_prompt.cu
+  src/models/inkling2/kernels/prompt_ops.cu)
+target_include_directories(inkling2_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(inkling2_kernels PUBLIC ${_gpu_runtime_target})
+add_library(model_inkling2 STATIC src/models/inkling2/adapter.cpp src/models/inkling2/pretok_inkling2.cpp
+  src/models/inkling2/pack.cpp src/models/inkling2/model.cpp src/models/inkling2/session.cpp src/models/inkling2/walk.cpp
+  src/models/inkling2/prompt.cpp src/models/inkling2/vision.cpp src/models/inkling2/vision_encoder.cpp
+  src/models/inkling2/dspark.cpp src/models/inkling2/spill.cpp)
+target_include_directories(model_inkling2 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
+target_link_libraries(model_inkling2 PUBLIC model tokenizer inkling2_kernels tiers kernels window_gemm mmq prefill_fp4 core vision_cuda ${_gpu_runtime_target})
+if(BUILD_TESTING)
+  add_executable(inkling2_kernels_parity src/models/inkling2/kernels/kernels_parity.cpp)
+  target_include_directories(inkling2_kernels_parity PRIVATE ${_gpu_include_directories})
+  target_link_libraries(inkling2_kernels_parity PRIVATE inkling2_kernels kernels ggml_quants ${_gpu_runtime_target})
+  basalt_gpu_test(NAME inkling2_kernels_parity COMMAND inkling2_kernels_parity)
+  add_executable(inkling2_dspark_parity src/models/inkling2/kernels/dspark_parity.cpp)
+  target_include_directories(inkling2_dspark_parity PRIVATE ${_gpu_include_directories})
+  target_link_libraries(inkling2_dspark_parity PRIVATE inkling2_kernels ${_gpu_runtime_target})
+  basalt_gpu_test(NAME inkling2_dspark_parity COMMAND inkling2_dspark_parity)
+  add_executable(inkling2_prompt_parity src/models/inkling2/kernels/prompt_parity.cpp)
+  target_include_directories(inkling2_prompt_parity PRIVATE ${_gpu_include_directories})
+  target_link_libraries(inkling2_prompt_parity PRIVATE inkling2_kernels kernels mmq prefill_fp4 ggml_quants ${_gpu_runtime_target})
+  basalt_gpu_test(NAME inkling2_prompt_parity COMMAND inkling2_prompt_parity)
+  add_executable(inkling2_pretok_test src/models/inkling2/pretok_test.cpp src/models/inkling2/pretok_inkling2.cpp)
+  target_include_directories(inkling2_pretok_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
+  target_link_libraries(inkling2_pretok_test PRIVATE tokenizer)
+  basalt_cpu_test(NAME inkling2_pretok_test COMMAND inkling2_pretok_test)
+  add_executable(inkling2_walk_test src/models/inkling2/walk_test.cpp src/models/inkling2/walk.cpp src/models/inkling2/pack.cpp)
+  target_include_directories(inkling2_walk_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(inkling2_walk_test PRIVATE core)
+  basalt_cpu_test(NAME inkling2_walk_test COMMAND inkling2_walk_test)
+  add_executable(inkling2_spill_test src/models/inkling2/spill_test.cpp src/models/inkling2/spill.cpp)
+  target_include_directories(inkling2_spill_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  basalt_cpu_test(NAME inkling2_spill_test COMMAND inkling2_spill_test)
+  add_executable(inkling2_expert_map_test src/models/inkling2/expert_map_test.cpp)
+  target_include_directories(inkling2_expert_map_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  basalt_cpu_test(NAME inkling2_expert_map_test COMMAND inkling2_expert_map_test)
+  add_executable(inkling2_vision_test src/models/inkling2/vision_test.cpp src/models/inkling2/vision.cpp)
+  target_include_directories(inkling2_vision_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(inkling2_vision_test PRIVATE vision_core warnings)
+  basalt_cpu_test(NAME inkling2_vision_test COMMAND inkling2_vision_test ${CMAKE_CURRENT_SOURCE_DIR}/assets/basalt-lockup-light.png
+                  ${CMAKE_CURRENT_SOURCE_DIR}/docs/assets/basalt-format.png)
+  # the image encoder on the real projector: CUDA against CPU per stage, the encode time, rows for an outside reference
+  add_executable(inkling2_vision_parity src/models/inkling2/vision_parity.cpp src/models/inkling2/vision.cpp)
+  target_include_directories(inkling2_vision_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(inkling2_vision_parity PRIVATE vision_cuda)
+endif()
+endif()
+
 if(BASALT_MODEL_DEEPSEEK41)
 add_library(model_deepseek41 STATIC src/models/deepseek41/adapter.cpp src/models/deepseek41/tokenizer/pretok_joyai.cpp src/models/deepseek41/pack.cpp
   src/models/deepseek41/model.cpp src/models/deepseek41/session.cpp src/models/deepseek41/layer_ops.cpp
@@ -478,6 +529,7 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/elementwise.cu
                         src/kernels/cuda/bf16_gemv.cu
                         src/kernels/cuda/native_mmvq.cu
+                        src/kernels/cuda/q80_screen.cu
                         src/kernels/cuda/native_bf16.cu
                         src/kernels/cuda/dequant_bf16.cu
                         src/kernels/cuda/wait_abort.cu
@@ -516,6 +568,7 @@ endif()
 endif()
 # Match the pinned llama.cpp CUDA arithmetic contract for this adapter only.
 set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/native_bf16.cu
+    src/kernels/cuda/q80_screen.cu
     src/models/qwen4exp/kernels/native_gr_norm.cu
     src/models/qwen4exp/kernels/native_moe.cu
     src/models/qwen4exp/kernels/native_gdn.cu
@@ -770,6 +823,7 @@ if(BUILD_TESTING)
   add_executable(vision_resize_test tests/vision/preprocess_test.cpp)
   target_link_libraries(vision_resize_test PRIVATE vision_core warnings)
   basalt_cpu_test(NAME vision_resize_test COMMAND vision_resize_test)
+  basalt_gpu_test(NAME cls_encoder_parity COMMAND cls_encoder_parity)
   # FFmpeg found at run time, or the reason it is not (any machine: CI has no FFmpeg)
   add_executable(ffmpeg_load_test tests/vision/ffmpeg_load_test.cpp)
   target_link_libraries(ffmpeg_load_test PRIVATE vision_core warnings)
@@ -795,6 +849,8 @@ if(BUILD_TESTING)
   endif()
 endif()
 add_dependencies(basalt-bench basalt basalt-device git_stamp)
+add_dependencies(serve_shared git_stamp)   # the engine's INFO commit=
+target_include_directories(serve_shared PRIVATE ${CMAKE_BINARY_DIR}/stamp)
 target_include_directories(basalt-bench PRIVATE ${CMAKE_BINARY_DIR}/stamp)
 target_link_libraries(basalt-bench PRIVATE engine_session platform warnings ${CMAKE_DL_LIBS})
 basalt_embed_manifest(basalt-bench)
@@ -1003,6 +1059,12 @@ add_executable(mmvq_multi_parity tests/kernels/mmvq_multi_parity.cpp)
 target_include_directories(mmvq_multi_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(mmvq_multi_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME mmvq_multi_parity COMMAND mmvq_multi_parity)
+# the draft head screen (q80_screen) against native_mmvq's one-column logits and their argmax, and against a CPU reference
+# (synthetic at the real width, GPU, no model; --bench adds the microbench)
+add_executable(q80_screen_parity tests/kernels/q80_screen_parity.cpp)
+target_include_directories(q80_screen_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(q80_screen_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME q80_screen_parity COMMAND q80_screen_parity)
 if(BASALT_MODEL_QWEN4EXP)
 # the decode GDN block against the per-stage verify kernels, bitwise (synthetic, GPU, no model; --bench)
 add_executable(dec_gdn_parity tests/models/qwen4exp/kernels/dec_gdn_parity.cpp)
@@ -1472,6 +1534,13 @@ target_link_libraries(reply_rows_test PRIVATE warnings)
 basalt_embed_manifest(reply_rows_test)
 basalt_cpu_test(NAME reply_rows_test COMMAND reply_rows_test)
 set_tests_properties(reply_rows_test PROPERTIES TIMEOUT 60)
+# the console's per-slot counts and the expert map's sample (CPU only)
+add_executable(console_stats_test tests/program/console_stats_test.cpp)
+target_include_directories(console_stats_test PRIVATE src/program/serve include)
+target_link_libraries(console_stats_test PRIVATE warnings)
+basalt_embed_manifest(console_stats_test)
+basalt_cpu_test(NAME console_stats_test COMMAND console_stats_test)
+set_tests_properties(console_stats_test PROPERTIES TIMEOUT 60)
 # a sent pick's log probability and the row's likeliest tokens (CPU only)
 add_executable(logprobs_test tests/program/logprobs_test.cpp)
 target_include_directories(logprobs_test PRIVATE src/program/serve include)

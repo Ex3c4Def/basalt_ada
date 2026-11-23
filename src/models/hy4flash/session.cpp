@@ -114,6 +114,7 @@ class Session final : public model::ModelSession {
 public:
     explicit Session(Hy4Model& m) : m_(m), g_(m.geo()) {}
     ~Session() override {
+        settle_early();
         dec_.release();
         big_.release();
         platform::free_aligned(cpu_act_);
@@ -129,16 +130,21 @@ public:
             jcv_.notify_one();
             joiner_.join();
         }
+        if (ra_st_) cudaStreamSynchronize(ra_st_);
         for (void* p : bufs_) cudaFree(p);
         if (d_hist_) cudaFree(d_hist_);
         for (void* p : pinned_) cudaFreeHost(p);
         if (ev_) cudaEventDestroy(ev_);
+        if (ra_ev_) cudaEventDestroy(ra_ev_);
+        if (ra_st_) cudaStreamDestroy(ra_st_);
         if (stream_) cudaStreamDestroy(stream_);
     }
 
     bool init(std::string& err) {
         if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess ||
-            cudaEventCreateWithFlags(&ev_, cudaEventDisableTiming) != cudaSuccess) {
+            cudaEventCreateWithFlags(&ev_, cudaEventDisableTiming) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&ra_st_, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaEventCreateWithFlags(&ra_ev_, cudaEventDisableTiming) != cudaSuccess) {
             err = "cannot create a stream";
             return false;
         }
@@ -161,6 +167,8 @@ public:
         pos_d_ = (int32_t*) alloc(16, ok);
         if (ok && cudaMallocHost((void**) &pos_h_, 16) == cudaSuccess) pinned_.push_back(pos_h_);
         else ok = false;
+        ra_mark_ = (uint32_t*) alloc(8, ok);
+        if (ok) cudaMemset(ra_mark_, 0, 8);
         cells_stride_ = g_.idx_top_k + 2 * g_.idx_pool;
         max_heads_ = max_heads;
         size_t attw = 0;   // the chunked attention's workspace: the largest a layer needs; zero from the start
@@ -254,6 +262,7 @@ public:
         // DFLY HOOK: the drafter's tap and scratch (nothing without a drafter in the pack)
         if (!dfly_.init(m_.dfly(), (int) (g_.idx_top_k + g_.idx_pool), ctx, [this](int32_t t, float* o) { return m_.embedding_row(t, o); }, m_.diag_dump(), fp8(), err))
             return false;
+        dfly_.on_row([this](int j, int32_t tok) { early_draft_row(j, tok); });
         return true;
     }
 
@@ -482,9 +491,13 @@ public:
     // DFLY HOOK: --spec sets the window (DeepSeek's rule: 0 or 1 is plain decode), and the drafter's calls (dfly.hpp)
     int max_window() const override { return std::clamp(m_.spec(), 1, kMaxWindow); }
     model::Result draft_begin(int32_t anchor, int64_t pos, int n) override {
-        return dfly_.draft_begin(anchor, pos, n, cache_, stream_, rope_on_ ? text_rope(pos) : pos);   // [vision]
+        const model::Result r = dfly_.draft_begin(anchor, pos, n, cache_, stream_, rope_on_ ? text_rope(pos) : pos);   // [vision]
+        early_window(anchor, pos);   // while the card runs the block
+        return r;
     }
-    model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n) override { return dfly_.draft_end(ids, conf, max_n, n, stream_); }
+    model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed& need) override {
+        return dfly_.draft_end(ids, conf, max_n, n, stream_, need);
+    }
 
     model::Result decode_window(const model::DecodeRequest& r) override {
         if (r.n_tokens < 1) return {model::Status::Error, "hy4flash: an empty window"};
@@ -523,7 +536,10 @@ public:
     model::Result prefill_chunk(const model::PrefillRequest& r) override {
         std::string err;
         dfly_.invalidate();   // DFLY HOOK
-        if (!big_.rows) turn_report();
+        if (!big_.rows) {   // a prompt starts
+            turn_report();
+            if (tier_) tier_->forget_use();
+        }
         if (!big_.rows && elastic()) {   // a prompt starts: its positions against what the caches back and can back
             const int64_t need = std::min<int64_t>(m_.context(), r.pos + std::max(r.total_tokens, r.n_tokens));
             const int64_t keep = std::max(kv_base(), std::min<int64_t>(m_.context(), (need + kGrowPositions - 1) / kGrowPositions * kGrowPositions));
@@ -661,7 +677,23 @@ public:
         return t == nullptr ? ExpertCounts{} : ExpertCounts{t->hits(), t->lookups(), t->offloaded(), t->file_lookups()};
     }
 
-    std::string info_words() const override { return tier_ ? "expert_slots=" + std::to_string(tier_->slots()) : std::string(); }
+    std::vector<CardExperts> experts_by_card() const override {
+        std::vector<CardExperts> out;
+        if (tier_)
+            for (const core::ExpertTier::CardSlots& c : tier_->slots_by_card()) out.push_back({c.device, c.slots, c.bytes});
+        return out;
+    }
+    // the sparse layers' caches as backed now (the elastic KV)
+    int64_t kv_bytes() const override { return backed_ * (int64_t) cell_bytes(); }
+
+    bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) override {
+        if (!tier_) return false;
+        tier_->expert_map(total, homes, routed);
+        return true;
+    }
+
+    std::string info_words() const override { return tier_ ? "expert_slots=" + std::to_string(tier_->gpu_slots()) + " expert_slots_primary=" + std::to_string(tier_->slots()) + " ram_experts_mib=" + std::to_string(tier_->ram_bytes() >> 20)
+                                     : std::string(); }
 
     // SLEEP / WAKE: the tier's card slots go back to the card (every expert keeps its RAM copy and its slot is remembered), and
     // return at the wake. The latent caches, the rings and the drafter's rows are conversation state and stay.
@@ -675,7 +707,7 @@ public:
             if (!tier_->reclaim(e, /*restore=*/true)) return {model::Status::Error, "hy4flash: " + e};
             tier_->grow();
         }
-        expert_slots = tier_->slots();
+        expert_slots = tier_->gpu_slots();
         return {};
     }
 
@@ -684,7 +716,7 @@ public:
         if (!tier_) return {model::Status::Error, "hy4flash: the expert tier is not open"};
         cudaStreamSynchronize(stream_);
         if (!tier_->replan(mib, e)) return {model::Status::Error, "hy4flash: " + e};
-        expert_slots = tier_->slots();
+        expert_slots = tier_->gpu_slots();
         return {};
     }
 
@@ -1167,11 +1199,27 @@ private:
     // asked for before the first layer runs, so the SSD works while the GPU does the layers in between.
     struct Prefetch {
         std::vector<float> valid;
-        std::vector<uint8_t> raw;
+        std::vector<uint8_t> raw;    // the rows read here, in order
+        std::vector<int> at;         // [row] its place in raw, or -1 for a row asked for early
         ngram::PleReader::Ticket tk;
         bool issued = false, collected = false;
     };
     std::vector<Prefetch> pf_;
+    // A decode window's rows are known before it runs: the anchor's when the drafter starts, each draft's as the heads make it.
+    // Their Engram rows are asked for then (every Engram layer's rows of a window row in one ticket), so they land during the
+    // draft instead of during layer 0; the window takes a row whose position, token and two tokens before match.
+    struct EarlyRow {
+        int64_t pos = 0;
+        int32_t tok = 0, p1 = 0, p2 = 0;
+        float valid = 1.f;
+        std::vector<uint8_t> raw;    // [Engram layer][column][row bytes]
+        ngram::PleReader::Ticket tk;
+        bool collected = false;
+    };
+    std::vector<EarlyRow> early_;
+    std::vector<int> early_of_;      // [window row] its early row, or -1
+    int64_t early_pos_ = -1;         // the window the drafter is making
+    int32_t early_tok_[kMaxWindow] = {};
 
     // A prompt chunk of kRingRows rows or more routes to every expert of every layer, so the next layer's experts do not wait for
     // its router: all of a layer's experts are copied into one of two slots of the ring while the layer before it computes.
@@ -1500,17 +1548,34 @@ private:
     void prefetch_engram(int64_t pos0, int R) {
         const EngramInfo& en = m_.pack().engram;
         const int n_cols = en.n_cols(), W = en.row_values;
+        early_of_.assign((size_t) R, -1);
+        std::vector<int> own;   // the rows not asked for early
+        for (int t = 0; t < R; ++t) {
+            const int64_t pos = pos0 + t;
+            const int32_t tok = hist_[(size_t) pos], p1 = pos >= 1 ? hist_[(size_t) pos - 1] : -1, p2 = pos >= 2 ? hist_[(size_t) pos - 2] : -1;
+            for (size_t k = 0; k < early_.size() && early_of_[(size_t) t] < 0; ++k) {
+                const EarlyRow& er = early_[k];
+                if (er.pos == pos && er.tok == tok && er.p1 == p1 && er.p2 == p2) early_of_[(size_t) t] = (int) k;
+            }
+            if (early_of_[(size_t) t] < 0) own.push_back(t);
+        }
         pf_.assign(en.layers.size(), Prefetch());
         for (size_t e = 0; e < en.layers.size(); ++e) {
             Prefetch& p = pf_[e];
-            std::vector<uint32_t> ids((size_t) R * n_cols);
+            std::vector<uint32_t> ids(own.size() * n_cols);
             p.valid.assign((size_t) R, 1.f);
-            for (int t = 0; t < R; ++t) {
+            p.at.assign((size_t) R, -1);
+            for (int t = 0; t < R; ++t)
+                if (early_of_[(size_t) t] >= 0) p.valid[(size_t) t] = early_[(size_t) early_of_[(size_t) t]].valid;
+            for (size_t i = 0; i < own.size(); ++i) {
+                const int t = own[i];
                 const int64_t pos = pos0 + t;
                 const int32_t p1 = pos >= 1 ? hist_[(size_t) pos - 1] : -1, p2 = pos >= 2 ? hist_[(size_t) pos - 2] : -1;
-                engram_ids(en, (int) e, hist_[(size_t) pos], p1, p2, pos, false, ids.data() + (size_t) t * n_cols, p.valid[(size_t) t]);
+                engram_ids(en, (int) e, hist_[(size_t) pos], p1, p2, pos, false, ids.data() + i * n_cols, p.valid[(size_t) t]);
+                p.at[(size_t) t] = (int) i;
             }
-            p.raw.resize((size_t) R * n_cols * W);
+            if (own.empty()) continue;
+            p.raw.resize(own.size() * n_cols * W);
             p.tk = m_.engram_reader().issue(ids.data(), ids.size(), p.raw.data());
             p.issued = true;
         }
@@ -1521,6 +1586,47 @@ private:
         for (Prefetch& p : pf_)
             if (p.issued && !p.collected) m_.engram_reader().collect(p.tk, ignore);
         pf_.clear();
+        settle_early();
+    }
+    // Every Engram layer's rows of window row (pos, tok) after p1 and p2, in one ticket.
+    void issue_early(int64_t pos, int32_t tok, int32_t p1, int32_t p2) {
+        const EngramInfo& en = m_.pack().engram;
+        if (en.layers.empty() || early_.size() >= (size_t) kMaxWindow) return;
+        const int n_cols = en.n_cols(), W = en.row_values, ne = (int) en.layers.size();
+        EarlyRow r;
+        r.pos = pos;
+        r.tok = tok;
+        r.p1 = p1;
+        r.p2 = p2;
+        std::vector<uint32_t> ids((size_t) ne * n_cols);
+        for (int e = 0; e < ne; ++e) engram_ids(en, e, tok, p1, p2, pos, false, ids.data() + (size_t) e * n_cols, r.valid);
+        r.raw.resize((size_t) ne * n_cols * W);
+        r.tk = m_.engram_reader().issue(ids.data(), ids.size(), r.raw.data());
+        early_.push_back(std::move(r));
+    }
+    // The drafter starts the window at `pos`: its first row, the anchor, has all it needs.
+    void early_window(int32_t anchor, int64_t pos) {
+        settle_early();
+        if (pos > (int64_t) hist_.size()) return;
+        early_pos_ = pos;
+        early_tok_[0] = anchor;
+        issue_early(pos, anchor, pos >= 1 ? hist_[(size_t) pos - 1] : -1, pos >= 2 ? hist_[(size_t) pos - 2] : -1);
+    }
+    // The heads made draft j - 1, window row j's token (DflyRunner::finish's on_row: the card runs the next head meanwhile).
+    void early_draft_row(int j, int32_t tok) {
+        if (early_pos_ < 0 || j < 1 || j >= kMaxWindow) return;
+        early_tok_[j] = tok;
+        const int64_t pos = early_pos_ + j;
+        const int32_t p2 = j >= 2 ? early_tok_[j - 2] : early_pos_ >= 1 ? hist_[(size_t) early_pos_ - 1] : -1;
+        issue_early(pos, tok, early_tok_[j - 1], p2);
+    }
+    // The early rows' reads land (their buffers are ours) and are dropped.
+    void settle_early() {
+        std::string ignore;
+        for (EarlyRow& r : early_)
+            if (!r.collected) m_.engram_reader().collect(r.tk, ignore);
+        early_.clear();
+        early_pos_ = -1;
     }
 
     bool engram_step(int l, int64_t pos0, int R, const int32_t* tokens, std::string& err, int off = 0) {
@@ -1547,16 +1653,22 @@ private:
             return t;
         }();
         if (eng_ev_) cudaEventSynchronize(eng_ev_);   // the last Engram layer's copies out of these host rows have landed
-        Prefetch* pf = (size_t) e < pf_.size() && pf_[(size_t) e].issued ? &pf_[(size_t) e] : nullptr;
+        Prefetch* pf = (size_t) e < pf_.size() ? &pf_[(size_t) e] : nullptr;
         std::vector<uint8_t> own_raw;
         const uint8_t* raw = nullptr;
         if (pf) {
-            if (!pf->collected) {
+            if (pf->issued && !pf->collected) {
                 if (!collect(pf->tk)) return false;
                 pf->collected = true;
             }
-            for (int t = 0; t < R; ++t) h_evalid_[t] = pf->valid[(size_t) (off + t)];
-            raw = pf->raw.data() + (size_t) off * n_cols * W;
+            for (int t = 0; t < R; ++t) {
+                const int k = early_of_[(size_t) (off + t)];
+                if (k >= 0 && !early_[(size_t) k].collected) {
+                    if (!collect(early_[(size_t) k].tk)) return false;
+                    early_[(size_t) k].collected = true;
+                }
+                h_evalid_[t] = pf->valid[(size_t) (off + t)];
+            }
         } else {
             std::vector<uint32_t> ids((size_t) R * n_cols);
             for (int t = 0; t < R; ++t) {
@@ -1579,12 +1691,19 @@ private:
             cudaMemcpy(nrm, T(l, "engram_lookup_norm.weight")->ptr, (size_t) n_cols * W * 4, cudaMemcpyDeviceToHost);
             lookup_loaded_[(size_t) e] = true;
         }
+        // row t's n_cols rows: from the window's own reads or from its early ones
+        const auto rows_of = [&](int t) -> const uint8_t* {
+            if (!pf) return raw + (size_t) t * n_cols * W;
+            const int k = early_of_[(size_t) (off + t)];
+            return k >= 0 ? early_[(size_t) k].raw.data() + (size_t) e * n_cols * W : pf->raw.data() + (size_t) pf->at[(size_t) (off + t)] * n_cols * W;
+        };
         const double norm_start = time_prompt ? now_ms() : 0;
         for (int t = 0; t < R; ++t) {
             const float valid = h_evalid_[t];
+            const uint8_t* trow = rows_of(t);
             for (int c = 0; c < n_cols; ++c) {
                 float* row = h_erows_ + ((size_t) t * n_cols + c) * W;
-                const uint8_t* src = raw + ((size_t) t * n_cols + c) * W;
+                const uint8_t* src = trow + (size_t) c * W;
                 float ss = 0.f;
                 for (int d = 0; d < W; ++d) {
                     row[d] = lut[src[d]];
@@ -2070,6 +2189,38 @@ private:
         return false;
     }
 
+    // While a layer's weighted sum waits for the CPU's and the second card's rows, the card's memory idles once its own experts
+    // are done: the next layer's two largest products, its attention gate and output (the head after the last layer), are read
+    // into L2 meanwhile, up to kReadAheadBytes, so those products read L2 instead of memory. The requests start behind the
+    // card's experts and stop once the wait is over; they change no result.
+    static constexpr uint64_t kReadAheadBytes = 56ull << 20;
+    void read_ahead(int l, uint32_t word, cudaStream_t st) {
+        if (ra_.empty()) {   // every layer's ranges, once
+            ra_.resize((size_t) g_.n_layers);
+            for (int k = 0; k < g_.n_layers; ++k) {
+                L2Ranges& r = ra_[(size_t) k];
+                uint64_t left = kReadAheadBytes;
+                int n = 0;
+                const auto add = [&](const DevTensor* t) {
+                    if (t == nullptr || n == kL2Ranges || ((uintptr_t) t->ptr & 15) != 0) return;
+                    r.p[n] = t->ptr;
+                    r.n[n] = std::min<uint64_t>(t->bytes, left) & ~15ull;
+                    left -= r.n[n];
+                    n += r.n[n] > 0;
+                };
+                if (k + 1 < g_.n_layers) {
+                    add(T(k + 1, "attn_gate.weight"));
+                    add(T(k + 1, "attn_output.weight"));
+                } else {
+                    add(m_.tensor("output.weight"));
+                }
+            }
+        }
+        cudaEventRecord(ra_ev_, st);
+        cudaStreamWaitEvent(ra_st_, ra_ev_, 0);
+        l2_read_ahead(ra_[(size_t) l], ra_mark_, word, ra_st_);
+    }
+
     // The routed experts of rows g0..g0+G of a layer, as DeepSeek's decode places them: the tier is asked once per distinct
     // expert of the group; the second card's share is raised first, then the CPU pool starts on the RAM experts, the card
     // runs its slot hits and then the bus fetches, and the weighted sum is queued behind a word the host writes once the
@@ -2133,6 +2284,7 @@ private:
             pd.reading = pd.reading || lk.reading[i];
             on_peer = on_peer || lk.peer[i];
         }
+        if (pd.cpu || pd.reading || on_peer) pd.word = ++join_seq_;   // the weighted sum waits for the host's rows
         // a promotion only queues its copies (they go out at a later pump), so it is decided now and the copies start behind
         // this layer's sum; experts still being read from the file are decided once they landed
         if (pd.cpu && !pd.reading) tier_->promote(tl, lk);
@@ -2172,6 +2324,7 @@ private:
                                                                       : d_rows_ + (size_t) r * L);
         put_words(&put, ex_plan_, (int) ((offsetof(WindowPut, rows) + (size_t) G * K * 8) / 4), st);
         if (nhits) launch(ex_plan_, nhits, ne);
+        if (pd.word) read_ahead(l, pd.word, st);
         if (n_fetched) {
             WindowPlan p2;
             const int ng = make_plan(p2, true, ne);
@@ -2181,10 +2334,7 @@ private:
         }
         // the second card's fetched experts run once their copies land, long after these launches
         if (peer && !peer->run_fetched(err)) return false;
-        if (pd.cpu || pd.reading || on_peer) {
-            pd.word = ++join_seq_;
-            kernels::wait_word(d_words_ + 1, pd.word, st);
-        }
+        if (pd.word) wait_word_mark(d_words_ + 1, pd.word, ra_mark_, st);
         const float* const* rows = (const float* const*) ((uint8_t*) ex_plan_ + offsetof(WindowPut, rows));
         weighted_sum_window(rows, rw_ + (size_t) g0 * K, G, K, L, lat_out_ + (size_t) g0 * L, st);
         if (pd.cpu && !pd.reading) tier_->mark_gap(st);   // the promotions' copies start behind the sum
@@ -2549,6 +2699,12 @@ private:
     int32_t *h_ids_ = nullptr, *d_ids_ = nullptr;
     uint32_t *h_words_ = nullptr, *d_words_ = nullptr;   // mapped: [0] the ids' sequence word, [1] the word a weighted sum waits for
     uint32_t seq_want_ = 0, join_seq_ = 0;
+    // the L2 read-ahead during a MoE layer's wait (read_ahead): its stream, the event it starts behind, the mark it stops at
+    // (device: the last word the weighted sum's wait saw) and each layer's ranges
+    cudaStream_t ra_st_ = nullptr;
+    cudaEvent_t ra_ev_ = nullptr;
+    uint32_t* ra_mark_ = nullptr;
+    std::vector<L2Ranges> ra_;
     // the joiner thread (moe_group hands it a group's CPU and second-card share; join_moe waits for its result)
     bool use_joiner_ = true;
     bool use_graphs_ = true;
