@@ -65,6 +65,39 @@ __device__ __forceinline__ void mma_mxfp8(float* c, const unsigned* a, unsigned 
                    "r"(sfa), "h"(kBid), "h"(kTid), "r"(sfb), "h"(kBid), "h"(kTid));
 }
 
+// Below compute capability 10.0 (no block-scaled MXFP8 mma): one K=32 block's product from the same fragments. The
+// thread's E4M3 bytes become f16 (exactly: every E4M3 value is an f16), the fragment's first and second 16 bytes are
+// two m16n8k16 products into fp32 (A and B take the same order of K, so the sums are the block's dot), and the rows'
+// and columns' UE8M0 scales, powers of two, multiply the block's sum into the accumulator.
+__device__ __forceinline__ unsigned e4m3x2_h2(unsigned v) {
+    const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) (v & 0xffffu), __NV_E4M3);
+    return (unsigned) h.x | ((unsigned) h.y << 16);
+}
+__device__ __forceinline__ void mma_f16(float (&c)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,
+                                        unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+// a UE8M0 byte's power of two (0xFF, NaN in the format, reads as 0 as the block-scaled mma's weights take it)
+__device__ __forceinline__ float ue8m0_f(unsigned u) {
+    u &= 255u;
+    if (u == 255u) u = 0u;
+    return u ? __uint_as_float(u << 23) : __uint_as_float(0x00400000u);
+}
+__device__ __forceinline__ void mma_mxfp8_ada(float* c, const unsigned* a, unsigned b0, unsigned b1, float sa0, float sa1,
+                                              float sb0, float sb1) {
+    float p[4] = {0.f, 0.f, 0.f, 0.f};
+    mma_f16(p, e4m3x2_h2(a[0]), e4m3x2_h2(a[1]), e4m3x2_h2(a[0] >> 16), e4m3x2_h2(a[1] >> 16), e4m3x2_h2(b0),
+            e4m3x2_h2(b0 >> 16));
+    mma_f16(p, e4m3x2_h2(a[2]), e4m3x2_h2(a[3]), e4m3x2_h2(a[2] >> 16), e4m3x2_h2(a[3] >> 16), e4m3x2_h2(b1),
+            e4m3x2_h2(b1 >> 16));
+    c[0] = fmaf(p[0], sa0 * sb0, c[0]);
+    c[1] = fmaf(p[1], sa0 * sb1, c[1]);
+    c[2] = fmaf(p[2], sa1 * sb0, c[2]);
+    c[3] = fmaf(p[3], sa1 * sb1, c[3]);
+}
+
 // ---------------------------------------------------------------------------------------- planning & quantizer
 
 __global__ void plan_blocks_kernel(const int32_t* __restrict__ bounds, int n, int32_t* __restrict__ blk_off) {
@@ -263,6 +296,25 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel(const GemmArgs a) {
                 unsigned v = *reinterpret_cast<const uint32_t*>(p);
                 sfb[r] = v & ~__vcmpeq4(v, 0xffffffffu);
             }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
+            // the thread's own rows' scale words (rows group and group + 8 of each token tile) and its accumulator
+            // columns' (2 tig and 2 tig + 1 of each weight tile): the block-scaled mma hands these out by lane
+            unsigned sa_w[4][2], sb_w[4][2];
+#pragma unroll
+            for (int mt = 0; mt < 4; ++mt) {
+                sa_w[mt][0] = asc[warp_m * 64 + mt * 16 + group];
+                sa_w[mt][1] = asc[warp_m * 64 + mt * 16 + group + 8];
+            }
+#pragma unroll
+            for (int r = 0; r < 4; ++r)
+#pragma unroll
+                for (int cc = 0; cc < 2; ++cc) {
+                    const int sr = b_tile_row<SWIGLU>(warp_n, r) + 2 * tig + cc;
+                    const uint8_t* src = w_src + (size_t) b_row<SWIGLU>(rb, sr, a.half) * row_bytes + (size_t) kt * kBlockBytes;
+                    const int pad = (int) (reinterpret_cast<uintptr_t>(src) & 15u);
+                    sb_w[r][cc] = *reinterpret_cast<const uint32_t*>(bs + sr * kBRowStride + pad);
+                }
+#endif
 
             auto step = [&]<int KS>() {
                 unsigned af[4][4];
@@ -275,8 +327,16 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel(const GemmArgs a) {
                     const uint8_t* q = bp[r] + KS * 32;
                     const unsigned b0 = *reinterpret_cast<const uint32_t*>(q + 4 * tig);
                     const unsigned b1 = *reinterpret_cast<const uint32_t*>(q + 16 + 4 * tig);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
+                    const float sb0 = ue8m0_f(sb_w[r][0] >> (8 * KS)), sb1 = ue8m0_f(sb_w[r][1] >> (8 * KS));
+#pragma unroll
+                    for (int mt = 0; mt < 4; ++mt)
+                        mma_mxfp8_ada(acc[mt][r], af[mt], b0, b1, ue8m0_f(sa_w[mt][0] >> (8 * KS)),
+                                      ue8m0_f(sa_w[mt][1] >> (8 * KS)), sb0, sb1);
+#else
 #pragma unroll
                     for (int mt = 0; mt < 4; ++mt) mma_mxfp8<KS>(acc[mt][r], af[mt], b0, b1, sfa[mt], sfb[r]);
+#endif
                 }
             };
             step.template operator()<0>();
