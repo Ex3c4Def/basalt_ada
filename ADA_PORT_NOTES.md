@@ -251,25 +251,15 @@ the fallback so the trap is never launched.
     75 % against 77 %). Its 64K followed (6057 to 6284).
 
 ## Upstream 0.5.0: Hy4-flash (merged 2026-11-20)
-- Hy4-flash (src/models/hy4flash) and the code it shares with DeepSeek, moved to shared places (the expert tier, its
-  policy, file reads and elastic array in src/core; the router, row norms and hyper-connections in src/kernels/cuda; the
-  decode MQA chunk stage in basalt/kernels/mqa_chunk.cuh), build for 8.9 as they are: no new or moved kernel uses an
-  instruction 8.9 lacks. Prompt attention, indexer scores and the vision tower are f16 mma m16n8k16 with ldmatrix and
-  cp.async; FP8 cache rows use the e4m3 cvt; NVFP4 experts go through the shared grouped kernels and MMQ (E2M1 by
-  table). The largest shared-memory opt-in, `attend_mma_kernel` with 32 heads a block, is 85,760 bytes (8.9: 101,376).
-  Hy4-flash checks no compute capability, so an Ada card can be its main or second card.
-- On the 4090: its kernel, drafter and encoder parity tests and `expert_tier_test` pass; `ds41_router_parity` keeps the
-  8.9 frozen hash after the router's move. No Hy4-flash pack (158.7 GB) has been run: output, quality and speed unknown.
-- `file_expert_repin_test` fails on Windows: its new check that the RAM copy holds no pinned page before its reads
-  assumes Linux; here `RamAllocation` takes host VMM memory, pinned when allocated (`kPreferHostVmm`).
-- Flash-Next output is identical to fork_4090's (fp16 and int8 KV, swaps off); sm_120 SASS of 33 files as upstream's.
-- Speed A/Bs need the RAM free as well as the GPU: a browser's 37 GiB moved during one, two starts found 50.4 GiB free,
-  kept a 41 GB RAM tier instead of 56-59 and decoded at about 73 tok/s instead of 197. Compare only runs whose server
-  line `ram-experts=` agrees.
-- Speed against fork_4090 before the merge, rerun with 111 GiB of RAM available before each start (2 rotated pairs on
-  fresh servers, engine_bench community, int8 KV, 450 W, DDR5-4800; every run `ram-experts=59.5GB`, the same text, the
-  same acceptance and hit rates): decode_tps 202.2 against 203.0 (-0.4 %; pairs -0.2 and -0.6 %), conv / struct / prose
-  -0.7 / -0.4 / -0.2 %, prefill 16K -1.0 %, 64K -0.1 %. A tie: the 16K figure moves more within one build (5367, 5436).
+- Hy4-flash (src/models/hy4flash) and the code it shares with DeepSeek, moved to src/core, src/kernels/cuda and
+  basalt/kernels/mqa_chunk.cuh, build for 8.9 as they are: f16 mma m16n8k16 with ldmatrix and cp.async, the e4m3 cvt
+  for FP8 cache rows, NVFP4 experts through the shared grouped kernels and MMQ; the largest shared-memory opt-in,
+  `attend_mma_kernel`, is 85,760 bytes (8.9: 101,376). It checks no compute capability, so an Ada card can be its main
+  or second card. Its parity tests pass on the 4090; no Hy4-flash pack (158.7 GB) has been run.
+- `file_expert_repin_test` fails on Windows (it assumes Linux; `RamAllocation` takes host VMM memory, pinned at once).
+- Flash-Next output identical to the fork before it; sm_120 SASS of 33 files as upstream's. A/B, 2 rotated pairs, every
+  run `ram-experts=59.5GB` (a browser's 37 GiB once cut that to 41 GB and decode to 73 tok/s): decode_tps 202.2 against
+  203.0, prefill 16K -1.0 %, 64K -0.1 %: a tie.
 
 ## PCIe share of solo decode windows (experiment, 2026-11-20)
 - A solo window (one conversation decoding) sends no routed expert over PCIe; only batch windows stage a share of each
@@ -287,12 +277,22 @@ the fallback so the trap is never launched.
   against the same line without `--exp`.
 
 ## Upstream 0.5.0+58: the shared routing flags (merged 2026-11-20)
-- Nothing to port: no added line uses an sm_90+ feature or checks the compute capability. The changed kernels (the
-  router's `--route-prior` instance, `route_tail_skip.cu`, Hy4-flash's `absorb_k` with 32 KB of static shared memory)
-  build for 8.9 as they are. Upstream's FP4-Local reader (#444) replaces the fork's (dbb54997).
-- 450 W, DDR5-4800: CPU suite 94/94, GPU 134 pass / 11 skip / the 3 known fails; output identical to 4e274ca8 (fp16
-  and int8 KV, swaps off); sm_120 SASS of 26 files as upstream's. A/B, 2 rotated pairs, every run `ram-experts=59.5GB`:
-  decode_tps 201.3 against 201.3, prefill +0.1 / +0.2 %: a tie.
+- Nothing to port (no sm_90+ feature, no compute-capability check); upstream's FP4-Local reader (#444) replaces the
+  fork's (dbb54997). CPU 94/94, GPU the 3 known fails; Flash-Next output identical; sm_120 SASS of 26 files as
+  upstream's; A/B decode_tps 201.3 against 201.3.
+
+## Upstream 0.5.5: Inkling 2 Mini (merged 2026-11-23)
+- Inkling 2 (src/models/inkling2) checks no compute capability. On 8.9 its fused window attention (a cluster of eight
+  blocks) compiles out and traps (`INK_NO_CLUSTER`), and `attention_window` takes the preparation, the split and the
+  combine on a card without clusters: upstream's own path for longer windows, with the same bits. Its prompt path's
+  NVFP4 experts take MMQ below 12.x (`fp4_cores()`; moe_fp4 is built for sm_120a alone), not the FP4 block-scaled
+  tensor cores. The bulk L2 prefetches in its glue and ops and in Hy4-flash's ops run a line at a time below 9.0.
+- The drafter's `head_final_kernel` read the pick back from the restrict-qualified `*prev` that thread 0 stored; the
+  sm_89 compiler hoists that load above the barrier (sm_120's does not), so warps copied the previous draft's w1 row.
+  Below 9.0 the pick comes from shared memory; `inkling2_dspark_parity` checks the row.
+- 450 W, DDR5-4800: CPU 100/100, GPU the 3 known fails; Flash-Next output identical (fp16 and int8 KV); sm_120 SASS
+  of 31 files as upstream's. A/B, 2 rotated pairs: decode_tps 201.2 against 202.3 (-0.5 %, one slower run), prefill a
+  tie. No Inkling 2 pack (19.7 GB) has been run: its output and speed on 8.9 are unknown.
 
 ## When a new build fails on the card
 An illegal-instruction or launch failure means a `__trap()` stub was launched: rerun with `CUDA_LAUNCH_BLOCKING=1`
