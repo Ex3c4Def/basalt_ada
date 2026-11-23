@@ -235,31 +235,18 @@ the fallback so the trap is never launched.
 - sm_120 code: in the 21 files the fork changes, every upstream kernel's SASS equals upstream's, apart from two kernels
   in verify_kernels.cu whose constant-bank address load reads offset 8 instead of 0 (the fork's `g_l2_ahead_sink` comes
   first in the module's address table; the instructions are the same).
-- Speed against fork_4090 (2 rotated pairs on fresh servers, engine_bench community, int8 KV, 450 W, DDR5-4800): decode_tps
-  197.4 against 197.9 (-0.2 %), conv/struct +0.8/-1.1 %, prefill 16K +1.8 %, 64K -3.6 % (the server's own lines: 6057
-  and 6122 t/s against 6295 and 6316). The 64K figure is not the prefill code, but where the adaptive swaps leave the
-  experts after the decode requests before it:
-  - The prefill alone is as fast: basalt-bench -p 65536 (a cold engine, 4 alternating pairs) 6131 against 6103 t/s; the
-    64K request alone on a server, 13-14 warm requests each, medians 6288 and 6314 against 6316 and 6313. The int8
-    prompt attention times the same before and after upstream's rewrite (1.906 ms per 32K chunk; fp16 KV's went from
-    9.7 to 2.3 ms).
-  - With `--adapt-swaps 0` the whole workload gives the same text in both builds and 64K 6260 against 6264 t/s
-    (-0.1 %); with checkpoints off (`--prompt-cache-every 0`) and swaps on, the merge still varied.
-  - With swaps on, fork_4090's sampled prose is nearly always the same text (1125 tokens), so the experts sit the same
-    and its 64K reads about 6300 every time. The merge's varies from run to run (1093 to 1200 tokens): upstream's
-    clock-free lookup-or-MTP choice and 8-gram suffix index change the windows a sampled reply verifies (conv acceptance
-    75 % against 77 %). Its 64K followed (6057 to 6284).
+- Speed against fork_4090 (2 rotated pairs, engine_bench community, int8 KV, 450 W, DDR5-4800): decode_tps 197.4 against
+  197.9 (-0.2 %), prefill 16K +1.8 %, 64K -3.6 %. The 64K loss is where the adaptive swaps leave the experts, not the
+  prefill code: alone (basalt-bench -p 65536, 4 pairs) 6131 against 6103 t/s, and with `--adapt-swaps 0` the same text
+  in both builds and 6260 against 6264. With swaps on, upstream's clock-free lookup-or-MTP choice varies the sampled
+  prose (1093 to 1200 tokens), so the experts sit differently before the 64K request.
 
 ## Upstream 0.5.0: Hy4-flash (merged 2026-11-20)
-- Hy4-flash (src/models/hy4flash) and the code it shares with DeepSeek, moved to src/core, src/kernels/cuda and
-  basalt/kernels/mqa_chunk.cuh, build for 8.9 as they are: f16 mma m16n8k16 with ldmatrix and cp.async, the e4m3 cvt
-  for FP8 cache rows, NVFP4 experts through the shared grouped kernels and MMQ; the largest shared-memory opt-in,
-  `attend_mma_kernel`, is 85,760 bytes (8.9: 101,376). It checks no compute capability, so an Ada card can be its main
-  or second card. Its parity tests pass on the 4090; no Hy4-flash pack (158.7 GB) has been run.
-- `file_expert_repin_test` fails on Windows (it assumes Linux; `RamAllocation` takes host VMM memory, pinned at once).
-- Flash-Next output identical to the fork before it; sm_120 SASS of 33 files as upstream's. A/B, 2 rotated pairs, every
-  run `ram-experts=59.5GB` (a browser's 37 GiB once cut that to 41 GB and decode to 73 tok/s): decode_tps 202.2 against
-  203.0, prefill 16K -1.0 %, 64K -0.1 %: a tie.
+- Hy4-flash and the code it shares with DeepSeek build for 8.9 as they are (f16 mma with ldmatrix and cp.async, the
+  e4m3 cvt, NVFP4 experts through the shared kernels and MMQ; `attend_mma_kernel` opts in to 85,760 bytes of 101,376).
+  Its parity tests pass; no Hy4-flash pack (158.7 GB) has been run. `file_expert_repin_test` fails on Windows (it
+  assumes Linux; `RamAllocation` takes host VMM memory, pinned at once). Output identical, SASS of 33 files as
+  upstream's, A/B a tie (202.2 against 203.0) with every run at `ram-experts=59.5GB`.
 
 ## PCIe share of solo decode windows (experiment, 2026-11-20)
 - A solo window (one conversation decoding) sends no routed expert over PCIe; only batch windows stage a share of each
@@ -267,11 +254,9 @@ the fallback so the trap is never launched.
   removed `--pcie-frac` rule, Strata's), `stage_min=N` nothing below N misses
   ([experiment keys](docs/configuration/diagnostics.md)). Off it is the old path: the 8.9 route kernels' staged
   instances are taken only with the switch.
-- NVFP4, 450 W, int8 KV, 60.9 GB RAM tier; basalt-bench, 8 sampled seeds, struct on 2; per-seed median against off,
-  conv / prose / struct: 0.1 -1.5 / -2.0 / -1.0 %, 0.2 +0.8 / -1.1 / +0.7 %, 0.3 -2.9 / -1.7 / +2.2 %, 0.35 with
-  `stage_min=6` +0.2 / -2.0 / +1.7 %; an earlier run: 0.35 -2.8 / -0.5 / +3.2 % (struct from engine_bench), 0.5
-  -13.7 / -9.2 %. No share wins. Only wide windows (struct, about 6 tokens a pass) gain; 0.1 hardly stages and still
-  loses: the stage kernel, the staged group launch and their join cost 0.2-0.5 ms a pass even when nothing is staged.
+- NVFP4, 450 W, int8 KV, 8 sampled seeds, per-seed median against off, conv / prose / struct: 0.1 -1.5 / -2.0 / -1.0 %,
+  0.2 +0.8 / -1.1 / +0.7 %, 0.3 -2.9 / -1.7 / +2.2 %, 0.35 with `stage_min=6` +0.2 / -2.0 / +1.7 %, 0.5 -13.7 / -9.2 %.
+  No share wins: only wide windows (struct) gain, and the stage kernel, launch and join cost 0.2-0.5 ms a pass.
 - Staging changes the text (the CPU pool's rows and CUDA0's round differently), so retest over seeds:
   `basalt-bench -t conv,struct,prose --seed N -o json -- --kv int8 --resident-experts --exp solo_stage=1,stage_frac=F`
   against the same line without `--exp`.
@@ -291,8 +276,21 @@ the fallback so the trap is never launched.
   sm_89 compiler hoists that load above the barrier (sm_120's does not), so warps copied the previous draft's w1 row.
   Below 9.0 the pick comes from shared memory; `inkling2_dspark_parity` checks the row.
 - 450 W, DDR5-4800: CPU 100/100, GPU the 3 known fails; Flash-Next output identical (fp16 and int8 KV); sm_120 SASS
-  of 31 files as upstream's. A/B, 2 rotated pairs: decode_tps 201.2 against 202.3 (-0.5 %, one slower run), prefill a
-  tie. No Inkling 2 pack (19.7 GB) has been run: its output and speed on 8.9 are unknown.
+  of 31 files as upstream's. A/B, 2 rotated pairs: decode_tps 201.2 against 202.3 (-0.5 %, one slower run).
+
+## Upstream 0.5.6+32: parallel slots, Inkling's CPU experts and MX8 pack (merged 2026-11-23)
+- Inkling 2's two new prompt GEMMs (#575) were built for sm_120a alone: every Inkling prompt stopped at "no kernel
+  image". The Q8_0 projections take `gemm_ada_kernel` below 9.0 (the TMA kernel's tiles, fragments and int32 block
+  dots, loaded by cp.async; `q8_gemm_test` replays it bit for bit). The MX8 pack's MXFP8 experts (layers 20-23) run
+  each K=32 block as two f16 mma.sync on the exactly decoded E4M3 codes, the UE8M0 scales on the block's sum (not the
+  block-scaled mma's bits; `moe_mxfp8_test` holds). `fp4_cores()` answers per device: the new layer split (#527) may
+  pair a Blackwell and an Ada card.
+- CPU 104/104; GPU the 3 known fails and the new `ds41_vision_reserve_test` (Windows: WDDM lets an allocation past the
+  free VRAM succeed in system memory); Flash-Next output identical (fp16 and int8 KV); sm_120 SASS as upstream's.
+- Inkling 2 Mini (basalt-bench, seed 1, `-r 2`, fp16 KV, every expert on the card, 450 W, DDR5-4800): MX8 conv 215,
+  struct 467, prose 177 tok/s, 16K prompt 8,640; DQ8 227 / 449 / 180, 8,760 (a 5090 at 400 W: 347 / 628 / 296,
+  15,820). Same greedy text from both packs. Drafts accepted 53 / 96.6 / 35 % (5090: 68 / 97.5 / 51), likely as the
+  policy drafts deeper on this card's costs: one draft a window (`--spec 2`) accepts 65 / 49 % but decodes at 184 / 169.
 
 ## When a new build fails on the card
 An illegal-instruction or launch failure means a `__trap()` stub was launched: rerun with `CUDA_LAUNCH_BLOCKING=1`

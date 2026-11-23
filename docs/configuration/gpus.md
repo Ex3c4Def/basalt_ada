@@ -125,6 +125,9 @@ kernels ([Ada port notes](../../ADA_PORT_NOTES.md)). On a Blackwell + Ada pair:
   the buffers, chunk plan and row rounding are the same on both. Its decode does not use FP4 tensor cores.
 - DeepSeek takes an Ada second card; its peer-tier kernels are built for 8.9 as well.
 - Hy4-flash takes an Ada main or second card: its kernels build for 8.9 as they are. No Hy4-flash pack has been run here.
+- Inkling 2 Mini runs on an Ada card alone (both packs run here). Its layer split may put an Ada card on either side:
+  each card picks its own prompt kernels (FP4 experts only on 12.x, the Q8_0 projections and MXFP8 experts in their 8.9
+  forms). Not run with two cards here.
 - Flash-Next's layer split, overlapped windows and tensor parallel need matched cards; an unlike pair uses the expert
   tier.
 - Not run here: no Blackwell card was available, so a mixed pair has been checked only with the 4090 alone running the
