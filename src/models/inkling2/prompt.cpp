@@ -23,6 +23,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <stdexcept>
 
@@ -585,17 +586,22 @@ private:
     // planes into H as the softcapped SwiGLU, H rounded per expert tile, then down into the pairs' rows.
     bool fp4_shape() const { return g_.n_embd == 2304 && g_.n_ff_exp == 1152 && g_.n_expert <= 1024; }
     // The FP4 block-scaled tensor cores exist from compute capability 12.0 (moe_fp4 is built for it alone); below it the
-    // NVFP4 experts take the MMQ products, which read NVFP4 on every card.
+    // NVFP4 experts take the MMQ products, which read NVFP4 on every card. Per device: a layer split's cards may differ.
     static bool fp4_cores() {
-        static const bool ok = [] {
-            int dev = 0, major = 0;
-            if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+        static std::atomic<signed char> known[64];   // per device: 0 unknown, 1 no, 2 yes
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { (void) cudaGetLastError(); return false; }
+        signed char k = known[dev].load(std::memory_order_acquire);
+        if (k == 0) {
+            int major = 0;
+            if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
                 (void) cudaGetLastError();
                 return false;
             }
-            return major >= 12;
-        }();
-        return ok;
+            k = major >= 12 ? 2 : 1;
+            known[dev].store(k, std::memory_order_release);
+        }
+        return k == 2;
     }
     bool mxfp8_shape() const { return g_.n_embd % 128 == 0 && g_.n_ff_exp % 128 == 0 && g_.n_expert <= 1024; }
     void experts_mxfp8(const LayerWeights& w, int rows) {
