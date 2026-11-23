@@ -186,6 +186,47 @@ void test_case(std::mt19937& rng, int64_t ntok, int64_t rows, int64_t cols, bool
     std::printf("PASS [%4lld x %4lld x %4lld add=%d pad=%lld]: max_abs=%.2e rel=%.2e\n", (long long) ntok,
                 (long long) rows, (long long) cols, (int) add, (long long) ld_pad, max_abs, rel);
 
+    // The header's arithmetic replayed on the GPU's own codes and scales: per 32-value block the int32 dot, scaled by
+    // the activation and weight scales and summed in fp32 in K order (fmaf), then the epilogue. Bit for bit, so any
+    // card's kernel that passes gives every card's bits. The largest shapes check every 13th token and each tile's last.
+    {
+        std::vector<uint8_t> ha(q8::act_bytes(ntok, cols));
+        ck(cudaMemcpy(ha.data(), d_act, ha.size(), cudaMemcpyDeviceToHost), "d2h act");
+        std::vector<int8_t> wc((size_t) (rows * cols));
+        ck(cudaMemcpy(wc.data(), gw.codes(), wc.size(), cudaMemcpyDeviceToHost), "d2h w codes");
+        std::vector<uint16_t> wsc(q8::scale_plane_bytes(rows, cols) / sizeof(uint16_t));
+        ck(cudaMemcpy(wsc.data(), gw.scales_t, wsc.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost), "d2h w scales");
+        const int8_t* ac = reinterpret_cast<const int8_t*>(ha.data());
+        const float* asc = q8::act_scales(ha.data(), ntok, cols);
+        const int64_t a_ld = q8::act_scale_ld(ntok), w_ld = q8::scale_plane_ld(rows), nb = cols / 32;
+        const bool all = ntok * rows * cols <= 300000000ll;
+        size_t bad = 0, checked = 0;
+        for (int64_t t = 0; t < ntok; ++t) {
+            if (!all && t % 13 != 0 && t % 64 != 63 && t != ntok - 1) continue;
+            for (int64_t r = 0; r < rows; ++r) {
+                float a = 0.0f;
+                for (int64_t b = 0; b < nb; ++b) {
+                    int32_t dot = 0;
+                    for (int i = 0; i < 32; ++i)
+                        dot += (int32_t) ac[t * cols + b * 32 + i] * (int32_t) wc[(size_t) (r * cols + b * 32 + i)];
+                    __half hd;
+                    std::memcpy(&hd, &wsc[(size_t) (b * w_ld + r)], sizeof hd);
+                    a = std::fmaf((float) dot, asc[b * a_ld + t] * __half2float(hd), a);
+                }
+                const float want = add ? y_init[(size_t) (t * ld + r)] + a : a;
+                bad += std::memcmp(&want, &got[(size_t) (t * ld + r)], sizeof want) != 0;
+                ++checked;
+            }
+        }
+        if (bad) {
+            std::printf("FAIL [%lldx%lldx%lld add=%d]: %zu of %zu outputs differ from the replayed arithmetic\n",
+                        (long long) ntok, (long long) rows, (long long) cols, (int) add, bad, checked);
+            std::exit(1);
+        }
+        std::printf("PASS [%4lld x %4lld x %4lld add=%d]: %zu outputs bit for bit as the replayed arithmetic\n",
+                    (long long) ntok, (long long) rows, (long long) cols, (int) add, checked);
+    }
+
     cudaFree(d_x);
     cudaFree(d_act);
     cudaFree(d_y);
@@ -470,8 +511,8 @@ void run_bench(std::mt19937& rng) {
 
 int main(int argc, char** argv) {
     cudaDeviceProp prop{};
-    if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess || prop.major < 12) {
-        std::printf("SKIP: requires Blackwell (sm_120+)\n");
+    if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess || prop.major * 10 + prop.minor < 89) {
+        std::printf("SKIP: requires compute capability 8.9 (the cp.async kernel) or 12.x (TMA)\n");
         return 77;
     }
     std::printf("GPU: %s (sm_%d%d, %d SMs)\n", prop.name, prop.major, prop.minor, prop.multiProcessorCount);

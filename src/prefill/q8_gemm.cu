@@ -105,6 +105,9 @@ __device__ __forceinline__ void tma2d(void* dst, const TmaDesc* m, int k, int r,
 __device__ __forceinline__ int sw(int row, int byte) { return row * BK + (byte ^ ((row & 7) << 4)); }
 
 __global__ __launch_bounds__(NT, 2) void gemm_kernel(const __grid_constant__ Args p) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+    __trap();   // TMA and mbarrier transaction counts: gemm_ada_kernel runs below compute capability 9.0
+#else
     extern __shared__ __align__(1024) unsigned char raw[];
     unsigned char* act = raw;
     unsigned char* wt = raw + ACT_B;
@@ -273,6 +276,200 @@ __global__ __launch_bounds__(NT, 2) void gemm_kernel(const __grid_constant__ Arg
             }
         }
     }
+#endif
+}
+
+// ---- below compute capability 9.0 (no TMA, no mbarrier transaction counts) --------------------------------------
+// gemm_kernel's tiles, ldmatrix fragments, int32 block dots and fp32 sums in K order, so every output has its bits; the
+// four warps load each stage themselves with cp.async (zero-filled past the matrices, where the tensor maps fill
+// zeros), double-buffered by commit groups and barriers. 35 KiB of static shared memory, two CTAs an SM.
+struct ArgsAda {
+    const int8_t* act;
+    const int8_t* w[MAX_SEG];
+    Seg seg[MAX_SEG];
+    const float* a_scale;
+    int64_t k;
+    int nseg, ntok, tok_tiles, total_tiles, k_tiles, k_blocks, a_sc_ld, epi;
+};
+
+__device__ __forceinline__ void cp16z(void* dst, const void* src, bool ok) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(su(dst)), "l"(src), "r"(ok ? 16 : 0) : "memory");
+}
+__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
+template <int N> __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N) : "memory"); }
+
+__global__ __launch_bounds__(NCONS, 2) void gemm_ada_kernel(const __grid_constant__ ArgsAda p) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    __trap();   // gemm_kernel runs from compute capability 9.0
+#else
+    __shared__ __align__(1024) unsigned char raw[ACT_B + W_B + ASC_B + WSC_B];
+    unsigned char* act = raw;
+    unsigned char* wt = raw + ACT_B;
+    float* asc = reinterpret_cast<float*>(wt + W_B);
+    __half* wsc = reinterpret_cast<__half*>(asc + ST * 4 * BT);
+
+    constexpr int G = 8;
+    const int gsz = G * p.tok_tiles;
+    const int grp = (int) blockIdx.x / gsz;
+    const int rem = (int) blockIdx.x - grp * gsz;
+    const int rg = (grp + 1) * G <= p.total_tiles ? G : (p.total_tiles - grp * G);
+    const int rt = grp * G + rem % rg;
+    const int tt = rem / rg;
+    int si = 0;
+    for (int i = 1; i < p.nseg; ++i) {
+        if (rt >= p.seg[i].tile0) si = i;
+    }
+    const Seg& seg = p.seg[si];
+    const int8_t* wsrc = p.w[si];
+    const int row0 = (rt - seg.tile0) * BR;
+    const int tok0 = tt * BT;
+    const int full_kt = p.k_blocks >> 2;
+    const int tid = (int) threadIdx.x;
+
+    // stage st holds K tile kt: the codes as the 128-byte swizzled tensor-map boxes, the scales as gemm_kernel's
+    // producer lays them out
+    const auto load = [&](int kt, int st) {
+#pragma unroll
+        for (int i = tid; i < BT * (BK / 16); i += NCONS) {
+            const int r = i >> 3, c = i & 7;
+            const int64_t k = (int64_t) kt * BK + c * 16;
+            const bool ok = tok0 + r < p.ntok && k < p.k;
+            cp16z(act + st * BT * BK + sw(r, c * 16), p.act + (ok ? (int64_t) (tok0 + r) * p.k + k : 0), ok);
+        }
+#pragma unroll
+        for (int i = tid; i < BR * (BK / 16); i += NCONS) {
+            const int r = i >> 3, c = i & 7;
+            const int64_t k = (int64_t) kt * BK + c * 16;
+            const bool ok = row0 + r < seg.rows && k < p.k;
+            cp16z(wt + st * BR * BK + sw(r, c * 16), wsrc + (ok ? (int64_t) (row0 + r) * p.k + k : 0), ok);
+        }
+        const int kb = kt * 4;
+        if (tid < 64) {
+            const int ks = tid >> 4, off = (tid & 15) * 4;
+            const bool ok = kb + ks < p.k_blocks;
+            cp16z(asc + st * 4 * BT + ks * BT + off, p.a_scale + (ok ? (int64_t) (kb + ks) * p.a_sc_ld + tok0 + off : 0), ok);
+        } else if (tid < 96) {
+            const int ks = (tid - 64) >> 3, off = ((tid - 64) & 7) * 8;
+            const bool ok = kb + ks < p.k_blocks;
+            cp16z(wsc + st * 4 * BR + ks * BR + off,
+                  seg.w_scale + (ok ? (int64_t) (kb + ks) * seg.w_sc_ld + row0 + off : 0), ok);
+        }
+    };
+
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int wtk = warp / WR;
+    const int wrw = warp % WR;
+    const int am = lane >> 3;
+    const int a_row = (lane & 7) + ((am & 1) << 3);
+    const int a_col = (am >> 1) * 16;
+    const int b_row = lane & 7;
+    const int b_col = ((lane >> 3) & 1) * 16;
+    const int g = lane >> 2;
+    const int c2 = 2 * (lane & 3);
+    const int t_off = wtk * WTOK + g;
+    const int r_off = wrw * WROW + c2;
+
+    float acc[MT][MR][4] = {};
+
+    const auto stage = [&]<int NKS>(int st) {
+        const unsigned char* as = act + st * BT * BK;
+        const unsigned char* ws = wt + st * BR * BK;
+        const float* a_sc = asc + st * 4 * BT;
+        const __half* w_sc = wsc + st * 4 * BR;
+        unsigned af[2][MT][4], bf[2][MR][2];
+        auto ld = [&](int ks, unsigned (&a)[MT][4], unsigned (&b)[MR][2]) {
+#pragma unroll
+            for (int mt = 0; mt < MT; ++mt)
+                ldsm4(a[mt][0], a[mt][1], a[mt][2], a[mt][3], su(as + sw(wtk * WTOK + mt * 16 + a_row, ks * 32 + a_col)));
+#pragma unroll
+            for (int mr = 0; mr < MR; ++mr)
+                ldsm2(b[mr][0], b[mr][1], su(ws + sw(wrw * WROW + mr * 8 + b_row, ks * 32 + b_col)));
+        };
+        ld(0, af[0], bf[0]);
+#pragma unroll
+        for (int ks = 0; ks < NKS; ++ks) {
+            const int sl = ks & 1;
+            if constexpr (NKS > 1) {
+                if (ks + 1 < NKS) ld(ks + 1, af[sl ^ 1], bf[sl ^ 1]);
+            }
+            float2 db[MR];
+            const __half* wr = w_sc + ks * BR + r_off;
+#pragma unroll
+            for (int mr = 0; mr < MR; ++mr) db[mr] = __half22float2(*reinterpret_cast<const __half2*>(wr + mr * 8));
+            const float* ar = a_sc + ks * BT + t_off;
+#pragma unroll
+            for (int mt = 0; mt < MT; ++mt) {
+                const float da0 = ar[mt * 16], da1 = ar[mt * 16 + 8];
+#pragma unroll
+                for (int mr = 0; mr < MR; ++mr) {
+                    int c0, c1, c2i, c3;
+                    mma_s8(c0, c1, c2i, c3, af[sl][mt][0], af[sl][mt][1], af[sl][mt][2], af[sl][mt][3],
+                           bf[sl][mr][0], bf[sl][mr][1]);
+                    acc[mt][mr][0] = fmaf((float) c0, da0 * db[mr].x, acc[mt][mr][0]);
+                    acc[mt][mr][1] = fmaf((float) c1, da0 * db[mr].y, acc[mt][mr][1]);
+                    acc[mt][mr][2] = fmaf((float) c2i, da1 * db[mr].x, acc[mt][mr][2]);
+                    acc[mt][mr][3] = fmaf((float) c3, da1 * db[mr].y, acc[mt][mr][3]);
+                }
+            }
+        }
+    };
+
+    load(0, 0);
+    cp_commit();
+    for (int kt = 0; kt < p.k_tiles; ++kt) {
+        if (kt + 1 < p.k_tiles) load(kt + 1, (kt + 1) & 1);
+        cp_commit();
+        cp_wait<1>();
+        __syncthreads();
+        if (kt < full_kt) stage.template operator()<4>(kt & 1);
+        else stage.template operator()<2>(kt & 1);
+        __syncthreads();   // the stage is free for the load two tiles on
+    }
+
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int tk = tok0 + t_off + mt * 16 + h * 8;
+            if (tk >= p.ntok) continue;
+            float* orow = seg.dst + (int64_t) tk * seg.ld;
+#pragma unroll
+            for (int mr = 0; mr < MR; ++mr) {
+                const int r = row0 + r_off + mr * 8;
+                if (r < seg.rows) {
+                    float2* dst = reinterpret_cast<float2*>(orow + r);
+                    if (p.epi == (int) Epilogue::Add) {
+                        float2 v = *dst;
+                        v.x += acc[mt][mr][2 * h];
+                        v.y += acc[mt][mr][2 * h + 1];
+                        *dst = v;
+                    } else {
+                        *dst = make_float2(acc[mt][mr][2 * h], acc[mt][mr][2 * h + 1]);
+                    }
+                }
+            }
+        }
+    }
+#endif
+}
+
+// the current device has TMA and mbarrier transaction counts (compute capability 9.0+), per device
+bool tma_device() {
+    static std::atomic<signed char> known[64];   // per device: 0 unknown, 1 no, 2 yes
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { (void) cudaGetLastError(); return true; }
+    signed char k = known[dev].load(std::memory_order_acquire);
+    if (k == 0) {
+        int major = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return true;
+        }
+        k = major >= 9 ? 2 : 1;
+        known[dev].store(k, std::memory_order_release);
+    }
+    return k == 2;
 }
 
 __global__ void quantize_q8_planes_kernel(const float* __restrict__ x, int64_t rows, int64_t cols, int64_t ld,
@@ -384,6 +581,38 @@ void gemm_segmented(const Segment* seg, int nseg, int64_t w_cols, const void* ac
     if (nseg > MAX_SEG || w_cols % 64 != 0) {
         basalt::log::error("basalt", "prefill q8: %d segments of %lld columns", nseg, (long long) w_cols);
         std::exit(1);
+    }
+    if (!tma_device()) {   // below compute capability 9.0: the same tiles, loaded with cp.async
+        ArgsAda p{};
+        int tiles = 0;
+        for (int i = 0; i < nseg; ++i) {
+            const Segment& s = seg[i];
+            if (s.rows <= 0 || s.rows % 2 != 0 || !s.w_scales_t || ((uintptr_t) s.w & 15) != 0 ||
+                ((uintptr_t) s.w_scales_t & 15) != 0 || ((uintptr_t) s.dst & 7) != 0 || s.ld_dst % 2 != 0 ||
+                s.ld_dst < s.rows) {
+                basalt::log::error("basalt", "prefill q8: segment %d: [%lld x %lld] matrix, ld %lld", i, (long long) s.rows,
+                                   (long long) w_cols, (long long) s.ld_dst);
+                std::exit(1);
+            }
+            p.w[i] = s.w;
+            p.seg[i] = {reinterpret_cast<const __half*>(s.w_scales_t), s.dst, s.ld_dst, (int) s.rows,
+                        (int) scale_plane_ld(s.rows), tiles};
+            tiles += (int) ((s.rows + BR - 1) / BR);
+        }
+        p.act = static_cast<const int8_t*>(act);
+        p.a_scale = reinterpret_cast<const float*>(static_cast<const uint8_t*>(act) + scale_off(rows, w_cols));
+        p.k = w_cols;
+        p.nseg = nseg;
+        p.ntok = (int) rows;
+        p.tok_tiles = (int) ((rows + BT - 1) / BT);
+        p.total_tiles = tiles;
+        p.k_tiles = (int) ((w_cols + BK - 1) / BK);
+        p.k_blocks = (int) (w_cols >> 5);
+        p.a_sc_ld = (int) act_scale_ld(rows);
+        p.epi = (int) epi;
+        gemm_ada_kernel<<<(unsigned) (tiles * p.tok_tiles), NCONS, 0, (cudaStream_t) stream>>>(p);
+        ck("gemm");
+        return;
     }
     static std::atomic<bool> configured[64];
     int dev = 0;
