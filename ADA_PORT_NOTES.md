@@ -286,7 +286,8 @@ the fallback so the trap is never launched.
   block-scaled mma's bits; `moe_mxfp8_test` holds). `fp4_cores()` answers per device: the new layer split (#527) may
   pair a Blackwell and an Ada card.
 - CPU 104/104; GPU the 3 known fails and the new `ds41_vision_reserve_test` (Windows: WDDM lets an allocation past the
-  free VRAM succeed in system memory); Flash-Next output identical (fp16 and int8 KV); sm_120 SASS as upstream's.
+  free VRAM succeed in system memory); Flash-Next output identical (fp16 and int8 KV); sm_120 SASS as upstream's. A/B,
+  2 rotated pairs, every run `ram-experts=59.5GB` and the same text: decode_tps 200.4 against 200.3, prefill a tie.
 - Inkling 2 Mini (basalt-bench, seed 1, `-r 2`, fp16 KV, every expert on the card, 450 W, DDR5-4800): MX8 conv 215,
   struct 467, prose 177 tok/s, 16K prompt 8,640; DQ8 227 / 449 / 180, 8,760 (a 5090 at 400 W: 347 / 628 / 296,
   15,820). Same greedy text from both packs. Drafts accepted 53 / 96.6 / 35 % (5090: 68 / 97.5 / 51), likely as the
