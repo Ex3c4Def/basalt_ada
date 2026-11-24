@@ -288,10 +288,11 @@ the fallback so the trap is never launched.
 - CPU 104/104; GPU the 3 known fails and the new `ds41_vision_reserve_test` (Windows: WDDM lets an allocation past the
   free VRAM succeed in system memory); Flash-Next output identical (fp16 and int8 KV); sm_120 SASS as upstream's. A/B,
   2 rotated pairs, every run `ram-experts=59.5GB` and the same text: decode_tps 200.4 against 200.3, prefill a tie.
-- Inkling 2 Mini (basalt-bench, seed 1, `-r 2`, fp16 KV, every expert on the card, 450 W, DDR5-4800): MX8 conv 215,
-  struct 467, prose 177 tok/s, 16K prompt 8,640; DQ8 227 / 449 / 180, 8,760 (a 5090 at 400 W: 347 / 628 / 296,
-  15,820). Same greedy text from both packs. Drafts accepted 53 / 96.6 / 35 % (5090: 68 / 97.5 / 51), likely as the
-  policy drafts deeper on this card's costs: one draft a window (`--spec 2`) accepts 65 / 49 % but decodes at 184 / 169.
+- Inkling 2 Mini (basalt-bench, seed 1, two runs, fp16 KV, every expert on the card, 450 W, DDR5-4800): MX8 conv 219,
+  struct 470, prose 185 tok/s, 16K prompt 8,600; DQ8 229 / 450 / 185, 8,740 (a 5090 at 400 W: 347 / 628 / 296, 15,820).
+  Below 9.0 a decode window reads no experts into L2 beside the attention (6d7dc337): the guessed experts' prefetch held
+  the SMs at the wrong L1/shared split and took the attention's bandwidth. Plain decoding +12 %, MX8 conv / prose +2.9 /
+  +4.7 %, same text (both packs alike). Drafts accepted 56 / 97 / 40 % (5090: 68 / 97.5 / 51): deeper drafts pay here.
 
 ## When a new build fails on the card
 An illegal-instruction or launch failure means a `__trap()` stub was launched: rerun with `CUDA_LAUNCH_BLOCKING=1`
