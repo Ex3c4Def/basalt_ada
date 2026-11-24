@@ -242,11 +242,10 @@ the fallback so the trap is never launched.
   prose (1093 to 1200 tokens), so the experts sit differently before the 64K request.
 
 ## Upstream 0.5.0: Hy4-flash (merged 2026-11-20)
-- Hy4-flash and the code it shares with DeepSeek build for 8.9 as they are (f16 mma with ldmatrix and cp.async, the
-  e4m3 cvt, NVFP4 experts through the shared kernels and MMQ; `attend_mma_kernel` opts in to 85,760 bytes of 101,376).
-  Its parity tests pass; no Hy4-flash pack (158.7 GB) has been run. `file_expert_repin_test` fails on Windows (it
-  assumes Linux; `RamAllocation` takes host VMM memory, pinned at once). Output identical, SASS of 33 files as
-  upstream's, A/B a tie (202.2 against 203.0) with every run at `ram-experts=59.5GB`.
+- Hy4-flash and the code it shares with DeepSeek build for 8.9 as they are (f16 mma with ldmatrix and cp.async, the e4m3
+  cvt, NVFP4 experts through MMQ; `attend_mma_kernel` opts in to 85,760 of 101,376 bytes). Its parity tests pass; no pack
+  (158.7 GB) has been run. `file_expert_repin_test` fails on Windows (it assumes Linux's unpinned RAM copy). Output
+  identical, SASS of 33 files as upstream's, A/B a tie (202.2 against 203.0, every run `ram-experts=59.5GB`).
 
 ## PCIe share of solo decode windows (experiment, 2026-11-20)
 - A solo window (one conversation decoding) sends no routed expert over PCIe; only batch windows stage a share of each
@@ -262,16 +261,14 @@ the fallback so the trap is never launched.
   against the same line without `--exp`.
 
 ## Upstream 0.5.0+58: the shared routing flags (merged 2026-11-20)
-- Nothing to port (no sm_90+ feature, no compute-capability check); upstream's FP4-Local reader (#444) replaces the
-  fork's (dbb54997). CPU 94/94, GPU the 3 known fails; Flash-Next output identical; sm_120 SASS of 26 files as
-  upstream's; A/B decode_tps 201.3 against 201.3.
+- Nothing to port (no sm_90+ feature or capability check); upstream's FP4-Local reader (#444) replaces the fork's
+  (dbb54997). CPU 94/94, GPU the 3 known fails; output identical; SASS of 26 files as upstream's; A/B 201.3 against 201.3.
 
 ## Upstream 0.5.5: Inkling 2 Mini (merged 2026-11-23)
 - Inkling 2 (src/models/inkling2) checks no compute capability. On 8.9 its fused window attention (a cluster of eight
-  blocks) compiles out and traps (`INK_NO_CLUSTER`), and `attention_window` takes the preparation, the split and the
-  combine on a card without clusters: upstream's own path for longer windows, with the same bits. Its prompt path's
-  NVFP4 experts take MMQ below 12.x (`fp4_cores()`; moe_fp4 is built for sm_120a alone), not the FP4 block-scaled
-  tensor cores. The bulk L2 prefetches in its glue and ops and in Hy4-flash's ops run a line at a time below 9.0.
+  blocks) compiles out and traps (`INK_NO_CLUSTER`); `attention_window` takes the split and the combine: upstream's own
+  path for longer windows, the same bits. Its prompt NVFP4 experts take MMQ below 12.x (`fp4_cores()`; moe_fp4 is
+  sm_120a only). The bulk L2 prefetches in its glue and ops and in Hy4-flash's ops run a line at a time below 9.0.
 - The drafter's `head_final_kernel` read the pick back from the restrict-qualified `*prev` that thread 0 stored; the
   sm_89 compiler hoists that load above the barrier (sm_120's does not), so warps copied the previous draft's w1 row.
   Below 9.0 the pick comes from shared memory; `inkling2_dspark_parity` checks the row.
@@ -293,6 +290,9 @@ the fallback so the trap is never launched.
   Below 9.0 a decode window reads no experts into L2 beside the attention (6d7dc337): the guessed experts' prefetch held
   the SMs at the wrong L1/shared split and took the attention's bandwidth. Plain decoding +12 %, MX8 conv / prose +2.9 /
   +4.7 %, same text (both packs alike). Drafts accepted 56 / 97 / 40 % (5090: 68 / 97.5 / 51): deeper drafts pay here.
+- Quality gate against upstream's `inkling2-bf16-base.kld`, 100 chunks, every expert on the card, scored-row base PPL 7.0633:
+  MX8 KLD 0.00297, top-1 97.69 %, PPL 7.0727; DQ8 0.00298 / 97.70 % / 7.0733, `--kv int8` 0.00346 / 97.47 % / 7.0746. The
+  5090's: 0.00297 / 97.83 %; 0.00304 / 97.81 % / 7.0737, 0.00343 / 97.47 % / 7.0788 (run at T=3, base 7.0644; T=1 here).
 
 ## When a new build fails on the card
 An illegal-instruction or launch failure means a `__trap()` stub was launched: rerun with `CUDA_LAUNCH_BLOCKING=1`
