@@ -53,22 +53,14 @@ the fallback so the trap is never launched.
   others go straight to the q8_1 rows) and `dm_ring_ada_kernel` (one block publishes the header and x in 16-byte stores and
   rings; blocks for the warm-up's rows do not hold the doorbell back, so those rows may land after it, which changes no
   output). `--exp dm_route_ada=0` runs `dm_route_kernel`, which is unchanged. `dm_route_ada_parity`: 0 differing bytes in
-  2560 cases against `dm_route_kernel`; greedy identical on conv, struct and prose. All numbers at 450 W, development only.
-  Traces: chain 8-10 -> 5 us at T=1, 18-21 -> 7-9 us at T=8; ring 12-14 -> 8 us at T=1, 17-21 -> 12-14 us at T=8; prose's
-  route busy time 7.6 -> 4.3 % of the cycle. Microbench, to the doorbell: 4.7 -> 3.3 us at T=1, 15.4 -> 6.2 us at T=8.
-  A/B, 4 rounds x 2 repetitions with the video decoder idle throughout: conv -0.1 %, struct -0.7 %, prose +2.5 % (7 of 8
-  faster), token-weighted +0.05 %. All three A/Bs pooled, 20 pairs each, paired median: conv +0.3 %, struct +0.5 %, prose
-  +2.8 %, with prose's window time -3.3 %. So only prose gains beyond the spread; expert hit rates are unchanged. Other
-  load on the machine moves these numbers: in an A/B during which a video played at some time, one conv run lost 21.5 %
-  across every window width. Log `utilization.decoder` beside an A/B to see this.
-- HC read and route together, against the build without them: `local_bench/engine_bench.py --tests community`, a fresh
-  server from `basalt_config.json`, 450 W, DDR5-4400, 4 rotated pairs, development only. conv / struct / prose /
-  decode_tps 111.2 / 200.3 / 120.4 / 170.2 -> 118.7 / 212.3 / 127.3 / 180.1, +5.8 %, faster in every pair. decode_tps
-  ranges 163.1 to 175.2 and 178.0 to 182.5. Same builds, plain basalt-bench with the log on, 14 pairs: +5.53 %; the hc
-  read alone +3.53 % and the route on top +1.40 %, 6 pairs each. Text differs between runs on conv and prose (adaptive
-  swaps), so struct, greedy, is the cleanest figure.
-- Those builds' output: the quality gate's rows (100 chunks, T 3) are byte-identical; greedy, and with `--adapt-swaps 0`
-  sampled conv and prose, are identical.
+  2560 cases against `dm_route_kernel`; greedy identical on conv, struct and prose. 450 W, development only, three A/Bs
+  pooled, 20 pairs each, paired median: conv +0.3 %, struct +0.5 %, prose +2.8 % (its route busy time 7.6 -> 4.3 % of the
+  cycle); only prose gains beyond the spread, and expert hit rates are unchanged. A video playing during an A/B once cost
+  a conv run 21.5 % across every window width: log `utilization.decoder` beside an A/B.
+- HC read and route together, against the build without them (`local_bench/engine_bench.py --tests community`, a fresh
+  server, 450 W, DDR5-4400, 4 rotated pairs): conv / struct / prose / decode_tps 111.2 / 200.3 / 120.4 / 170.2 -> 118.7 /
+  212.3 / 127.3 / 180.1, +5.8 %, faster in every pair (basalt-bench: the HC read alone +3.53 %, the route on top +1.40 %).
+  The gate's rows (100 chunks, T 3) are byte-identical; greedy, and sampled with `--adapt-swaps 0`, are identical.
 - Measuring: plain basalt-bench asks for the per-window log unless `--no-windows`, about 2 % slower, so compare its tok/s
   only with its own. It keeps the last of a repeated engine flag, so two experiment gates go in one `--exp a=0,b=0`.
 - Comparing the quality gate across builds: its rows follow the GPU slots, and a bigger binary leaves less VRAM (6491 slots
@@ -280,17 +272,26 @@ the fallback so the trap is never launched.
 - CPU 104/104; GPU the 3 known fails and the new `ds41_vision_reserve_test` (Windows: WDDM lets an allocation past the
   free VRAM succeed in system memory); Flash-Next output identical (fp16 and int8 KV); sm_120 SASS as upstream's. A/B,
   2 rotated pairs, every run `ram-experts=59.5GB` and the same text: decode_tps 200.4 against 200.3, prefill a tie.
-- Inkling 2 Mini (basalt-bench, seed 1, two runs, fp16 KV, every expert on the card, 450 W, DDR5-4800): MX8 conv 219,
-  struct 470, prose 185 tok/s, 16K prompt 8,600; DQ8 229 / 450 / 185, 8,740 (a 5090 at 400 W: 347 / 628 / 296, 15,820).
-  Below 9.0 a decode window reads no experts into L2 beside the attention (6d7dc337): the guessed experts' prefetch held
+- Below 9.0 a decode window reads no experts into L2 beside the attention (6d7dc337): the guessed experts' prefetch held
   the SMs at the wrong L1/shared split and took the attention's bandwidth. Plain decoding +12 %, MX8 conv / prose +2.9 /
   +4.7 %, same text (both packs alike). Drafts accepted 56 / 97 / 40 % (5090: 68 / 97.5 / 51): deeper drafts pay here.
-- Quality gate against upstream's `inkling2-bf16-base.kld`, 100 chunks, every expert on the card, scored-row base PPL 7.0633:
-  MX8 KLD 0.00297, top-1 97.69 %, PPL 7.0727; DQ8 0.00298 / 97.70 % / 7.0733, `--kv int8` 0.00346 / 97.47 % / 7.0746. The
-  5090's: 0.00297 / 97.83 %; 0.00304 / 97.81 % / 7.0737, 0.00343 / 97.47 % / 7.0788 (run at T=3, base 7.0644; T=1 here).
-- DQ8 at `--kv int8` against fp16 (fp16, int8, int8, fp16; 450 W): plain decoding after a 16K prompt 6.87 against 7.17 ms
-  a token (-4.2 %: 288 against 512 MiB of cache read a token); prompts -0.4 % at 16K, -1.9 % at 64K. At short context a
-  window costs the same; the fixtures (conv -2.8 %, struct +6.5 %, prose +0.2 %) follow int8's other texts.
+- Inkling 2 Mini, every expert on the card, 450 W, DDR5-4800. Gate: upstream's `inkling2-bf16-base.kld`, 100 chunks,
+  T=1, scored-row base PPL 7.0633. Speed: basalt-bench seed 1, two runs (fp16, int8, int8, fp16), tok/s; ms/tok is plain
+  decoding (`--spec 1`) after the 16K prompt. Context: the largest `--max-context` that keeps every expert on the card
+  (CLI, one session, the card otherwise empty; it moves by about 100 between starts).
+
+  | Pack, KV | KLD     | top-1 % | PPL    | conv | struct | prose | 16K   | 64K   | ms/tok | context |
+  |----------|--------:|--------:|-------:|-----:|-------:|------:|------:|------:|-------:|--------:|
+  | MX8 fp16 | 0.00297 |   97.69 | 7.0727 |  219 |    470 |   184 | 8,597 | 7,444 |   7.17 |  84,572 |
+  | MX8 int8 | 0.00346 |   97.51 | 7.0742 |  223 |    476 |   194 | 8,566 | 7,309 |   6.86 | 141,673 |
+  | DQ8 fp16 | 0.00298 |   97.70 | 7.0733 |  228 |    450 |   186 | 8,778 | 7,587 |   7.17 |  81,158 |
+  | DQ8 int8 | 0.00346 |   97.47 | 7.0746 |  222 |    479 |   186 | 8,739 | 7,442 |   6.87 | 136,085 |
+
+- A 5090 (400 W, MX8): conv 347, struct 628, prose 296, 16K 15,820; gate at T=3 (base 7.0644) MX8 0.00297 /
+  97.83 %, DQ8 0.00304 / 97.81 % / 7.0737, int8 0.00343 / 97.47 % / 7.0788. int8 reads 288 against 512 MiB of cache a
+  token at 16K and fits 1.68x the context; a short-context window costs the same (DQ8), so conv / struct / prose follow
+  int8's other texts. DQ8 reads prompts 2 % faster here (upstream: MX8 5 %; likely 8.9's MXFP8 on f16 mma). Just above
+  each context limit about 35 MiB refuses to start instead of moving experts to RAM (upstream #542, open PR #643).
 
 ## When a new build fails on the card
 An illegal-instruction or launch failure means a `__trap()` stub was launched: rerun with `CUDA_LAUNCH_BLOCKING=1`
