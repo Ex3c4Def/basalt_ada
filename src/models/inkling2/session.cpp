@@ -200,7 +200,20 @@ struct Lane {
     unsigned long long* rec_blobs = nullptr;    // [visit][kAheadExperts] the experts each visit took in the last window
     int32_t* rec_n = nullptr;                   // [visit] how many
     bool ra_on = false, pf_on = false;
+    bool side_reads = true;                     // the experts' prefetch and read-ahead beside the attention and the glue
 };
+
+// The guessed experts' prefetch and the read-ahead into L2 run from compute capability 9.0. Below it they cost a decode
+// pass more than they save: the side kernel takes the memory bandwidth the attention and the projections need, and an SM
+// holding its blocks changes its split of L1 and shared memory for the attention only once they end.
+static bool side_reads_on(int device) {
+    int major = 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return true;
+    }
+    return major >= 9;
+}
 
 class Session final : public model::BatchSession, private Scratch {
 public:
@@ -263,6 +276,7 @@ public:
         if (m_.cards() > 1) {
             Lane& k = lane_[1];
             k.device = m_.card_device(1);
+            k.side_reads = side_reads_on(k.device);
             cudaSetDevice(k.device);
             bool sok = cudaStreamCreateWithFlags(&k.stream, cudaStreamNonBlocking) == cudaSuccess &&
                        cudaStreamCreateWithFlags(&k.ra_st, cudaStreamNonBlocking) == cudaSuccess &&
@@ -353,6 +367,7 @@ public:
         static_cast<Scratch&>(*this) = sh_->x;
         lane_[0] = Lane{m_.device(), &sh_->x, stream_, ra_st_, pf_st_, ra_ev_, ra_join_, gs_ev_, pf_ev_, pf_join_, hand0_, ex_tally_,
                         rec_blobs_, rec_n_};
+        lane_[0].side_reads = side_reads_on(m_.device());
         lane_[1].x = &sh_->x1;
         for (const VisitCache& c : vc_) {
             if (slot_card_[(size_t) (&c - vc_.data())] != 0) continue;
@@ -881,7 +896,7 @@ private:
         // kGuessExperts / rows best) into L2 on the other side stream, while the attention and the glue before the experts
         // run (it starts once the projections are done)
         const int vi = (int) (&v - g_.visits.data());
-        const bool guess = rows <= kGuessRows;
+        const bool guess = rows <= kGuessRows && k.side_reads;
         if (guess && vi > 0 && m_.card_of(g_.visits[(size_t) vi - 1].layer) == card) {   // its guess was made on this card
             const bk::NativeExpertLayout Lx = bk::native_expert_layout(w.gu_type, w.d_type, E, g_.n_ff_exp);
             cudaEventRecord(k.pf_ev, k.stream);
@@ -936,7 +951,7 @@ private:
         bk::native_q8_planes_mmvq(w.out, x.xo_, x.o_, kOutRows, E, rows, k.stream);
         // a wider window: the experts this visit took in the window before into L2 on the side stream, while the glue
         // before the experts runs (it starts once the output projection is done)
-        if (!guess) {
+        if (!guess && k.side_reads) {
             const bk::NativeExpertLayout Lx = bk::native_expert_layout(w.gu_type, w.d_type, E, g_.n_ff_exp);
             cudaEventRecord(k.ra_ev, k.stream);
             cudaStreamWaitEvent(k.ra_st, k.ra_ev, 0);
