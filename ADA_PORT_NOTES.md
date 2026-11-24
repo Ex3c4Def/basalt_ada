@@ -7,14 +7,9 @@ CONTRIBUTING.md rules against other architectures and the parity-test requiremen
 must stay exactly as it was. Do not git commit, push or delete anything unless the user asks.
 
 ## State
-The source edits are already applied (14 files, listed below). They were written **without a compiler or a GPU**, so
-nothing has been built or run yet. The first job is to get it to compile and then to run.
-
-Changed files:
-CMakeLists.txt, include/basalt/models/qwen4exp/kernels/dec_gdn.hpp, src/core/device.cu, src/models/qwen4exp/kernels/dec_gdn_rec.cu,
-src/models/qwen4exp/kernels/dec_moe.cuh, src/models/qwen4exp/kernels/dense_tc.cu, src/kernels/cuda/gu2.cuh, src/models/qwen4exp/kernels/hc_fused.cu,
-src/models/qwen4exp/kernels/verify_kernels.cu, src/models/qwen4exp/prefill/experts.hpp, src/models/qwen4exp/prefill/layout.cpp, src/models/qwen4exp/prefill/layout.hpp,
-src/prefill/mmq/mmq_common.cuh, src/program/gpu_select.cpp. (`git diff` shows all of them.)
+Builds and runs on the 4090. The first port changed 14 files (CMakeLists.txt, src/core/device.cu, qwen4exp's dec_gdn,
+dec_gdn_rec, dec_moe, dense_tc, hc_fused, verify_kernels, prefill experts and layout, src/kernels/cuda/gu2.cuh,
+src/prefill/mmq/mmq_common.cuh, src/program/gpu_select.cpp); each upstream merge below says what 8.9 needed since.
 
 ## Build (Windows, docs/platforms.md has the details)
 Needs Visual Studio 2022 C++ tools, CUDA 13.x, CMake 3.24+, Ninja. The desktop app does not load vcvars, so use
@@ -293,6 +288,9 @@ the fallback so the trap is never launched.
 - Quality gate against upstream's `inkling2-bf16-base.kld`, 100 chunks, every expert on the card, scored-row base PPL 7.0633:
   MX8 KLD 0.00297, top-1 97.69 %, PPL 7.0727; DQ8 0.00298 / 97.70 % / 7.0733, `--kv int8` 0.00346 / 97.47 % / 7.0746. The
   5090's: 0.00297 / 97.83 %; 0.00304 / 97.81 % / 7.0737, 0.00343 / 97.47 % / 7.0788 (run at T=3, base 7.0644; T=1 here).
+- DQ8 at `--kv int8` against fp16 (fp16, int8, int8, fp16; 450 W): plain decoding after a 16K prompt 6.87 against 7.17 ms
+  a token (-4.2 %: 288 against 512 MiB of cache read a token); prompts -0.4 % at 16K, -1.9 % at 64K. At short context a
+  window costs the same; the fixtures (conv -2.8 %, struct +6.5 %, prose +0.2 %) follow int8's other texts.
 
 ## When a new build fails on the card
 An illegal-instruction or launch failure means a `__trap()` stub was launched: rerun with `CUDA_LAUNCH_BLOCKING=1`
