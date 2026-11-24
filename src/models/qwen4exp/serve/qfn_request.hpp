@@ -51,6 +51,7 @@ public:
     bool run_window(int T, int e0, int& TB);
     bool take_held(int T);
     bool window_failed() const { return runtime_.drive.d.failed; }
+    bool window_refused() const { return false; }
     const char* window_error() const {
         return runtime_.drive.d.failed && runtime_.drive.d.fail ? runtime_.drive.d.fail : runtime_.err.c_str();
     }
@@ -123,8 +124,8 @@ private:
     bool batch_fatal{};
     int64_t il_parts{};
     double il_ms{};
-    // ---- the prompt-time layer split: a long part of the prompt is read across the cards when its price there
-    // (split_price) beats the main card's alone; the chunk, its head chunk, the stage count and the cuts, or none
+    // ---- the prompt-time layer split: a part of the prompt longer than a chunk is read across the cards at the start's
+    // fixed cuts (split_part says when it cannot be); the chunk, its head chunk, the stage count and the cuts, or none
     struct SplitPlan { int64_t chunk = 0, head = 0; int stages = 0; std::vector<int> cuts; };
     bool relax_on{};
     bool in_call{};

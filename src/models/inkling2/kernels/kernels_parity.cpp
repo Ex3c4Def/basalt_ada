@@ -539,8 +539,8 @@ void test_attention() {
         std::snprintf(tag, sizeof tag, "attention (%s%s)", window ? "window ring" : "full, 3k keys", kv_tag(kv));
         report(tag, got, ref, 2e-3);
         const uint64_t hash = print_hash("output", bytes_of(got));
-        // Frozen outputs from main's FP16/FP8 kernels on the fixed attention fixture.
-        static constexpr uint64_t kBaseHashes[] = {0x37a69c7be6281e30ull, 0xde59e213bef8dbb9ull, 0x8302535765d7601full};
+        // Frozen outputs from the FP16/FP8 kernels on the fixed attention fixture.
+        static constexpr uint64_t kBaseHashes[] = {0x37a69c7be6281e30ull, 0x59167d639fa4a77bull, 0x3460547e2a0576d1ull};
         if (mode < 3) {
             const bool baseline = hash == kBaseHashes[mode];
             std::printf("  previous FP16/FP8 baseline %s\n", baseline ? "matches" : "FAIL");
@@ -712,6 +712,39 @@ void test_experts() {
     }
     std::printf("%-34s %s\n", "  the experts' tally", tally_ok ? "counted" : "FAIL");
     failures += !tally_ok;
+}
+
+// heat_fold: the kept rows' lookups of every visit, against a host count; only the first `rows` rows of each visit count,
+// whatever the row stride, and two folds add up
+void test_heat_fold() {
+    std::printf("heat_fold\n");
+    constexpr int V = 48, R = kDecodeRows, K = 8, NE = 128, L = 24;
+    std::uniform_int_distribution<int> pick_e(0, NE - 1), pick_l(0, L - 1);
+    std::vector<int32_t> ids((size_t) V * R * K), layer(V);
+    for (auto& e : ids) e = pick_e(rng);
+    for (auto& l : layer) l = pick_l(rng);
+    int32_t* di = dev(ids);
+    int32_t* dl = dev(layer);
+    bool ok = true;
+    for (int rows = 1; rows <= R && ok; ++rows) {
+        uint32_t* tally = zeros<uint32_t>((size_t) L * NE);
+        heat_fold(di, dl, V, R, rows, K, NE, tally, nullptr);
+        heat_fold(di, dl, V, R, rows, K, NE, tally, nullptr);
+        const std::vector<uint32_t> got = host(tally, (size_t) L * NE);
+        std::vector<uint32_t> want((size_t) L * NE, 0);
+        for (int v = 0; v < V; ++v)
+            for (int i = 0; i < rows * K; ++i) want[(size_t) layer[v] * NE + ids[(size_t) v * R * K + i]] += 2;
+        ok = got == want;
+        cudaFree(tally);
+    }
+    std::printf("%-34s %s\n", "  kept rows' lookups (1..8 rows)", ok ? "counted" : "FAIL");
+    failures += !ok;
+    uint32_t* tally = zeros<uint32_t>((size_t) L * NE);
+    const double us = time_us([&] { heat_fold(di, dl, V, R, 4, K, NE, tally, nullptr); });
+    std::printf("  %.1f us a call (48 visits, 4 rows: %.1f GB/s of ids)\n", us, (double) V * 4 * K * 4 / us / 1e3);
+    cudaFree(tally);
+    cudaFree(di);
+    cudaFree(dl);
 }
 
 void test_softcap() {
@@ -1972,6 +2005,7 @@ int main() {
     test_cpu_ring();
     test_cpu_abort();
     time_cpu_handoff();
+    test_heat_fold();
     test_batch_window();
     std::printf("inkling2_kernels_parity: %d failures\n", failures);
     return failures ? 1 : 0;

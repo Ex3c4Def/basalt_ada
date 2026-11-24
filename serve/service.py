@@ -29,16 +29,21 @@ from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY, Channels as LogprobC
 from serve.config import GRAMMAR_DEFAULT
 
 
-def available_ram_mib() -> int | None:
-    """MemAvailable from /proc/meminfo, in MiB; None where there is no such file."""
+def meminfo_mib(field: str) -> int | None:
+    """A field of /proc/meminfo in MiB; None where there is no such file."""
     try:
         with open("/proc/meminfo", encoding="ascii") as f:
             for line in f:
-                if line.startswith("MemAvailable:"):
+                if line.startswith(field + ":"):
                     return int(line.split()[1]) >> 10
     except (OSError, ValueError, IndexError):
         pass
     return None
+
+
+def available_ram_mib() -> int | None:
+    """MemAvailable, in MiB."""
+    return meminfo_mib("MemAvailable")
 
 
 # trailing effort turn (effort_end): sentences for the non-default efforts
@@ -346,6 +351,12 @@ class Service:
                 subprocess.run(cmd, shell=isinstance(cmd, str), timeout=120, stdin=subprocess.DEVNULL)
             except (OSError, subprocess.SubprocessError) as e:
                 print(f"[server] warning: before_load command failed ({e}), loading anyway", flush=True)
+        reap = getattr(self.engine, "reap", None)
+        if callable(reap):
+            # an engine that ended (retired on an encode timeout, silent, crashed) may still have a child
+            # releasing GPU/RAM: reap it now, or the free-VRAM check below would blame "another program" and
+            # keep rejecting the very restart that cleans it up
+            reap()   # EngineStuck here means it is genuinely still exiting: the honest answer
         if self.min_free_vram_mib:
             free = self.free_vram_mib()
             deadline = time.time() + 15                 # memory just released elsewhere may take a moment
@@ -546,6 +557,47 @@ class Service:
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
 
+    def park(self, fits) -> str:
+        """End this model's turn by sleeping its engine, state kept in RAM, its sidecar encoder (if any) ended; see
+        `sleep` for the answers. The router calls it between requests."""
+        out = self.sleep(fits=fits)
+        if out == "asleep" and self.vision is not None and hasattr(self.vision, "unload"):
+            self.vision.unload()
+        return out
+
+    def _gpu_state_mib(self) -> int | None:
+        """The GPU memory this engine's process holds: what the driver moves into RAM when it sleeps."""
+        pid = getattr(getattr(self.engine, "proc", None), "pid", None)
+        return vram.process_mib(pid) if pid else None
+
+    def park_need_mib(self) -> int | None:
+        """The RAM this engine would hold asleep, before it sleeps: its own memory and its GPU state."""
+        own, state = self.engine.held_mib(), self._gpu_state_mib()
+        return None if own is None or state is None else own + state
+
+    def held_mib(self) -> int | None:
+        """The RAM a sleeping engine holds: its process's own memory, which by then includes the GPU state the driver
+        moved there."""
+        return self.engine.held_mib()
+
+    def park_refusal(self, floor_mib: int) -> str | None:
+        """Why this engine may not be held asleep (RAM): the sleep's own margin, and the RAM floor once its state is
+        in RAM; None when it may."""
+        why = self._sleep_fits()
+        if why is not None:
+            return why
+        avail, state = available_ram_mib(), self._gpu_state_mib()
+        if avail is not None and state is not None and avail - state < floor_mib:
+            return f"RAM: {avail} MiB free, {state} MiB of GPU state to hold and the {floor_mib} MiB floor to keep"
+        return None
+
+    def evict(self):
+        """End a parked engine without waking it: its VRAM is another model's now."""
+        with self.fifo:
+            self.engine.discard()
+            if self.vision is not None and hasattr(self.vision, "unload"):
+                self.vision.unload()
+
     def _wake(self):
         """Wake a sleeping engine (caller holds fifo); a failed wake ends it and the next start loads it again."""
         t = time.time()
@@ -591,9 +643,10 @@ class Service:
     sleep_refused_at = None                              # the request an idle sleep was last refused after
     SLEEP_RAM_MARGIN_MIB = 8192                          # RAM left free once the GPU state is in host memory
 
-    def sleep(self, idle_for: float | None = None) -> str:
+    def sleep(self, idle_for: float | None = None, fits=None) -> str:
         """Put the engine to sleep between requests: its VRAM released, its process and RAM state kept, the next
-        request wakes it. "asleep", "not loaded", "busy", "no ram" or "unsupported"."""
+        request wakes it. `fits()` replaces the RAM check (it says why the state may not be held, None if it may).
+        "asleep", "not loaded", "busy", "no ram" or "unsupported"."""
         if not hasattr(self.engine, "sleep") or not self.engine.can_sleep():
             return "unsupported"
         if self.stopping.is_set():                      # shutdown: the engine is being ended, not put to sleep
@@ -619,7 +672,7 @@ class Service:
                 return "unsupported"
             t = time.time()
             try:
-                self.engine.sleep(ram_check=self._sleep_fits)
+                self.engine.sleep(ram_check=fits or self._sleep_fits)
             except ValueError as e:
                 if idle_for is not None:
                     self.sleep_refused_at = self.last_request_at or self.started_at
@@ -1321,21 +1374,23 @@ class Service:
         return "[server] live | " + " | ".join(parts) + f" | total {total:.0f}t/s"
 
     def _progress(self, last_print, every=1.0, st=None):
-        """Print progress while a request runs: its prompt read, then the shared live line."""
+        """Print progress while a request runs: its prompt read, then the shared live line. The common case, nothing
+        due, takes no lock and copies nothing: the two fields that decide it are plain scalar reads."""
         now = time.time()
-        with self.status_lock:
-            s = dict(self.status if st is None else st)
+        s = self.status if st is None else st
         if now - last_print < (READ_PRINT_EVERY if s.get("first_token") is None else every):
             return last_print
         if s.get("first_token") is None:
+            with self.status_lock:
+                cur = st if st is not None else self.status
+                slot = self._slot_of(cur)
+                prompt_tokens, started = cur.get("prompt_tokens", 0), cur.get("started", now)
             pr = getattr(self.engine, "progress", None)   # (position, prompt tokens); a reused prefix counts as read
-            done = f"{pr[0]}/{pr[1]}" if pr and pr[1] else f"{s.get('prompt_tokens', 0)}"   # as read
+            done = f"{pr[0]}/{pr[1]}" if pr and pr[1] else f"{prompt_tokens}"   # as read
             # the engine's average over the tokens it read for this request (a reused prefix is not in it)
             pp = getattr(self.engine, "prefill_tok_s_mean", None) if pr and pr[1] else None
             speed = f" {pp:.0f}t/s" if pp and pp > 0 else ""
-            with self.status_lock:
-                slot = self._slot_of(st if st is not None else self.status)
-            print(f"[server] {slot_tag(slot)} read  pp={done}{speed} {now - s.get('started', now):.0f}s", flush=True)
+            print(f"[server] {slot_tag(slot)} read  pp={done}{speed} {now - started:.0f}s", flush=True)
         else:
             with self.live_lock:
                 due = now - self.live_at >= LIVE_EVERY_S
