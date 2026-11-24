@@ -539,10 +539,16 @@ void test_attention() {
         std::snprintf(tag, sizeof tag, "attention (%s%s)", window ? "window ring" : "full, 3k keys", kv_tag(kv));
         report(tag, got, ref, 2e-3);
         const uint64_t hash = print_hash("output", bytes_of(got));
-        // Frozen outputs from the FP16/FP8 kernels on the fixed attention fixture.
+        // Frozen outputs from the FP16/FP8 kernels on the fixed attention fixture. Below 9.0 (the Ada port) the full
+        // attention's tensor cores sum to other bits: the values measured there (against the reference above, the same
+        // on every run and under any launch bound); the window ring's split kernel keeps its bits.
         static constexpr uint64_t kBaseHashes[] = {0x37a69c7be6281e30ull, 0x59167d639fa4a77bull, 0x3460547e2a0576d1ull};
+        static constexpr uint64_t kBaseHashesAda[] = {0x37a69c7be6281e30ull, 0xf723c2562df7adeeull, 0x07d15d9e2aa02b99ull};
+        int cc_dev = 0, cc_major = 0;
+        cudaGetDevice(&cc_dev);
+        cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, cc_dev);
         if (mode < 3) {
-            const bool baseline = hash == kBaseHashes[mode];
+            const bool baseline = hash == (cc_major >= 9 ? kBaseHashes : kBaseHashesAda)[mode];
             std::printf("  previous FP16/FP8 baseline %s\n", baseline ? "matches" : "FAIL");
             failures += !baseline;
         }

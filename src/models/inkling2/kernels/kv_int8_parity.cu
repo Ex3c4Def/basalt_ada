@@ -666,6 +666,12 @@ static bool check_decode_graph(bool reduced) {
               upload_cache(&dv, vp) &&
               alloc(&scratch, ink::attention_decode_scratch(rows, cap)) &&
               check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "graph stream");
+    // Below compute capability 9.0 there is no griddepcontrol: the chain's programmatic launches go out plain, so the
+    // captured graph holds none and only its bits are checked.
+    int dev = 0, major = 0;
+    ok = ok && check_cuda(cudaGetDevice(&dev), "graph device") &&
+         check_cuda(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev), "graph device major");
+    const bool pdl_device = major >= 9;
     bool pass = true;
     for (const Shape& shape : shapes) {
         if (!ok) break;
@@ -737,7 +743,7 @@ static bool check_decode_graph(bool reduced) {
         std::printf("kv MMA graph: depth=%d T=%d replays=%d prime_span=%d identical=%d bound=%lld fewest=%lld finite=%d "
                     "pdl_launches=%ld\n", shape.depth, rows, replays, prime_span, identical, (long long) bucket,
                     (long long) fewest, finite, pdl_launches);
-        pass &= identical && finite && pdl_launches > 0;
+        pass &= identical && finite && (pdl_launches > 0 || !pdl_device);
     }
     if (stream) cudaStreamDestroy(stream);
     for (void* p : {(void*) dy, (void*) dtaps, (void*) dqs, (void*) drs, (void*) dkr, (void*) dvr, (void*) dtable, (void*) dq,

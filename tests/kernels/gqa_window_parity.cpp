@@ -192,7 +192,12 @@ int main(int argc, char** argv) {
     std::printf("gqa_window_attn: a deep window's rows bitwise their one-row windows: %s (%d of %d differ)\n",
                 place_diff || !placed ? "NO" : "yes", place_diff, placed);
     if (place_diff || !placed) ++fails;
-    const unsigned long long frozen = 0x966f4088b1f5f753ull;   // the one-tile kernel's
+    // the one-tile kernel's; below 9.0 (the Ada port) its tensor cores sum to other bits, those of the one-tile kernel
+    // there, which the two-tile staging leaves as they are
+    int cc_dev = 0, cc_major = 0;
+    cudaGetDevice(&cc_dev);
+    cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, cc_dev);
+    const unsigned long long frozen = cc_major >= 9 ? 0x966f4088b1f5f753ull : 0xea4ef8b981d45552ull;
     std::printf("gqa_window_attn hash: %016llx (bits against the frozen hash: %s)\n", hash, hash == frozen ? "identical" : "DIFFERENT");
     if (hash != frozen) ++fails;
     cudaFree(full.dk); cudaFree(full.dv); cudaFree(ring.dk); cudaFree(ring.dv); cudaFree(dscr); cudaFree(dwide);
