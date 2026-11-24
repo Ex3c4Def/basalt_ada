@@ -196,20 +196,11 @@ the fallback so the trap is never launched.
   `bf16_rows_dot` itself passes. The thresholds were left as they are.
 
 ## Upstream's own Ada peer and the rest of 0.4.1 (merged 2026-11-18)
-- Upstream added a narrower Ada mode (ba7d5d72, #343): with `-DPEER_ADA=ON` a list of peer-tier files also compiles for
-  sm_89, so an Ada card can be an expert-tier second card beside an sm_120 main card; the main card stays sm_120 and
-  DeepSeek refuses an older second card. Here every kernel has an 8.9 form and an Ada card can be the main card, so:
-  - `PEER_ADA=ON` adds 89 to `CMAKE_CUDA_ARCHITECTURES` (the `"120;89"` build); upstream's per-file list is gone. A
-    per-file build would hold only those files' 8.9 code, and the start refuses a card whose code the build lacks
-    (`build_archs.hpp`).
-  - gpu_select keeps upstream's `gpu_main_supported` / `gpu_peer_supported`, both 12.0 or 8.9; `gpu_select_test`'s Ada
-    case expects an Ada card as main or second card, and auto makes the card with the most bandwidth main.
-  - DeepSeek refuses a second card that is neither 12.0 nor 8.9 (its `ds41_*` tests pass on 8.9).
-  - Kernel guards: gdn_window.cu keeps the fork's `REC_NO_CLUSTER` trap stubs (they also cover an 89-only build's host
-    pass, where `__cluster_dims__` must not appear) instead of upstream's `DM_REC_NO_CLUSTERS`; gu2.cuh and
-    mmq_common.cuh take upstream's text (`pdl_launch_dependents`, the same griddepcontrol on 12.0, nothing below 9.0);
-    dec_moe.cuh's TMA kernel is compiled out below 9.0 by upstream's guard (the fork's `DM_SM90_ONLY` inside it stays).
-  - docs/configuration/gpus.md ("An Ada (sm_89) card") and docs/platforms.md say what this fork does.
+- Upstream added a narrower Ada mode (ba7d5d72, #343: `-DPEER_ADA=ON` compiled a list of peer-tier files for sm_89).
+  Here `PEER_ADA=ON` adds 89 to `CMAKE_CUDA_ARCHITECTURES` instead (the start refuses a card whose code the build lacks,
+  `build_archs.hpp`). gdn_window.cu keeps the fork's `REC_NO_CLUSTER` stubs (they also cover an 89-only build's host
+  pass); gu2.cuh and mmq_common.cuh take upstream's `pdl_launch_dependents` (nothing below 9.0); dec_moe.cuh's TMA kernel
+  is compiled out below 9.0 by upstream's guard.
 - The rest of upstream's 79 commits add no instruction 8.9 lacks: the new fp16 KV prompt attention is f16 mma m16n8k16
   and ldmatrix, the GQA decode's next-chunk fetch plain loads, the 27B's layer split and `--kv-resident` host code and
   flag kernels. The FP8 GEMM's per-device shared-memory opt-in sits beside the fork's `gemm_ada`, which already had one.
@@ -222,11 +213,9 @@ the fallback so the trap is never launched.
 - sm_120 code: in the 21 files the fork changes, every upstream kernel's SASS equals upstream's, apart from two kernels
   in verify_kernels.cu whose constant-bank address load reads offset 8 instead of 0 (the fork's `g_l2_ahead_sink` comes
   first in the module's address table; the instructions are the same).
-- Speed against fork_4090 (2 rotated pairs, engine_bench community, int8 KV, 450 W, DDR5-4800): decode_tps 197.4 against
-  197.9 (-0.2 %), prefill 16K +1.8 %, 64K -3.6 %. The 64K loss is where the adaptive swaps leave the experts, not the
-  prefill code: alone (basalt-bench -p 65536, 4 pairs) 6131 against 6103 t/s, and with `--adapt-swaps 0` the same text
-  in both builds and 6260 against 6264. With swaps on, upstream's clock-free lookup-or-MTP choice varies the sampled
-  prose (1093 to 1200 tokens), so the experts sit differently before the 64K request.
+- Speed (2 rotated pairs, engine_bench community, int8 KV, 450 W, DDR5-4800): decode_tps 197.4 against 197.9, prefill
+  16K +1.8 %, 64K -3.6 %: where the adaptive swaps leave the experts after the varying sampled prose, not the prefill code
+  (alone 6131 against 6103 t/s; with `--adapt-swaps 0` the same text and 6260 against 6264).
 
 ## Upstream 0.5.0: Hy4-flash (merged 2026-11-20)
 - Hy4-flash and the code it shares with DeepSeek build for 8.9 as they are (f16 mma with ldmatrix and cp.async, the e4m3
@@ -235,17 +224,10 @@ the fallback so the trap is never launched.
   identical, SASS of 33 files as upstream's, A/B a tie (202.2 against 203.0, every run `ram-experts=59.5GB`).
 
 ## PCIe share of solo decode windows (experiment, 2026-11-20)
-- A solo window (one conversation decoding) sends no routed expert over PCIe; only batch windows stage a share of each
-  layer's CPU misses. `--exp solo_stage=1` stages in solo windows too, `stage_frac=F` takes floor(misses * F) (the
-  removed `--pcie-frac` rule, Strata's), `stage_min=N` nothing below N misses
-  ([experiment keys](docs/configuration/diagnostics.md)). Off it is the old path: the 8.9 route kernels' staged
-  instances are taken only with the switch.
-- NVFP4, 450 W, int8 KV, 8 sampled seeds, per-seed median against off, conv / prose / struct: 0.1 -1.5 / -2.0 / -1.0 %,
-  0.2 +0.8 / -1.1 / +0.7 %, 0.3 -2.9 / -1.7 / +2.2 %, 0.35 with `stage_min=6` +0.2 / -2.0 / +1.7 %, 0.5 -13.7 / -9.2 %.
-  No share wins: only wide windows (struct) gain, and the stage kernel, launch and join cost 0.2-0.5 ms a pass.
-- Staging changes the text (the CPU pool's rows and CUDA0's round differently), so retest over seeds:
-  `basalt-bench -t conv,struct,prose --seed N -o json -- --kv int8 --resident-experts --exp solo_stage=1,stage_frac=F`
-  against the same line without `--exp`.
+- `--exp solo_stage=1` stages a share of each layer's CPU misses over PCIe in solo windows too (`stage_frac=F`,
+  `stage_min=N`; [experiment keys](docs/configuration/diagnostics.md)); off is the old path. NVFP4, 450 W, int8 KV, 8
+  seeds: no share wins (0.1 to 0.35: conv / prose -2.9 to +0.8 %, struct up to +2.2 %; 0.5: -13.7 / -9.2 %); the stage
+  kernel, launch and join cost 0.2-0.5 ms a pass. Staging changes the text, so retest over seeds.
 
 ## Upstream 0.5.0+58: the shared routing flags (merged 2026-11-20)
 - Nothing to port (no sm_90+ feature or capability check); upstream's FP4-Local reader (#444) replaces the fork's
@@ -291,7 +273,22 @@ the fallback so the trap is never launched.
   97.83 %, DQ8 0.00304 / 97.81 % / 7.0737, int8 0.00343 / 97.47 % / 7.0788. int8 reads 288 against 512 MiB of cache a
   token at 16K and fits 1.68x the context; a short-context window costs the same (DQ8), so conv / struct / prose follow
   int8's other texts. DQ8 reads prompts 2 % faster here (upstream: MX8 5 %; likely 8.9's MXFP8 on f16 mma). Just above
-  each context limit about 35 MiB refuses to start instead of moving experts to RAM (upstream #542, open PR #643).
+  each context limit about 35 MiB refused to start instead of moving experts to RAM (#542; fixed by #643, below).
+
+## Upstream 0.5.7+39: gpu-mode for several cards, Inkling's tensor-core attention (merged 2026-11-24)
+- `gpu-mode` (peer, split) and `gpu-share` replace each model's multi-card logic; upstream takes an sm_89 card only as a
+  Flash-Next peer (`-DPEER_ADA=ON`), here every card may be sm_120 or sm_89 in every mode (gpu_select.cpp).
+- Inkling's tensor-core attention (#626, #606) is f16 mma and ldmatrix, sized by the card's opt-in limits; the cluster
+  attention's `cluster_device()`, `fp4_cores()` and `side_reads` are kept. No new arch guard, bulk copy or 120a library.
+- Tests frozen on Blackwell take 8.9 values (ad46f9ef): the INT8 KV graph's PDL launches, `gqa_window_parity` (the
+  one-tile kernel's own 8.9 bits) and Inkling's full-attention hashes. `prefill_mmq_mxfp4_test` (new) fails IQ2_XS /
+  IQ2_S gate/up (2.96e-4 against 1e-4) the same at every planning SM count: not 8.9's.
+- CPU 111/111, GPU the 4 known fails; Flash-Next output identical (fp16, int8 KV); sm_120 SASS of 35 files as upstream's.
+  A/B 2 pairs, `ram-experts=59.5GB`, same text: decode_tps 200.0 against 203.8, conv / struct / prose +3.0 / +3.1 /
+  -3.6 % (prose lower in both pairs, cause not found), prefill a tie.
+- Inkling (#579 changes its bits by design): gate MX8 0.00296 / 97.73 %, DQ8 0.00296 / 97.73 %, int8 0.00343 / 97.45
+  and 0.00345 / 97.40 %; per-window costs level or lower, MX8 struct -6.6 % from another greedy text. With #643 every
+  expert stays on the card up to MX8 80,918 / 135,718, DQ8 77,500 / 130,129 (fp16 / int8); above, experts move to RAM.
 
 ## When a new build fails on the card
 An illegal-instruction or launch failure means a `__trap()` stub was launched: rerun with `CUDA_LAUNCH_BLOCKING=1`
