@@ -284,8 +284,8 @@ the fallback so the trap is never launched.
   one-tile kernel's own 8.9 bits) and Inkling's full-attention hashes. `prefill_mmq_mxfp4_test` (new) fails IQ2_XS /
   IQ2_S gate/up (2.96e-4 against 1e-4) the same at every planning SM count: not 8.9's.
 - CPU 111/111, GPU the 4 known fails; Flash-Next output identical (fp16, int8 KV); sm_120 SASS of 35 files as upstream's.
-  A/B 2 pairs, `ram-experts=59.5GB`, same text: decode_tps 200.0 against 203.8, conv / struct / prose +3.0 / +3.1 /
-  -3.6 % (prose lower in both pairs, cause not found), prefill a tie.
+  A/B 4 pairs, `ram-experts=59.5GB`, same text: decode_tps 200.2 against 200.1, conv / struct / prose +0.3 / -0.1 /
+  -0.4 %, prefill a tie (prose read -3.6 % in the first 2 pairs, +3.1 % in the next 2: a fixture swings ~4 % a run).
 - Inkling (#579 changes its bits by design): gate MX8 0.00296 / 97.73 %, DQ8 0.00296 / 97.73 %, int8 0.00343 / 97.45
   and 0.00345 / 97.40 %; per-window costs level or lower, MX8 struct -6.6 % from another greedy text. With #643 every
   expert stays on the card up to MX8 80,918 / 135,718, DQ8 77,500 / 130,129 (fp16 / int8); above, experts move to RAM.
