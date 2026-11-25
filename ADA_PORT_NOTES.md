@@ -141,15 +141,11 @@ the fallback so the trap is never launched.
   `grammar_batch_test` (`--parallel 4`) pass; vision `dynamic`, the sidecar on GPU 0 and on the CPU each read the wordmark
   in assets/basalt-lockup-light.png as "Basalt" (1.1 / 1.3 / 4.4 s); the router swaps two models both ways (about 25 s a
   swap). Greedy and sampled output with swaps off is identical to fork_4090 at cab6afa3.
-- Fixed on the way, both not Ada-specific: the sidecar kept the image open until after its OK line, so the server's
-  delete failed on Windows (WinError 32) and every sidecar image request was dropped; and the model-pack ctest entries were
-  never registered, because python3 was looked up after them.
-- Left as they are, Windows only: `file_expert_repin_test` assumes a registered copy's device alias is its host address
-  (true under Linux's unified addressing), and `iq_avx512_test`'s rows differ from its frozen hashes under MSVC on Zen 5
-  (max rel error against double 4e-6).
+- Fixed on the way (not Ada-specific): the sidecar kept an image open past its OK line (WinError 32 on Windows), and
+  the model-pack ctest entries were never registered. Left as they are, Windows only: `file_expert_repin_test` (Linux's
+  unified addressing) and `iq_avx512_test`'s frozen hashes under MSVC on Zen 5 (max rel error against double 4e-6).
 - sm_120-only tests skip below their compute capability: `hc_fused_parity`, `prefill_fp4_test`, `mid_chain_hold*`,
-  `qsa_mid_parity`. The MoE experts' FP4 kernels (`src/prefill/moe_fp4.cu`, library `prefill_fp4`) are always built for
-  `120a-real` and never launched on 8.9. The server does not parse gpu_select.cpp's error strings ("not sm_120 or sm_89").
+  `qsa_mid_parity`. moe_fp4.cu (library `prefill_fp4`) builds for the Blackwell "a" target alone, never run on 8.9.
 
 ## The dense stack (Qwen3.8-27B) on 8.9 (upstream 0.4.0)
 - No 27B pack has been run (none downloaded; `qwen35_checkpoint_round_trip` skips without one). The pack takes 16.0 GiB
@@ -235,14 +231,11 @@ the fallback so the trap is never launched.
 
 ## Upstream 0.5.5: Inkling 2 Mini (merged 2026-11-23)
 - Inkling 2 (src/models/inkling2) checks no compute capability. On 8.9 its fused window attention (a cluster of eight
-  blocks) compiles out and traps (`INK_NO_CLUSTER`); `attention_window` takes the split and the combine: upstream's own
-  path for longer windows, the same bits. Its prompt NVFP4 experts take MMQ below 12.x (`fp4_cores()`; moe_fp4 is
-  sm_120a only). The bulk L2 prefetches in its glue and ops and in Hy4-flash's ops run a line at a time below 9.0.
+  blocks) traps (`INK_NO_CLUSTER`) and `attention_window` takes upstream's split and combine (the same bits); its prompt
+  NVFP4 experts take MMQ below 12.x (`fp4_cores()`); its bulk L2 prefetches run a line at a time below 9.0.
 - The drafter's `head_final_kernel` read the pick back from the restrict-qualified `*prev` that thread 0 stored; the
-  sm_89 compiler hoists that load above the barrier (sm_120's does not), so warps copied the previous draft's w1 row.
-  Below 9.0 the pick comes from shared memory; `inkling2_dspark_parity` checks the row.
-- 450 W, DDR5-4800: CPU 100/100, GPU the 3 known fails; Flash-Next output identical (fp16 and int8 KV); sm_120 SASS
-  of 31 files as upstream's. A/B, 2 rotated pairs: decode_tps 201.2 against 202.3 (-0.5 %, one slower run).
+  sm_89 compiler hoists that load above the barrier (sm_120's does not). Below 9.0 the pick comes from shared memory.
+- CPU 100/100, GPU the 3 known fails; output identical; SASS of 31 files as upstream's; A/B -0.5 % (one slow run).
 
 ## Upstream 0.5.6+32: parallel slots, Inkling's CPU experts and MX8 pack (merged 2026-11-23)
 - Inkling 2's two new prompt GEMMs (#575) were built for sm_120a alone: every Inkling prompt stopped at "no kernel
@@ -269,26 +262,37 @@ the fallback so the trap is never launched.
   | DQ8 fp16 | 0.00298 |   97.70 | 7.0733 |  228 |    450 |   186 | 8,778 | 7,587 |   7.17 |  81,158 |
   | DQ8 int8 | 0.00346 |   97.47 | 7.0746 |  222 |    479 |   186 | 8,739 | 7,442 |   6.87 | 136,085 |
 
-- A 5090 (400 W, MX8): conv 347, struct 628, prose 296, 16K 15,820; gate at T=3 (base 7.0644) MX8 0.00297 /
-  97.83 %, DQ8 0.00304 / 97.81 % / 7.0737, int8 0.00343 / 97.47 % / 7.0788. int8 reads 288 against 512 MiB of cache a
-  token at 16K and fits 1.68x the context; a short-context window costs the same (DQ8), so conv / struct / prose follow
-  int8's other texts. DQ8 reads prompts 2 % faster here (upstream: MX8 5 %; likely 8.9's MXFP8 on f16 mma). Just above
-  each context limit about 35 MiB refused to start instead of moving experts to RAM (#542; fixed by #643, below).
+- A 5090 (400 W, MX8): conv 347, struct 628, prose 296, 16K 15,820. int8 reads 288 against 512 MiB of cache a token at
+  16K and fits 1.68x the context. DQ8 reads prompts 2 % faster here (upstream: MX8 5 %; likely 8.9's MXFP8 on f16 mma).
+  Just above each context limit ~35 MiB refused to start instead of moving experts to RAM (#542; fixed by #643).
 
 ## Upstream 0.5.7+39: gpu-mode for several cards, Inkling's tensor-core attention (merged 2026-11-24)
-- `gpu-mode` (peer, split) and `gpu-share` replace each model's multi-card logic; upstream takes an sm_89 card only as a
-  Flash-Next peer (`-DPEER_ADA=ON`), here every card may be sm_120 or sm_89 in every mode (gpu_select.cpp).
-- Inkling's tensor-core attention (#626, #606) is f16 mma and ldmatrix, sized by the card's opt-in limits; the cluster
-  attention's `cluster_device()`, `fp4_cores()` and `side_reads` are kept. No new arch guard, bulk copy or 120a library.
-- Tests frozen on Blackwell take 8.9 values (ad46f9ef): the INT8 KV graph's PDL launches, `gqa_window_parity` (the
-  one-tile kernel's own 8.9 bits) and Inkling's full-attention hashes. `prefill_mmq_mxfp4_test` (new) fails IQ2_XS /
-  IQ2_S gate/up (2.96e-4 against 1e-4) the same at every planning SM count: not 8.9's.
-- CPU 111/111, GPU the 4 known fails; Flash-Next output identical (fp16, int8 KV); sm_120 SASS of 35 files as upstream's.
-  A/B 4 pairs, `ram-experts=59.5GB`, same text: decode_tps 200.2 against 200.1, conv / struct / prose +0.3 / -0.1 /
-  -0.4 %, prefill a tie (prose read -3.6 % in the first 2 pairs, +3.1 % in the next 2: a fixture swings ~4 % a run).
-- Inkling (#579 changes its bits by design): gate MX8 0.00296 / 97.73 %, DQ8 0.00296 / 97.73 %, int8 0.00343 / 97.45
-  and 0.00345 / 97.40 %; per-window costs level or lower, MX8 struct -6.6 % from another greedy text. With #643 every
-  expert stays on the card up to MX8 80,918 / 135,718, DQ8 77,500 / 130,129 (fp16 / int8); above, experts move to RAM.
+- `gpu-mode` (peer, split) and `gpu-share` replace each model's multi-card logic; here every card may be sm_120 or sm_89
+  in every mode (upstream: sm_89 only as a Flash-Next peer). Inkling's tensor-core attention (#626, #606) is f16 mma and
+  ldmatrix within the card's opt-in limits. Three tests frozen on Blackwell take 8.9 values (ad46f9ef);
+  `prefill_mmq_mxfp4_test` (new) fails IQ2_XS / IQ2_S gate/up alike at every planning SM count: not 8.9's.
+- CPU 111/111, GPU the 4 known fails; output identical; SASS of 35 files as upstream's. A/B 4 pairs: decode_tps 200.2
+  against 200.1 (prose -3.6 % in 2 pairs, +3.1 % in 2 more: a fixture swings ~4 % a run).
+- Inkling (#579 changes its bits): gate MX8 / DQ8 0.00296 / 97.73 %, int8 0.00343 / 97.45 and 0.00345 / 97.40 %; MX8
+  struct -6.6 % from another greedy text; with #643 all experts stay on the card up to MX8 80,918 / 135,718, DQ8
+  77,500 / 130,129 (fp16 / int8).
+
+## Upstream 0.5.7+79: Inkling's 16-row windows, a 128x128 Q8 GEMM, Arm64 and 12.1 (merged 2026-11-25)
+- Upstream's build takes one compute capability, 12.0 or 12.1 (#450, cmake/target_arch.cmake); here one Blackwell one
+  and 89 ("120;89", "121;89", "89"; "120;121" is refused), and device.cu / gpu_select.cpp take cuda_cc_is_ours() or 8.9.
+- #657's 128x128 TMA Q8 GEMM: below 9.0 `gemm_ada_kernel` is a template with a 64x64 and a 128x128 instance (16 warps,
+  70 KiB, one CTA an SM) on upstream's tile rule; `q8_gemm_test` replays a 1601 x 8190 x 704 case bit for bit.
+  `--bench`, 3 runs: -3.8 / -2.4 % at 4096 tokens (Inkling's chunk), +2.6 % at 2048.
+- #652's batched drafter head read its pick as 0.5.5's solo head did (the load hoisted above the barrier on 8.9): the
+  same fix (91ea05ad). #673's tensor-core window ring sums to other bits here; its hash takes the 8.9 value.
+- CPU 112/112, GPU the 5 known fails; Flash-Next output identical (fp16, int8 KV); sm_120 SASS of 42 files as upstream's.
+  A/B 4 pairs, `ram-experts=59.5GB`: decode_tps 197.7 against 192.5, the last 2 pairs a tie (195.3 / 195.5); the two
+  runs during which another process took 10 GiB read lowest.
+- Inkling MX8: gate level or lower (fp16 MX8 0.00286 / 97.79 %, DQ8 0.00287 / 97.75 %; int8 as before); 16K prompt
+  +2.5 %; per-width verify costs level (1-2 tokens +1-2 %, 5-8 tokens -2-3 %); conv -3.3 % over 5 seeds (acceptance
+  ~2 points lower on 4), prose level, struct -12 % on a new greedy text (from token 155); `--suffix-draft 0` (#674's
+  continuation off) the same. The 16-row windows' buffers lower the all-on-card context to MX8 80,020 / 134,265, DQ8
+  76,620 / 128,678 (fp16 / int8).
 
 ## When a new build fails on the card
 An illegal-instruction or launch failure means a `__trap()` stub was launched: rerun with `CUDA_LAUNCH_BLOCKING=1`
