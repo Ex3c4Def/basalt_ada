@@ -1018,7 +1018,13 @@ __global__ void __launch_bounds__(512) head_final_batch_kernel(DsHead h, const Q
     __syncthreads();
     px::pick_block<false>(f, n, n_tiles, nullptr, part, prev_b, conf_b + step_i);
     __syncthreads();
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+    // as in head_final_kernel: the pick as pick_block left it in shared memory (below 9.0 the compiler may load the
+    // restrict-qualified *prev_b before the barrier, ahead of thread 0's store)
+    const int pick = f.cnt < 0x7fffffff ? f.cnt : 0;
+#else
     const int pick = *prev_b;
+#endif
     if (tid == 0) ids_b[step_i] = pick;
     for (int c = warp; c < n; c += 16)
         if (f.list[c] == pick) reinterpret_cast<uint4*>(w1_b)[lane] = wr[c][lane];
