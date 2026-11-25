@@ -1,6 +1,8 @@
 // src/program/gpu_select.cpp - see gpu_select.hpp.
 #include "basalt/program/gpu_select.hpp"
 
+#include "basalt/core/cuda_cc.hpp"
+
 #include "basalt/log.hpp"
 #include "basalt/platform/dynlib.hpp"
 #include "basalt/platform/process.hpp"
@@ -167,12 +169,13 @@ std::string arch_name(const GpuCard& c) { return "sm_" + std::to_string(c.cc_maj
 
 }  // namespace
 
-// Every card runs the whole engine, on compute capability 12.0 or 8.9 (the Ada port: an 8.9 build compiles out what
-// needs 9.0 or FP4 tensor cores and the callers take plain kernels there), so a main card and the other cards follow
-// one rule in every mode. Whether this build holds device code for a card is checked at start (build_archs.hpp): an
-// Ada card beside a Blackwell one needs -DCMAKE_CUDA_ARCHITECTURES="120;89" (or -DPEER_ADA=ON, which adds 89).
+// Every card runs the whole engine, on this build's Blackwell compute capability or on 8.9 (the Ada port: an 8.9 build
+// compiles out what needs 9.0 or FP4 tensor cores and the callers take plain kernels there), so a main card and the
+// other cards follow one rule in every mode. Whether this build holds device code for a card is checked at start
+// (build_archs.hpp): an Ada card beside a Blackwell one needs -DCMAKE_CUDA_ARCHITECTURES="120;89" (or -DPEER_ADA=ON,
+// which adds 89).
 bool gpu_main_supported(const GpuCard& c) {
-    return c.cc_major == 0 || (c.cc_major == 12 && c.cc_minor == 0) || (c.cc_major == 8 && c.cc_minor == 9);
+    return c.cc_major == 0 || core::cuda_cc_is_ours(c.cc_major, c.cc_minor) || (c.cc_major == 8 && c.cc_minor == 9);
 }
 bool gpu_peer_supported(const GpuCard& c) { return gpu_main_supported(c); }
 
@@ -213,10 +216,10 @@ GpuChoice choose_gpus(const GpuSpec& spec, GpuMode mode, const std::string& shar
         c.cards.clear();
         return c;
     };
-    // the main card runs the model's own kernels: sm_120 or sm_89
+    // the main card runs the model's own kernels: this build's Blackwell capability or sm_89
     if (known && !gpu_main_supported(visible[(size_t) c.cards[0]]))
         return refuse("gpu " + shown + ": " + gpu_label(visible, c.cards[0]) + " is " + arch_name(visible[(size_t) c.cards[0]]) +
-                      "; the main card must be sm_120 or sm_89");
+                      "; the main card must be " + core::cuda_cc_name() + " or sm_89");
     // what the settings say about the number of cards
     const size_t count = c.cards.size();
     const std::string mode_text = gpu_mode_name(mode);
@@ -250,12 +253,12 @@ GpuChoice choose_gpus(const GpuSpec& spec, GpuMode mode, const std::string& shar
         for (double v : shares) sum += v;
         for (double v : shares) c.shares.push_back(v / sum);
     }
-    // the cards after the main one: sm_120 or sm_89 in every mode
+    // the cards after the main one: this build's Blackwell capability or sm_89 in every mode
     for (size_t idx = 1; known && idx < count; ++idx) {
         const GpuCard& g = visible[(size_t) c.cards[idx]];
         if (!gpu_peer_supported(g))
             return refuse("gpu-mode " + mode_text + ": " + gpu_label(visible, c.cards[idx]) + " is " + arch_name(g) +
-                          "; every card must be sm_120 or sm_89");
+                          "; every card must be " + core::cuda_cc_name() + " or sm_89");
     }
     return c;
 }

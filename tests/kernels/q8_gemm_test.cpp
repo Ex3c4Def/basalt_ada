@@ -119,7 +119,9 @@ struct GpuWeight {
     }
 };
 
-void test_case(std::mt19937& rng, int64_t ntok, int64_t rows, int64_t cols, bool add, int64_t ld_pad = 0) {
+// replay_only: a shape too large for the double reference, checked bit for bit against the replayed arithmetic alone
+void test_case(std::mt19937& rng, int64_t ntok, int64_t rows, int64_t cols, bool add, int64_t ld_pad = 0,
+               bool replay_only = false) {
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     std::vector<float> x((size_t) (ntok * cols));
     std::vector<float> wf((size_t) (rows * cols));
@@ -135,7 +137,7 @@ void test_case(std::mt19937& rng, int64_t ntok, int64_t rows, int64_t cols, bool
         for (float& v : base) v = dist(rng) * 3.0f;
     }
     std::vector<float> ref = base;
-    ref_q8_double(x, ntok, cols, wb, rows, ref, add);
+    if (!replay_only) ref_q8_double(x, ntok, cols, wb, rows, ref, add);
 
     GpuWeight gw;
     gw.init(wb, rows, cols);
@@ -164,7 +166,7 @@ void test_case(std::mt19937& rng, int64_t ntok, int64_t rows, int64_t cols, bool
 
     double max_abs = 0.0, max_ref = 0.0;
     for (int64_t t = 0; t < ntok; ++t) {
-        for (int64_t r = 0; r < rows; ++r) {
+        for (int64_t r = 0; r < rows && !replay_only; ++r) {
             const float g = got[(size_t) (t * ld + r)];
             const float e = ref[(size_t) (t * rows + r)];
             max_abs = std::max(max_abs, (double) std::fabs(g - e));
@@ -178,13 +180,14 @@ void test_case(std::mt19937& rng, int64_t ntok, int64_t rows, int64_t cols, bool
         }
     }
     const double rel = max_ref > 0.0 ? max_abs / max_ref : max_abs;
-    if (rel > 2e-5) {
+    if (!replay_only && rel > 2e-5) {
         std::printf("FAIL [%lldx%lldx%lld add=%d ld_pad=%lld]: max_abs=%.3e rel=%.3e\n", (long long) ntok,
                     (long long) rows, (long long) cols, (int) add, (long long) ld_pad, max_abs, rel);
         std::exit(1);
     }
-    std::printf("PASS [%4lld x %4lld x %4lld add=%d pad=%lld]: max_abs=%.2e rel=%.2e\n", (long long) ntok,
-                (long long) rows, (long long) cols, (int) add, (long long) ld_pad, max_abs, rel);
+    if (!replay_only)
+        std::printf("PASS [%4lld x %4lld x %4lld add=%d pad=%lld]: max_abs=%.2e rel=%.2e\n", (long long) ntok,
+                    (long long) rows, (long long) cols, (int) add, (long long) ld_pad, max_abs, rel);
 
     // The header's arithmetic replayed on the GPU's own codes and scales: per 32-value block the int32 dot, scaled by
     // the activation and weight scales and summed in fp32 in K order (fmaf), then the epilogue. Bit for bit, so any
@@ -325,14 +328,15 @@ void test_q8_planes_mmvq_parity(std::mt19937& rng) {
     ck(cudaStreamCreate(&st), "stream");
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     struct Sh { const char* name; int M, K; };
-    const Sh shs[] = {{"w.proj [8664x2304]", 8664, 2304}, {"w.out [2304x3072]", 2304, 3072}};
+    const Sh shs[] = {{"w.proj [8664x2304]", 8664, 2304}, {"w.out [2304x3072]", 2304, 3072}, {"lm_head [65536x2304]", 65536, 2304}};
+    constexpr int TMAX = 32;
     for (const auto& s : shs) {
         std::vector<float> wf((size_t) s.M * s.K);
         for (float& v : wf) v = dist(rng);
         std::vector<block_q8_0> wb;
         make_q8_0(wf, s.M, s.K, wb);
         const size_t bytes = wb.size() * sizeof(block_q8_0);
-        std::vector<float> hx((size_t) 8 * s.K);
+        std::vector<float> hx((size_t) TMAX * s.K);
         for (float& v : hx) v = dist(rng);
         void *draw = nullptr, *dpl = nullptr, *dxq = nullptr;
         float *dx = nullptr, *y0 = nullptr, *y1 = nullptr;
@@ -342,29 +346,44 @@ void test_q8_planes_mmvq_parity(std::mt19937& rng) {
         bk::wgemm::q8_planes(draw, s.M, s.K, dpl, st);
         ck(cudaMalloc(&dx, hx.size() * sizeof(float)), "dx");
         ck(cudaMemcpy(dx, hx.data(), hx.size() * sizeof(float), cudaMemcpyHostToDevice), "cpy dx");
-        ck(cudaMalloc(&dxq, bk::native_q8_1_bytes(s.K, 8)), "dxq");
-        bk::native_quantize_q8_1(dx, dxq, s.K, 8, st);
+        ck(cudaMalloc(&dxq, bk::native_q8_1_bytes(s.K, TMAX)), "dxq");
+        bk::native_quantize_q8_1(dx, dxq, s.K, TMAX, st);
         ck(cudaMalloc(&y0, (size_t) 8 * s.M * sizeof(float)), "y0");
-        ck(cudaMalloc(&y1, (size_t) 8 * s.M * sizeof(float)), "y1");
-        for (int T = 1; T <= 8; ++T) {
-            bk::native_q8_0_mmvq(draw, dxq, y0, s.K, s.M, T, st);
+        ck(cudaMalloc(&y1, (size_t) TMAX * s.M * sizeof(float)), "y1");
+        const size_t q81_col_bytes = bk::native_q8_1_bytes(s.K, 1);
+        std::vector<float> single_ref((size_t) TMAX * s.M);
+        for (int c = 0; c < TMAX; ++c) {
+            bk::native_q8_planes_mmvq(dpl, static_cast<const char*>(dxq) + (size_t) c * q81_col_bytes, y1 + (size_t) c * s.M, s.K, s.M, 1, st);
+        }
+        ck(cudaStreamSynchronize(st), "sync single ref");
+        ck(cudaMemcpy(single_ref.data(), y1, single_ref.size() * 4, cudaMemcpyDeviceToHost), "d2h single ref");
+        for (int T = 1; T <= TMAX; ++T) {
+            if (T > 8 && T != 9 && T != 15 && T != 16 && T != 17 && T != 24 && T != 25 && T != 31 && T != 32) continue;
             bk::native_q8_planes_mmvq(dpl, dxq, y1, s.K, s.M, T, st);
+            if (T <= 8) bk::native_q8_0_mmvq(draw, dxq, y0, s.K, s.M, T, st);
             ck(cudaStreamSynchronize(st), "sync mmvq");
-            std::vector<float> a((size_t) T * s.M), b((size_t) T * s.M);
-            ck(cudaMemcpy(a.data(), y0, a.size() * 4, cudaMemcpyDeviceToHost), "d2h a");
+            std::vector<float> b((size_t) T * s.M);
             ck(cudaMemcpy(b.data(), y1, b.size() * 4, cudaMemcpyDeviceToHost), "d2h b");
-            double max_abs = 0.0, max_ref = 0.0;
-            for (size_t i = 0; i < a.size(); ++i) {
-                max_abs = std::max(max_abs, std::abs((double) a[i] - (double) b[i]));
-                max_ref = std::max(max_ref, std::abs((double) a[i]));
-            }
-            const double rel = max_ref > 0.0 ? max_abs / max_ref : max_abs;
-            if (rel > 1e-5) {
-                std::printf("FAIL native_q8_planes_mmvq %s T=%d max_abs=%.3e rel=%.3e\n", s.name, T, max_abs, rel);
+            if (std::memcmp(single_ref.data(), b.data(), b.size() * sizeof(float)) != 0) {
+                std::printf("FAIL native_q8_planes_mmvq row-invariance %s T=%d (not bitwise identical to T=1)\n", s.name, T);
                 std::exit(1);
             }
+            if (T <= 8) {
+                std::vector<float> a((size_t) T * s.M);
+                ck(cudaMemcpy(a.data(), y0, a.size() * 4, cudaMemcpyDeviceToHost), "d2h a");
+                double max_abs = 0.0, max_ref = 0.0;
+                for (size_t i = 0; i < a.size(); ++i) {
+                    max_abs = std::max(max_abs, std::abs((double) a[i] - (double) b[i]));
+                    max_ref = std::max(max_ref, std::abs((double) a[i]));
+                }
+                const double rel = max_ref > 0.0 ? max_abs / max_ref : max_abs;
+                if (rel > 1e-5) {
+                    std::printf("FAIL native_q8_planes_mmvq %s T=%d max_abs=%.3e rel=%.3e\n", s.name, T, max_abs, rel);
+                    std::exit(1);
+                }
+            }
         }
-        std::printf("PASS native_q8_planes_mmvq %s T=1..8: matches native_q8_0_mmvq (rel <= 1e-5)\n", s.name);
+        std::printf("PASS native_q8_planes_mmvq %s T=1..32: bitwise row-invariant & matches native_q8_0_mmvq (rel <= 1e-5)\n", s.name);
         if (s.M == 8664) {
             bk::Q80Segments sg0, sg1;
             sg0.n = sg1.n = 3;
@@ -373,30 +392,52 @@ void test_q8_planes_mmvq_parity(std::mt19937& rng) {
             sg0.row0[2] = sg1.row0[2] = 7608; sg0.n_out[2] = sg1.n_out[2] = 1056;
             for (int k = 0; k < 3; ++k) sg0.x[k] = sg1.x[k] = dxq;
             sg0.y[0] = y0; sg0.y[1] = y0 + 8 * 6552; sg0.y[2] = y0 + 8 * 7608;
-            sg1.y[0] = y1; sg1.y[1] = y1 + 8 * 6552; sg1.y[2] = y1 + 8 * 7608;
-            for (int T = 1; T <= 8; ++T) {
-                bk::native_q8_0_mmvq_segments(draw, sg0, s.K, T, st);
+            sg1.y[0] = y1; sg1.y[1] = y1 + TMAX * 6552; sg1.y[2] = y1 + TMAX * 7608;
+            std::vector<float> seg_ref((size_t) TMAX * s.M);
+            for (int c = 0; c < TMAX; ++c) {
+                bk::Q80Segments sgc = sg1;
+                for (int k = 0; k < 3; ++k) sgc.x[k] = static_cast<const char*>(dxq) + (size_t) c * q81_col_bytes;
+                sgc.y[0] = y1 + (size_t) c * 6552;
+                sgc.y[1] = y1 + TMAX * 6552 + (size_t) c * 1056;
+                sgc.y[2] = y1 + TMAX * 7608 + (size_t) c * 1056;
+                bk::native_q8_planes_mmvq_segments(dpl, s.M, sgc, s.K, 1, st);
+            }
+            ck(cudaStreamSynchronize(st), "sync seg ref");
+            ck(cudaMemcpy(seg_ref.data(), y1, seg_ref.size() * 4, cudaMemcpyDeviceToHost), "d2h seg ref");
+            for (int T = 1; T <= TMAX; ++T) {
+                if (T > 8 && T != 9 && T != 15 && T != 16 && T != 17 && T != 24 && T != 25 && T != 31 && T != 32) continue;
+                if (T <= 8) bk::native_q8_0_mmvq_segments(draw, sg0, s.K, T, st);
                 bk::native_q8_planes_mmvq_segments(dpl, s.M, sg1, s.K, T, st);
                 ck(cudaStreamSynchronize(st), "sync seg");
-                std::vector<float> a((size_t) 8 * s.M), b((size_t) 8 * s.M);
-                ck(cudaMemcpy(a.data(), y0, a.size() * 4, cudaMemcpyDeviceToHost), "d2h sa");
+                std::vector<float> b((size_t) TMAX * s.M);
                 ck(cudaMemcpy(b.data(), y1, b.size() * 4, cudaMemcpyDeviceToHost), "d2h sb");
-                auto check_range = [&](size_t off, size_t cnt, const char* tag) {
-                    double ma = 0.0, mr = 0.0;
-                    for (size_t i = 0; i < cnt; ++i) {
-                        ma = std::max(ma, std::abs((double) a[off + i] - (double) b[off + i]));
-                        mr = std::max(mr, std::abs((double) a[off + i]));
-                    }
-                    if ((mr > 0.0 ? ma / mr : ma) > 1e-5) {
-                        std::printf("FAIL seg %s T=%d rel=%.3e\n", tag, T, mr > 0.0 ? ma / mr : ma);
+                std::vector<float> a;
+                if (T <= 8) {
+                    a.resize((size_t) 8 * s.M);
+                    ck(cudaMemcpy(a.data(), y0, a.size() * 4, cudaMemcpyDeviceToHost), "d2h sa");
+                }
+                auto check_range = [&](size_t off_ref, size_t off_a, size_t cnt, const char* tag) {
+                    if (std::memcmp(seg_ref.data() + off_ref, b.data() + off_ref, cnt * sizeof(float)) != 0) {
+                        std::printf("FAIL seg row-invariance %s T=%d (not bitwise identical to T=1)\n", tag, T);
                         std::exit(1);
                     }
+                    if (T <= 8) {
+                        double ma = 0.0, mr = 0.0;
+                        for (size_t i = 0; i < cnt; ++i) {
+                            ma = std::max(ma, std::abs((double) a[off_a + i] - (double) b[off_ref + i]));
+                            mr = std::max(mr, std::abs((double) a[off_a + i]));
+                        }
+                        if ((mr > 0.0 ? ma / mr : ma) > 1e-5) {
+                            std::printf("FAIL seg %s T=%d rel=%.3e\n", tag, T, mr > 0.0 ? ma / mr : ma);
+                            std::exit(1);
+                        }
+                    }
                 };
-                check_range(0, (size_t) T * 6552, "Q");
-                check_range(8 * 6552, (size_t) T * 1056, "K");
-                check_range(8 * 7608, (size_t) T * 1056, "V");
+                check_range(0, 0, (size_t) T * 6552, "Q");
+                check_range(TMAX * 6552, 8 * 6552, (size_t) T * 1056, "K");
+                check_range(TMAX * 7608, 8 * 7608, (size_t) T * 1056, "V");
             }
-            std::printf("PASS native_q8_planes_mmvq_segments [6552,1056,1056]x2304 T=1..8: matches (rel <= 1e-5)\n");
+            std::printf("PASS native_q8_planes_mmvq_segments [6552,1056,1056]x2304 T=1..32: bitwise row-invariant & matches (rel <= 1e-5)\n");
         }
         cudaFree(draw); cudaFree(dpl); cudaFree(dx); cudaFree(dxq); cudaFree(y0); cudaFree(y1);
     }
@@ -535,6 +576,8 @@ int main(int argc, char** argv) {
     test_case(rng, 130, 1056, 2304, false);
     test_case(rng, 130, 2304, 3072, true);
     test_case(rng, 257, 6552, 2304, false);
+    // the 128x128 tiles (at least 1024 tokens, 32 row tiles and 800 tiles): ragged token, row and K tails
+    test_case(rng, 1601, 8190, 704, true, 2, true);
     test_invariance_and_segmented(rng);
     test_q8_planes_mmvq_parity(rng);
     for (int i = 1; i < argc; ++i) {

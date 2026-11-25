@@ -60,7 +60,11 @@ the text model.
   from the start and the RAM experts are copied back while the card has room. Either way the copies leave the card's spare
   free: 1 GiB at the start and 512 MiB after a cache grow, or `--vram-reserve-mib N` for both (at least 128, 256 where the
   driver pages GPU memory); with the flag they also leave 256 MiB for what loads after them (kernels at their first launch,
-  the windows' graphs). The spare is where the copies stop, not a floor: a cache grow with no copy left to send back, or
+  the windows' graphs). The flag is a load-time promise, not just a runtime floor: the load sizes the sessions and the
+  spill so the card holds the asked reserve after loading — the fit check refuses a `--max-context` that cannot leave it
+  room, and a load that still leaves less than the asked reserve is refused with an error naming the knobs (lower
+  `--max-context` or `--spec`, or use a bigger card) — so a reserve that cannot be met is never silently served at a
+  smaller one. The spare is where the copies stop, not a floor: a cache grow with no copy left to send back, or
   another program, can take it. Placement counts the card's free memory itself: it reads it when the copies are first
   placed, at a VRAM resize and at a wake, and counts every map and release of the copies and the caches after that (what
   loads later comes out of the spare and the 256 MiB). A grow or a copy that cannot map what was counted (another
@@ -161,11 +165,12 @@ RTX 5060 Ti runs the 5090 alone (355, 642 and 306 tok/s); a split forced at 12 t
 
 Prompts of more than 16 tokens read in chunks of up to 4,096 rows on the tensor cores: the NVFP4 experts on the FP4 block-scaled
 tensor cores (each activation row as two FP4 terms, [precision](../precision/inkling2.md#where-each-stage-rounds)), the other
-products through MMQ. The drafter sees every chunk. With experts in RAM a chunk stages each spilled layer's experts on the card,
-each from its card copy while the spill still holds one and from RAM where the caches' growth sent it back; a chunk of at
-most 1,024 rows (a tool result, a short turn) stages only the experts its rows route to; a longer chunk copies a layer's
-experts on a second stream once the spilled visit before it has read the staging, under the kernels in between. At
-`--max-context 1048576 --kv fp8` on an RTX 5090, needles at 131K and 400K are
+products through MMQ. With experts in RAM the cut is 64 tokens: a shorter read, such as a turn's new tokens, runs as decode
+windows, because a chunk's fixed cost there is more than eight windows. The drafter sees every chunk. With experts in RAM a
+chunk stages each spilled layer's experts on the card, each from its card copy while the spill still holds one and from RAM
+where the caches' growth sent it back; a chunk of at most 1,024 rows (a tool result, a short turn) stages only the experts its
+rows route to; a longer chunk copies a layer's experts on a second stream once the spilled visit before it has read the
+staging, under the kernels in between. At `--max-context 1048576 --kv fp8` on an RTX 5090, needles at 131K and 400K are
 found; decode runs at 264 tok/s on a short chat, 173 at 131K and 108 at 400K (plain decoding), and a 400K prompt reads at about
 4,110 tok/s. Needles at 10, 50 and 90 % of 31,943 and 127,958-token prompts are found through the server
 (`--max-context 262144`). On an RTX 5090 at 400 W with every expert on the card, prompts of 2K, 16K, 32K and 128K tokens read at
@@ -206,7 +211,9 @@ checkerboard (8 x 8 squares of 204 and 153), as the model saw in training; the m
 - **Thinking:** the template writes an effort level into a system message: `reasoning_effort` `none` (0), `minimal` (0.1),
   `low` (0.2), `medium` (0.7), `high` (0.9, the template's default), `xhigh` and `max` (0.99), or a number from 1 to 100 as
   hundredths (at most 0.99). There is no hard switch: at `none` the model still writes a short thinking block (a few hundred
-  tokens), so leave room in `max_tokens`.
+  tokens), so leave room in `max_tokens`. As a practical floor, use 1,024 tokens for short answers and 2,048 when evaluating
+  answer quality; a 512-token cap can end with `length` before the answer is complete. If that happens, raise `max_tokens` or
+  set an explicit `reasoning_budget_tokens` / `answer-room` value; a reserved answer room helps but cannot guarantee a complete answer.
 - **Structured output:** under a JSON schema or `json_object` the model thinks first, as its effort asks, and the grammar
   holds only the answer block; the answer cannot end before its value is whole. At `none` it answers at once.
 - **Tools:** the model writes `<|content_invoke_tool_json|>{"name": ..., "args": {...}}`; several calls per turn are supported.

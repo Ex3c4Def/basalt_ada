@@ -1,9 +1,12 @@
 # basalt: a local inference engine for one NVIDIA GPU.
 cmake_minimum_required(VERSION 3.24)
+# The compute capability defaults by target architecture (120 on x86-64, 121 on Arm64), which is known only after
+# project(): cmake/target_arch.cmake sets it there when the caller named none.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures" FORCE)
+  set(_basalt_cuda_arch_default ON)
 endif()
 project(basalt VERSION 0.5.7 LANGUAGES C CXX CUDA)
+include(cmake/target_arch.cmake)
 add_compile_definitions(BASALT_VERSION="${PROJECT_VERSION}")
 
 set(CMAKE_CXX_STANDARD 20)
@@ -40,9 +43,9 @@ endfunction()
 # the CUDA language gives the .cu compile rules but not the imported targets, so `CUDA::cudart` is brought in
 # explicitly for the host-side programs that call the runtime themselves
 find_package(CUDAToolkit REQUIRED)
-# Two architectures: 120 (the full engine) and 89 (Ada, e.g. -DCMAKE_CUDA_ARCHITECTURES=89), where the kernels that
-# need thread-block clusters, bulk async copies or FP4 tensor cores are compiled out and their callers take the
-# plain kernels instead.
+# Two architectures: the Blackwell one (cmake/target_arch.cmake: 12.0 or 12.1, the full engine) and 89 (Ada, e.g.
+# -DCMAKE_CUDA_ARCHITECTURES=89), where the kernels that need thread-block clusters, bulk async copies or FP4 tensor
+# cores are compiled out and their callers take the plain kernels instead.
 if(PEER_ADA)
   set(_basalt_has_89 FALSE)
   foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
@@ -58,10 +61,7 @@ endif()
 set(_basalt_has_sm90 FALSE)
 foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
   string(REGEX REPLACE "[-a].*$" "" _base "${_a}")     # 120-real / 120a are still 120
-  if(NOT (_base STREQUAL "120" OR _base STREQUAL "89"))
-    message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}': basalt builds for compute capability 12.0 and 8.9 only")
-  endif()
-  if(_base STREQUAL "120")
+  if(NOT _base STREQUAL "89")
     set(_basalt_has_sm90 TRUE)
   endif()
 endforeach()
@@ -69,16 +69,16 @@ if(NOT _basalt_has_sm90)
   # Nothing in the build has thread-block clusters (gdn_window.cu drops __cluster_dims__ in every compile pass).
   add_compile_definitions($<$<COMPILE_LANGUAGE:CUDA>:BASALT_ARCH_BELOW_SM90=1>)
 endif()
-# The architectures of a target whose 12.0 code needs sm_120a's instructions (the block-scaled mma, the E2M1
-# conversions): 120a-real for a 120, 89-real for an 89, where the same files build their Ada kernels instead.  A 120-only
-# build gets 120a-real alone.
+# The architectures of a target whose Blackwell code needs the "a" instructions (the block-scaled mma, the E2M1
+# conversions): 120a-real (121a-real) for the Blackwell one, 89-real for an 89, where the same files build their Ada
+# kernels instead. A Blackwell-only build gets the "a" one alone; a target with no Ada form takes BASALT_CUDA_ARCH_A.
 set(BASALT_CUDA_ARCHS_A "")
 foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
   string(REGEX REPLACE "[-a].*$" "" _base "${_a}")
-  if(_base STREQUAL "120")
-    list(APPEND BASALT_CUDA_ARCHS_A 120a-real)
-  else()
+  if(_base STREQUAL "89")
     list(APPEND BASALT_CUDA_ARCHS_A 89-real)
+  else()
+    list(APPEND BASALT_CUDA_ARCHS_A ${_base}a-real)
   endif()
 endforeach()
 list(REMOVE_DUPLICATES BASALT_CUDA_ARCHS_A)
@@ -313,7 +313,7 @@ if(BUILD_TESTING)
   basalt_gpu_test(NAME inkling2_kv_int8_parity COMMAND inkling2_kv_int8_parity)
   add_executable(inkling2_dspark_parity src/models/inkling2/kernels/dspark_parity.cpp)
   target_include_directories(inkling2_dspark_parity PRIVATE ${_gpu_include_directories})
-  target_link_libraries(inkling2_dspark_parity PRIVATE inkling2_kernels ${_gpu_runtime_target})
+  target_link_libraries(inkling2_dspark_parity PRIVATE inkling2_kernels kernels ${_gpu_runtime_target})
   basalt_gpu_test(NAME inkling2_dspark_parity COMMAND inkling2_dspark_parity)
   add_executable(inkling2_prompt_parity src/models/inkling2/kernels/prompt_parity.cpp)
   target_include_directories(inkling2_prompt_parity PRIVATE ${_gpu_include_directories})
@@ -680,6 +680,10 @@ if(BUILD_TESTING)
   add_executable(conversation_cache_test tests/core/conversation_cache_test.cpp)
   target_include_directories(conversation_cache_test PRIVATE include)
   basalt_cpu_test(NAME conversation_cache_test COMMAND conversation_cache_test)
+  # the RAM copy's pack bound beside the adaptive swaps' free places (header-only sizing, no GPU, no file)
+  add_executable(resident_pack_room_test tests/core/resident_pack_room_test.cpp)
+  target_include_directories(resident_pack_room_test PRIVATE include)
+  basalt_cpu_test(NAME resident_pack_room_test COMMAND resident_pack_room_test)
   # conversation_memory.cpp asks the platform layer for the free RAM, so the probe comes along; it needs the system
   # allocator and the OS memory query, and nothing from the GPU runtime.
   add_executable(conversation_memory_test tests/core/conversation_memory_test.cpp src/core/conversation_memory.cpp)
@@ -942,6 +946,16 @@ if(BASALT_GRAMMAR_MODEL AND Python3_Interpreter_FOUND)
                    $<TARGET_FILE:basalt> ${BASALT_GRAMMAR_MODEL} ${BASALT_GRAMMAR_BATCH_ARGS})
   set_property(TEST grammar_batch_test APPEND PROPERTY LABELS gpu)
   set_tests_properties(grammar_batch_test PROPERTIES TIMEOUT 1500)
+endif()
+
+# speculative multi-slot batch identity (`--serve --batch 2/4/8 --spec 8` vs `--batch 1`, cold + warm replay;
+# configure with -DBASALT_BATCH_IDENTITY_MODEL=/path/to/model.basalt and optional -DBASALT_BATCH_IDENTITY_ARGS=...)
+if(BASALT_BATCH_IDENTITY_MODEL AND Python3_Interpreter_FOUND)
+  add_test(NAME batch_spec_identity_test
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/batch_spec_identity_test.py
+                   $<TARGET_FILE:basalt> ${BASALT_BATCH_IDENTITY_MODEL} ${BASALT_BATCH_IDENTITY_ARGS})
+  set_property(TEST batch_spec_identity_test APPEND PROPERTY LABELS gpu)
+  set_tests_properties(batch_spec_identity_test PROPERTIES TIMEOUT 1500)
 endif()
 
 # the route tail skip against a plain CPU rule: which entries it drops over random windows, tables and ranks at each MoE
@@ -1826,6 +1840,11 @@ set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIO
 # the router lookahead's AVX1 dot (called behind cpu_avx1_ok)
 set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx1_flags}")
 target_link_libraries(kernels_cpu PUBLIC ggml_quants)
+if(BASALT_ARM64)
+  basalt_arm64_kernels_cpu()   # the NEON kernels in place of the x86 ones (cmake/arm64.cmake)
+  # deferred to the end of this file, when every target and test exists: the x86 kernels' own tests are not built
+  cmake_language(DEFER CALL basalt_arm64_disable avx_bench iq_avx2_test iq_avx512_test nvfp4_cpu_rows_test router_dot_parity)
+endif()
 if(BUILD_TESTING)
   # the router lookahead's dot on each rung this CPU has (AVX2, the older CPUs' AVX1) against a double reference
   add_executable(router_dot_parity tests/kernels/cpu/router_dot_parity.cpp)
@@ -1893,13 +1912,13 @@ set_target_properties(window_gemm PROPERTIES CUDA_ARCHITECTURES "${BASALT_CUDA_A
 target_include_directories(window_gemm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(window_gemm PUBLIC core ${_gpu_runtime_target})
 # The dense W4A4 product has an Ada kernel (e4m3 mma on the codes, a scale group at a time), so it builds for every architecture; the MoE
-# experts' FP4 kernels are sm_120a's alone (Flash-Next reads its prompt experts through MMQ on 8.9).
+# experts' FP4 kernels are the Blackwell "a" target's alone (Flash-Next reads its prompt experts through MMQ on 8.9).
 add_library(prefill_fp4_dense STATIC src/prefill/fp4_dense.cu)
 set_target_properties(prefill_fp4_dense PROPERTIES CUDA_ARCHITECTURES "${BASALT_CUDA_ARCHS_A}")
 target_include_directories(prefill_fp4_dense PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(prefill_fp4_dense PUBLIC ${_gpu_runtime_target})
 add_library(prefill_fp4 STATIC src/prefill/moe_fp4.cu)
-set_target_properties(prefill_fp4 PROPERTIES CUDA_ARCHITECTURES 120a-real)
+set_target_properties(prefill_fp4 PROPERTIES CUDA_ARCHITECTURES ${BASALT_CUDA_ARCH_A})
 target_include_directories(prefill_fp4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(prefill_fp4 PUBLIC prefill_fp4_dense mmq ${_gpu_runtime_target})
 add_library(prefill_mxfp8 STATIC src/prefill/moe_mxfp8.cu)
@@ -2125,7 +2144,11 @@ if(BUILD_TESTING)
   add_executable(mxfp8_cpu_rows_test tests/kernels/cpu/mxfp8_cpu_rows_test.cpp)
   target_link_libraries(mxfp8_cpu_rows_test PRIVATE kernels_cpu)
   basalt_cpu_test(NAME mxfp8_cpu_rows_test COMMAND mxfp8_cpu_rows_test)
-  set_tests_properties(mxfp8_cpu_rows_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "cpu;avx2")
+  if(BASALT_ARM64)
+    set_tests_properties(mxfp8_cpu_rows_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "cpu;neon")
+  else()
+    set_tests_properties(mxfp8_cpu_rows_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "cpu;avx2")
+  endif()
 
   # Both tests run on a synthetic expert fixture by default; --file experts.bin (the pack's experts section) checks real blobs.
 
