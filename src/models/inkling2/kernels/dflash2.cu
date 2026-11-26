@@ -248,9 +248,16 @@ __global__ void __launch_bounds__(kThreads) conv2_add_kernel(const float* __rest
     for (int i = 0; i < kPer; ++i) {
         const int c = threadIdx.x + i * kThreads;
         const int g = c / kDf2ConvGroup;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+        // the rounding steps spelled out (see conv2_add_norm_pack_kernel)
+        float acc = __fmul_rn(__fadd_rn(b2[c], dr[g]), zr[c]);
+        if (t > 0) acc = __fmaf_rn(__fadd_rn(b2[kWidth + c], dr[kDf2ConvGroups + g]), zp[c], acc);
+        xr[c] = __fadd_rn(xr[c], acc);
+#else
         float acc = (b2[c] + dr[g]) * zr[c];
         if (t > 0) acc += (b2[kWidth + c] + dr[kDf2ConvGroups + g]) * zp[c];
         xr[c] += acc;
+#endif
     }
 }
 
@@ -287,9 +294,19 @@ __global__ void __launch_bounds__(512) conv2_add_norm_pack_kernel(const float* _
         const int c = tid + j * 512;
         if (c < kWidth) {
             const int g = c / kDf2ConvGroup;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+            // Below compute capability 9.0 the compiler contracts the residual add into a fused multiply-add for some
+            // unrolled values and not for others, differently here and in conv2_add_kernel, so the two would round apart:
+            // both spell out the steps the expression compiles to from 9.0 on (an add, a multiply, the previous row's
+            // term fused, then the add), which keeps them bitwise alike and equal to that build.
+            float acc = __fmul_rn(__fadd_rn(b0v[j], dr[g]), zr[c]);
+            if (t > 0) acc = __fmaf_rn(__fadd_rn(b1v[j], dr[kDf2ConvGroups + g]), zp[c], acc);
+            xv[j] = __fadd_rn(xr[c], acc);
+#else
             float acc = (b0v[j] + dr[g]) * zr[c];
             if (t > 0) acc += (b1v[j] + dr[kDf2ConvGroups + g]) * zp[c];
             xv[j] = xr[c] + acc;
+#endif
             xr[c] = xv[j];
             ss = fmaf(xv[j], xv[j], ss);
         } else {
