@@ -289,10 +289,11 @@ the fallback so the trap is never launched.
   A/B 4 pairs, `ram-experts=59.5GB`: decode_tps 197.7 against 192.5, the last 2 pairs a tie (195.3 / 195.5); the two
   runs during which another process took 10 GiB read lowest.
 - Inkling MX8: gate level or lower (fp16 MX8 0.00286 / 97.79 %, DQ8 0.00287 / 97.75 %; int8 as before); 16K prompt
-  +2.5 %; per-width verify costs level (1-2 tokens +1-2 %, 5-8 tokens -2-3 %); conv -3.3 % over 5 seeds (acceptance
-  ~2 points lower on 4), prose level, struct -12 % on a new greedy text (from token 155); `--suffix-draft 0` (#674's
-  continuation off) the same. The 16-row windows' buffers lower the all-on-card context to MX8 80,020 / 134,265, DQ8
-  76,620 / 128,678 (fp16 / int8).
+  +2.5 %; per-width verify costs level (1-2 tokens +1-2 %, 5-8 tokens -2-3 %). Conv -3.3 % (5 seeds) and struct -12 %
+  are other texts, not kernel cost: on one shared text (struct without thinking) the split kernels, which int8 KV
+  always takes, are 4.4 % (MX8) / 2.8 % (DQ8) slower than #673's ring; over 10 seeds they are level (conv +1.9 %, se
+  1.3; prose -0.5 %, se 0.5); greedy struct thinks twice as long after a slip (it relists the 200 items). The 16-row
+  windows' buffers lower the all-on-card context to MX8 80,020 / 134,265, DQ8 76,620 / 128,678 (fp16 / int8).
 
 ## When a new build fails on the card
 An illegal-instruction or launch failure means a `__trap()` stub was launched: rerun with `CUDA_LAUNCH_BLOCKING=1`
