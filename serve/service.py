@@ -20,7 +20,7 @@ from serve.util import vram
 from serve.util.logbuf import LogBuffer
 from serve.security import LOOPBACK_NAMES
 from serve.models import Dialect, dialect_for
-from serve.prompt import CTX_SLACK, PromptText, overflow_error, room_error
+from serve.prompt import CTX_SLACK, REPLY_KEY, PromptText, overflow_error, room_error
 from serve.util.text import Detokenizer, StopMatcher, control_literals, stop_strings
 from serve.engine.image_source import USAGE as IMAGE_USAGE, VIDEO as VIDEO_KIND, ImageRefused, ImageSources
 from serve.engine.vision import IMAGE_WAITING_BYTES, VIDEO_MAX_TOKENS, VIDEO_REQUEST_BYTES, Vision
@@ -57,6 +57,7 @@ REASONING_CLOSE = "\n</think>\n\n"
 # ANSWER_ROOM_MIN_CAP is too small to split and is left as it is.
 ANSWER_ROOM_MIN_CAP = 32
 ANSWER_RESERVE_MIN = 512
+WRAP_SOFT_MAX = 32          # tokens a budget wrap that stops the engine softly may keep past the budget
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often
 KEEPALIVE_S = 10.0          # a stream quiet this long (a held-back tool argument) gets a keep-alive
 # live tok/s is a windowed rate: a mean since the first token spikes at the start of an answer
@@ -410,14 +411,21 @@ class Service:
         --vram-elastic; an unloaded engine applies it on load."""
         if not hasattr(self.engine, "vram"):
             raise ValueError("this engine cannot resize its VRAM use")
+        mine = {"reserve_mib": reserve_mib}
         with self.vram_cv:
             replaced = self.vram_queued is not None
-            self.vram_queued = {"reserve_mib": reserve_mib}
+            self.vram_queued = mine
         out = self._apply_vram(0)
         if out is not None:
             return out
         with self.vram_cv:
             if self.vram_queued is None:                # the worker got there first
+                if "error" in mine:
+                    raise mine["error"]
+                if "result" in mine:
+                    return mine["result"]
+                if self.stopping.is_set():
+                    raise EngineDied("the server is stopping")
                 return {"status": "ok", **(self.vram_applied or {})}
             if self.vram_worker is None:
                 self.vram_worker = threading.Thread(target=self._vram_worker, daemon=True)
@@ -437,9 +445,12 @@ class Service:
             self.fifo.release()
             return None
         job = None
+        out = None
+        err = None
         try:
-            if self.live_reqs:
-                return None
+            with self.status_lock:
+                if self.live_reqs or self.status.get("busy"):
+                    return None
             with self.vram_cv:
                 job = self.vram_queued
             if job is None:
@@ -459,15 +470,24 @@ class Service:
                 print(f"[server] vram: {got.get('vram_free_mib')} MiB free, {cache}({got.get('expert_slots')} experts)",
                       flush=True)
                 out = {"status": "ok", **got}
-            self.vram_applied = {"reserve_mib": reserve_mib, "at": int(time.time())}
-            self.vram_error = None
+            with self.vram_cv:
+                self.vram_applied = {"reserve_mib": reserve_mib, "at": int(time.time())}
+                self.vram_error = None
             return out
+        except Exception as exc:
+            err = exc
+            raise
         finally:
             if ctl is not None:
                 ctl.release()
             self.fifo.release()
             if job is not None:
                 with self.vram_cv:
+                    if err is not None:
+                        job["error"] = err
+                        self.vram_error = str(err)
+                    elif out is not None:
+                        job["result"] = out
                     if self.vram_queued is job:         # a newer one stays queued
                         self.vram_queued = None
                     self.vram_cv.notify_all()
@@ -484,7 +504,8 @@ class Service:
                     if self._apply_vram(0.2) is None:
                         time.sleep(0.05)
                 except (ValueError, EngineDied) as e:
-                    self.vram_error = str(e)
+                    with self.vram_cv:
+                        self.vram_error = str(e)
                     print(f"[server] warning: queued VRAM reserve not applied ({e})", flush=True)
         finally:
             with self.vram_cv:
@@ -663,7 +684,7 @@ class Service:
             if getattr(self.engine, "asleep", False) is True:
                 return "asleep"
             with self.status_lock:
-                if self.status.get("busy") or self.status.get("queued"):
+                if self.live_reqs or self.status.get("busy") or self.status.get("queued"):
                     return "busy"
             if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
                 return "busy"
@@ -742,11 +763,15 @@ class Service:
             return "unsupported"
         if not self.fifo.acquire(blocking=False):
             return "busy"
+        ctl = getattr(self.engine, "ctl", None) if getattr(self.engine, "batch", 0) else None
+        if ctl is not None and not ctl.acquire(blocking=False):
+            self.fifo.release()
+            return "busy"
         try:
             if not self.engine.alive():
                 return "not loaded"
             with self.status_lock:
-                if self.status.get("busy") or self.status.get("queued"):
+                if self.live_reqs or self.status.get("busy") or self.status.get("queued"):
                     return "busy"
             if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
                 return "busy"
@@ -756,18 +781,24 @@ class Service:
             print(f"[server] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}, the next request loads it", flush=True)
             return "unloaded"
         finally:
+            if ctl is not None:
+                ctl.release()
             self.fifo.release()
 
-    def start_idle_unload(self):
+    def start_idle_unload(self, unloader=None):
+        """Unload the model after idle_unload_s; `unloader(idle_for=...)` defaults to `self.unload`."""
         if not self.idle_unload_s or not hasattr(self.engine, "unload"):
             return
         print(f"[server] model unloads after {self.idle_unload_s} s idle", flush=True)
+        unload = unloader or self.unload
 
         def loop():
-            while True:
+            while not self.stopping.is_set():
                 time.sleep(max(1.0, min(30.0, self.idle_unload_s / 4)))
+                if self.stopping.is_set():
+                    return
                 try:
-                    self.unload(idle_for=self.idle_unload_s)
+                    unload(idle_for=self.idle_unload_s)
                 except EngineStuck as e:                # retried next turn
                     print(f"[server] warning: idle unload failed ({e})", flush=True)
         threading.Thread(target=loop, daemon=True).start()
@@ -1181,7 +1212,7 @@ class Service:
         """The text path: the engine tokenizes, so the server sends the rendered prompt as it is and settles the
         answer cap with the engine (clip: cut to the room the context leaves)."""
         text, plain = self.render_text(messages, tools, kwargs)
-        tail = force if force and kwargs.get("enable_thinking", True) is False else ""
+        tail = self.dialect.nothink_lead + force if force and kwargs.get("enable_thinking", True) is False else ""
         ctx = self.engine.max_context
         if ctx <= 0:
             if getattr(self.engine, "starting", False):
@@ -1237,17 +1268,22 @@ class Service:
             self._video_state_check()
         try:                                            # before the fifo: a slow source must not hold the turn
             read = iter(self.vision.read(images, image_access)) if images else iter(())
-            datas = [next(read) if item["type"] == "image" else self.vision.read_video(item["source"], image_access)
-                     for item in media]
+            datas, video_bytes = [], 0
+            for item in media:
+                if item["type"] == "image":
+                    datas.append(next(read))
+                else:
+                    data = self.vision.read_video(item["source"], image_access)
+                    video_bytes += len(data)
+                    if video_bytes > VIDEO_REQUEST_BYTES:
+                        raise ValueError(f"the request's videos are larger than {VIDEO_REQUEST_BYTES >> 20} MiB")
+                    datas.append(data)
         except ImageRefused as e:
             print(f"[server] error: {e.log_line}", flush=True)
             raise
         except ValueError as e:
             print(f"[server] error: {e}", flush=True)
             raise
-        video_bytes = sum(len(d) for item, d in zip(media, datas) if item["type"] == "video")
-        if video_bytes > VIDEO_REQUEST_BYTES:
-            _refuse_images(f"the request's videos are larger than {VIDEO_REQUEST_BYTES >> 20} MiB")
         held = sum(len(d) for d in {id(d): d for d in datas}.values())
         with self.images_lock:
             if self.images_waiting + held > IMAGE_WAITING_BYTES:
@@ -1404,7 +1440,7 @@ class Service:
         return now
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None, session=None,
-            live=None) -> Iterator[tuple[str, object]]:
+            live=None, stream_tools: bool = True) -> Iterator[tuple[str, object]]:
         """Yield ("event", Event) as text arrives, ("ping", None) as heartbeat, then ("done", {...}).
         `force`: the opening of the call the reply must make (see prepare). `live` (serve.live.LiveRequest): the state
         this updates, and the answer-now signal that closes the thinking at its next clean point. A request with
@@ -1413,19 +1449,24 @@ class Service:
         (serve/api/logprobs.py)."""
         if live is not None:
             live.thinking = bool(thinking)
-        if not thinking and self.dialect.thinks_in_blocks and isinstance((sampling or {}).get(GRAMMAR_KEY), dict):
-            # the grammar guard lets a reply of blocks think only when the request does
-            sampling = {**sampling, GRAMMAR_KEY: dict(sampling[GRAMMAR_KEY], think=False)}
+        if not thinking and self.dialect.thinks_in_blocks and self.grammar_engine:
+            # the grammar guard lets a reply of blocks think only when the request does: a request without a grammar
+            # gets the one that only forbids thinking
+            spec = (sampling or {}).get(GRAMMAR_KEY)
+            sampling = {**(sampling or {}), GRAMMAR_KEY: dict(
+                spec if isinstance(spec, dict) else {"kind": "text", "calls": bool(tools)}, think=False)}
         budget = self.reasoning_budget(sampling) if thinking else None
+        budget_asked = budget           # the request's own budget, before the answer room
         budget_req = sampling
         budget_ready = False
         if self.sampling_defaults:     # the request's own fields win
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**self.sampling_defaults, **req_values}
-        parser = self.dialect.parser(thinking, tools, stream_tools=True)
+        parser = self.dialect.parser(thinking, tools, stream_tools=stream_tools)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         lp_channels = LogprobChannels(thinking) if (sampling or {}).get(LOGPROBS_KEY) is not None else None
         thinking_n = 0                                 # tokens written while thinking
+        answered = False                               # any content or tool event emitted (for block-structured dialects)
         stop_list = stop_strings(sampling)
         stops = StopMatcher(stop_list) if stop_list else None
 
@@ -1524,23 +1565,6 @@ class Service:
                     with self.status_lock:
                         self.status["queued"] -= 1
                         self.waiting.pop(id(wait_key), None)
-                    # restart a dead or unloaded engine; parallel requests serialize this start on the fifo
-                    with (self.fifo if par else contextlib.nullcontext()):
-                        self.ensure_loaded()
-                    gprompt0 = None
-                    if forced_now and has_grammar:
-                        if isinstance(ids, PromptText) and ids.tail:
-                            tail_n = len(self.tok.encode(ids.tail, parse_special=True))
-                            ids, max_new = ids.resolve(max_new, self.engine.max_context)
-                            gprompt0 = len(ids) - tail_n
-                        elif not isinstance(ids, PromptText):
-                            tail_n = len(self.tok.encode(opening_text, parse_special=True))
-                            gprompt0 = len(ids) - tail_n
-                        if gprompt0 is not None and 0 < gprompt0 < len(ids):
-                            sampling = {**(sampling or {}), GPROMPT_KEY: gprompt0}
-                        else:
-                            gprompt0 = None
-                    with self.status_lock:
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
                                   path=path, prompt_ms=None, decode_ms=None, decoded=None, passes=None, windows=None,
@@ -1553,16 +1577,44 @@ class Service:
                             self.status.update(st)
                         self.last_request_at = time.time()
                         rate.clear()                    # drop the previous request's samples
+                    # restart a dead or unloaded engine; parallel requests serialize this start on the fifo
+                    try:
+                        with (self.fifo if par else contextlib.nullcontext()):
+                            self.ensure_loaded()
+                        gprompt0 = None
+                        if forced_now and has_grammar:
+                            if isinstance(ids, PromptText) and ids.tail:
+                                tail_n = len(self.tok.encode(ids.tail, parse_special=True))
+                                ids, max_new = ids.resolve(max_new, self.engine.max_context)
+                                gprompt0 = len(ids) - tail_n
+                            elif not isinstance(ids, PromptText):
+                                tail_n = len(self.tok.encode(opening_text, parse_special=True))
+                                gprompt0 = len(ids) - tail_n
+                            if gprompt0 is not None and 0 < gprompt0 < len(ids):
+                                sampling = {**(sampling or {}), GPROMPT_KEY: gprompt0}
+                            else:
+                                gprompt0 = None
+                    except BaseException:
+                        with self.status_lock:
+                            st["busy"] = False
+                        raise
+                    with self.status_lock:
+                        started = time.time()
+                        st.update(prompt_tokens=len(ids), max_tokens=max_new, started=started)
+                        if par and self.live_reqs and list(self.live_reqs.values())[-1][0] is st:
+                            self.status.update(prompt_tokens=len(ids), max_tokens=max_new, started=started)
+                        self.last_request_at = started
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
                     if live is not None:
                         live.state = "prompt"
                     prompt, thought = ids, 0            # reasoning tokens so far
                     # answer now stops an engine that takes `stop_soon` at its own pace (see the pass below)
-                    soft_stops = live is not None and "stop_soon" in inspect.signature(self.engine.generate).parameters
+                    soft_stops = "stop_soon" in inspect.signature(self.engine.generate).parameters
                     closed_early = False                # the thinking was already closed once
                     pt_settled = False                  # the engine's PT line was applied to the total cap
                     run_id, run_n = None, 0             # the token the thinking is repeating, and how often in a row
+                    reply_at = None                     # the prompt's token count where this reply's own tokens begin (once a pass continues it)
                     for ev in opening:
                         yield "event", ev
                     while True:
@@ -1572,12 +1624,15 @@ class Service:
                         more = {"stop_soon": soft} if soft is not None else {}
                         # A thinking budget caps the pass itself, so the engine stops on the budget's token and holds
                         # exactly what was kept: the next pass extends its live state instead of reading the overshoot
-                        # again through the prompt path (which rounds differently from decoding).
-                        if thinking and not budget_ready and not isinstance(ids, PromptText):
+                        # again through the prompt path (which rounds differently from decoding). A text prompt the
+                        # engine may clip learns its cap, and so its budget, from the engine's count (below).
+                        if thinking and not budget_ready and not (isinstance(ids, PromptText) and ids.clip):
                             budget = self.answer_budget(budget_req, max_new, budget)
                             budget_ready = True
                         cap = max_new - n
-                        capped = bool(budget) and parser.state == "reasoning" and budget - thought < cap
+                        may_think = parser.state == "reasoning" or (
+                            self.dialect.thinks_in_blocks and parser.state == "between" and thought == 0 and not answered)
+                        capped = bool(budget) and may_think and budget - thought < cap
                         if capped:
                             cap = max(1, budget - thought)
                         gen = self.engine.generate(prompt, cap, sampling, cancel, embeddings=emb,
@@ -1585,6 +1640,7 @@ class Service:
                             else self.engine.generate(prompt, cap, sampling, cancel, session=session, **more)
                         n_pass0 = n
                         seg, wrap, leaving = [], False, False   # this pass's tokens; budget reached; consumer left
+                        over = False                    # the budget was reached in a pass it does not cap: stopping soon
                         looped = False                  # the wrap is for a repeated token, not the budget
                         asked = False                   # the wrap is the client's answer now
                         drained = False                 # the pass ran to the engine's DONE
@@ -1601,11 +1657,21 @@ class Service:
                                 # comes back as the budget and must not replace the client's cap.
                                 if isinstance(ids, PromptText) and ids.n is not None and not pt_settled:
                                     pt_settled = True
+                                    # the engine checked this pass's cap, which a thinking budget may have lowered:
+                                    # the whole cap must fit before a token goes out, as an id prompt's does
+                                    ctx = self.engine.max_context or getattr(self.engine, "known_ctx", 0)
+                                    if not ids.clip and ctx > 0 and ids.n + CTX_SLACK + max_new > ctx:
+                                        raise overflow_error(ids.n, max_new, ctx)
                                     if ids.max_new and ids.max_new < cap:
                                         max_new = min(max_new, n_pass0 + ids.max_new)
+                                        cap = ids.max_new
+                                        if thinking and budget_ready:   # a budget set from the cap the engine cut
+                                            budget, budget_ready = budget_asked, False
                                 if thinking and not budget_ready and (not isinstance(ids, PromptText) or ids.n is not None):
                                     budget = self.answer_budget(budget_req, max_new, budget)
                                     budget_ready = True
+                                    # the pass the engine settled ends on the budget only if the budget is past its cap
+                                    capped = bool(budget) and parser.state == "reasoning" and budget - thought >= cap
                                 if t is None:               # heartbeat
                                     if isinstance(ids, PromptText) and ids.n is not None and st.get("prompt_tokens") != ids.n:
                                         with self.status_lock:  # the engine has counted the prompt
@@ -1620,6 +1686,11 @@ class Service:
                                             and not detok.pending()):
                                         n -= 1              # the end token is not part of the reply
                                         ended_thinking = True
+                                        break
+                                    if (force and self.dialect.thinks_in_blocks and not parser.buf
+                                            and not detok.pending() and parser.state in ("between", "content")):
+                                        n -= 1              # the end token is not part of the reply
+                                        opens = True
                                         break
                                     finish = "stop"
                                     raw_ids.append(t)
@@ -1636,6 +1707,8 @@ class Service:
                                 tail = (tail + piece)[-2:]
                                 state0 = parser.state
                                 evs = cut(parser.feed(piece))
+                                if not answered and any(ev.kind in ("content", "tool_start", "tool_call") for ev in evs):
+                                    answered = True
                                 if lp_channels is not None:
                                     lp = logprob_entry(self.tok, t) if getattr(t, "lp", None) is not None else None
                                     for item in lp_channels.token(lp, state0, parser.state, evs):
@@ -1667,12 +1740,24 @@ class Service:
                                     break
                                 if budget and parser.state == "reasoning":
                                     thought += 1
-                                    # only at a clean point: no held tag or split character
-                                    if thought >= budget and not parser.buf and not detok.pending():
-                                        wrap = True
+                                    # only at a clean point: no held tag or split character; a pass the budget caps
+                                    # drains to its own DONE/BDONE and wraps after it (below)
+                                    if thought >= budget and not over and not parser.buf and not detok.pending() \
+                                            and not (capped and n - n_pass0 >= cap):
+                                        if capped or soft is None or max_new - n < 2 * WRAP_SOFT_MAX:
+                                            wrap = True
+                                            break
+                                        # the pass goes on past the budget: the engine stops at its own pace and the
+                                        # tokens it still writes are kept, so the next pass extends what it holds
+                                        soft.set()
+                                        over = True
+                                    elif over and thought >= budget + WRAP_SOFT_MAX and not parser.buf and not detok.pending():
+                                        wrap = True     # the engine did not stop soon enough: the answer keeps its room
                                         break
                                 if live is not None:
-                                    live.state = "thinking" if parser.state == "reasoning" else "answering"
+                                    live.state = "thinking" if (
+                                        parser.state == "reasoning"
+                                        or (thinking and parser.state == "between" and not answered)) else "answering"
                                     if live.answer_now.is_set() and parser.state == "reasoning":
                                         if soft is not None:
                                             soft.set()      # the close follows the engine's last token
@@ -1682,7 +1767,10 @@ class Service:
                                 if force:
                                     if any(ev.kind in ("tool_start", "tool_call") for ev in evs):
                                         force = None    # the model is writing a call of its own
-                                    elif parser.state == "content" and not parser.buf and not detok.pending():
+                                    elif ((parser.state == "content"
+                                           or (self.dialect.thinks_in_blocks and state0 == "reasoning"
+                                               and parser.state == "between"))
+                                          and not parser.buf and not detok.pending()):
                                         opens = True    # at a clean point right after the thinking
                                         break
                             else:
@@ -1740,7 +1828,8 @@ class Service:
                                 resumed = True
                         if drained and soft is not None and soft.is_set() and n < max_new and not cancel.is_set():
                             if parser.state == "reasoning" and not parser.buf and not detok.pending():
-                                wrap = asked = True
+                                wrap = True
+                                asked = not over
                             else:                       # a split tag or character, or the thinking ended meanwhile
                                 resumed = True
                         if not (wrap or opens or ended_thinking or resumed) or cancel.is_set():
@@ -1748,9 +1837,15 @@ class Service:
                         # budget reached or turn ended in thinking: close it and continue; the next prompt extends this
                         # one, so the engine keeps its prefix
                         forced_here = bool(force) and (ended_thinking or wrap)
+                        close_n = 0
                         if ended_thinking:
                             closed_early = True
-                            extra = self.tok.encode(self.dialect.reasoning_close + (force or ""), parse_special=True)
+                            if self.dialect.thinks_in_blocks and force:
+                                close_ids = self.tok.encode(self.dialect.reasoning_close, parse_special=True)
+                                close_n = len(close_ids)
+                                extra = close_ids + self.tok.encode(force, parse_special=True)
+                            else:
+                                extra = self.tok.encode(self.dialect.reasoning_close + (force or ""), parse_special=True)
                             force = None
                             if max_new - n - len(extra) < 1:
                                 finish = "stop"
@@ -1758,7 +1853,12 @@ class Service:
                             print("[server] the model ended while thinking, closing it for an answer", flush=True)
                         elif wrap:
                             budget = None
-                            extra = self.tok.encode(self.dialect.reasoning_close + (force or ""), parse_special=True)
+                            if self.dialect.thinks_in_blocks and force:
+                                close_ids = self.tok.encode(self.dialect.reasoning_close, parse_special=True)
+                                close_n = len(close_ids)
+                                extra = close_ids + self.tok.encode(force, parse_special=True)
+                            else:
+                                extra = self.tok.encode(self.dialect.reasoning_close + (force or ""), parse_special=True)
                             force = None
                             if max_new - n - len(extra) < 1:
                                 break                   # no room to answer: "length"
@@ -1772,10 +1872,15 @@ class Service:
                             extra = []
                         else:
                             # the thinking closed itself: the call opens after the blank line the template puts
-                            # before a call
-                            text = "\n" * max(0, self.dialect.call_newlines - (len(tail) - len(tail.rstrip("\n")))) + force
+                            # before a call (or after closing an open block on a block-structured dialect)
+                            if self.dialect.thinks_in_blocks and parser.state == "content":
+                                close_ids = self.tok.encode(self.dialect.reasoning_close, parse_special=True)
+                                close_n = len(close_ids)
+                                extra = close_ids + self.tok.encode(force, parse_special=True)
+                            else:
+                                text = "\n" * max(0, self.dialect.call_newlines - (len(tail) - len(tail.rstrip("\n")))) + force
+                                extra = self.tok.encode(text, parse_special=True)
                             force = None
-                            extra = self.tok.encode(text, parse_special=True)
                             if max_new - n - len(extra) < 1:
                                 break                   # no room for the call: "length"
                         for t in extra:
@@ -1784,6 +1889,8 @@ class Service:
                             thinking_n += parser.state == "reasoning"
                             state0 = parser.state
                             evs = cut(parser.feed(detok.push(t)))
+                            if not answered and any(ev.kind in ("content", "tool_start", "tool_call") for ev in evs):
+                                answered = True
                             if lp_channels is not None:       # written by the server: no entry of its own
                                 for item in lp_channels.token(None, state0, parser.state, evs):
                                     yield "logprobs", item
@@ -1791,17 +1898,22 @@ class Service:
                             for ev in evs:
                                 yield "event", ev
                         if live is not None:
-                            live.state = "thinking" if parser.state == "reasoning" else "answering"
+                            live.state = "thinking" if (
+                                parser.state == "reasoning"
+                                or (thinking and parser.state == "between" and not answered)) else "answering"
                         if stops is not None and stops.hit is not None:
                             finish = "stop"
                             break
                         base_len = len(prompt.ids()) if isinstance(prompt, PromptText) else len(prompt)
                         prompt = prompt + seg + extra
+                        # the engine takes no turn checkpoint inside the reply this prompt now carries
+                        reply_at = base_len if reply_at is None else reply_at
+                        sampling = {**(sampling or {}), REPLY_KEY: reply_at}
                         if has_grammar:
                             if resumed:
                                 gprompt0 = gprompt0 if gprompt0 is not None else base_len
                             elif opens or forced_here:
-                                gprompt0 = base_len + len(seg)
+                                gprompt0 = base_len + len(seg) + close_n
                             else:
                                 gprompt0 = None
                             if gprompt0 is not None and 0 < gprompt0 < len(prompt):
@@ -1901,6 +2013,8 @@ class Service:
             if emb:
                 Path(emb).unlink(missing_ok=True)
         last_evs = cut(parser.finish())
+        if stops is not None and stops.hit is not None and finish == "length":
+            finish = "stop"
         if lp_channels is not None:
             if stops is not None and stops.hit is not None:
                 lp_channels.pending.clear()             # the stop string's tokens: not in the answer

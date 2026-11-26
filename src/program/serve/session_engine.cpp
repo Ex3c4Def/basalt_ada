@@ -201,10 +201,8 @@ public:
             if (at_exit) disk.flush();   // one image in RAM at a time
             const int64_t positions = (int64_t) ids.size();
             if (!disk.fits(session().running_bytes() + session().cells_bytes(positions))) return;   // no copy the writer drops
-            if (!capture_admit(session().running_bytes() + session().cells_bytes(positions), floor)) {
-                basalt::log::info("basalt serve", "conversation cache: %zu tokens not written to disk (physical RAM admission)", ids.size());
-                return;
-            }
+            const uint64_t snapshot = session().running_bytes() + session().cells_bytes(positions);
+            if (!admit_parking(snapshot, floor, "disk write", ids.size(), snapshot)) return;
             basalt::core::SavedConversation image;
             std::string se;
             if (!capture(image, ids, imgs, cks, cvec, se)) {
@@ -256,10 +254,6 @@ public:
         if (!out.empty()) out[0].kv_bytes = kv;
         return out;
     }
-    bool capture_admit(uint64_t need, uint64_t floor) override {
-        return basalt::platform::ram_guard_level() == basalt::platform::RamLevel::Ok &&
-               basalt::core::conversation_memory_admit(basalt::core::conversation_available_memory(), need, floor);
-    }
     /// The session's conversation as an image: its running state and its positional state by layer.
     bool capture(basalt::core::SavedConversation& image, const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs,
                  const std::vector<ConvCheckpoint>& cks, bool cvec, std::string& e) {
@@ -297,10 +291,7 @@ public:
         if (to_disk && !disk.fits(estimate)) return true;   // a full disk: no copy off the card that the writer drops
         if (to_disk ? disk.queued_bytes() + estimate > kDiskQueueCap : !ram_room) return true;
         const uint64_t floor = std::max<uint64_t>((uint64_t) o.conversation_cache_min_free_mib << 20, disk.enabled() ? disk_floor : 0);
-        if (!capture_admit(estimate, floor)) {
-            basalt::log::info("basalt serve", "conversation cache: %zu tokens not parked (physical RAM admission)", live.size());
-            return true;
-        }
+        if (!admit_parking(estimate, floor, "parking", live.size(), estimate)) return true;
         basalt::core::SavedConversation image;
         if (!capture(image, live, live_imgs, checks, cvec_cached, err)) return false;
         (void) (to_disk ? disk.put(std::move(image), kDiskQueueCap) : conversations->put(std::move(image), held));
@@ -447,10 +438,8 @@ public:
         drafts_.assign((size_t) max_window(), 0);
         conf_.assign((size_t) max_window(), 0.0f);
         sbuf_.assign((size_t) max_window(), 0);
-        if (rt_.sfx) {
-            rt_.sfx->reset();
-            for (int64_t t : ids) rt_.sfx->append((int32_t) t);
-        }
+        if (rt_.sfx && (!in_slot || solo_req))
+            rt_.sfx->sync(ids32.data(), ids32.size());
     }
     void decode_stats_begin() {
         counts0_ = rt_.session().expert_counts();
@@ -493,7 +482,7 @@ public:
     }
     int before_window(int, int64_t) { return 0; }
     int32_t* history_stage() {
-        history_.resize((size_t) max_window() * hist_n);
+        history_.resize((size_t) std::max<int64_t>({(int64_t) max_window(), (int64_t) rt_.session().prompt_fold_window(), n - fold_p0}) * hist_n);
         return history_.data();
     }
     void upload_history(int) {}
@@ -503,10 +492,12 @@ public:
         d.tokens = window.data();
         d.n_tokens = T;
         d.pos = p;
+        const bool tail_only = e0 == T - 1 && T > 1 && req_logprobs < 0 && (gguard == nullptr || !gguard->on()) && ppl == nullptr;
         d.drawn_drafts = own_drafts_ && e0 == 0 && ppl == nullptr && T > 1;
-        (T > 1 ? d.row_tokens : d.next_token) = outv.data();
+        if (tail_only) d.next_token = &outv[(size_t) e0];
+        else (T > 1 ? d.row_tokens : d.next_token) = outv.data();
         d.sampling = &req_sp;
-        d.history = hist_n > 0 ? history_.data() : nullptr;
+        d.history = hist_n > 0 ? history_.data() + (tail_only ? (size_t) e0 * hist_n : 0) : nullptr;
         d.history_len = hist_n;
         req_sp.counter = draws_;
         const basalt::model::Result r = rt_.session().decode_window(d);
@@ -615,7 +606,7 @@ public:
     }
     void observe_policy(bool from_sfx, int T, int a, int sfx_match, Clock::time_point round0) {
         if (ppl != nullptr) return;   // a quality gate's windows are forced, not drafted
-        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - round0).count();
+        const double ms = rt_.session().window_cold() ? 0.0 : std::chrono::duration<double, std::milli>(Clock::now() - round0).count();
         if (from_sfx) rt_.policy->observe(true, T, a, sfx_match, ms);
         else rt_.policy->observe_window(window_conf_.data(), T, a, ms);
     }
@@ -648,9 +639,10 @@ private:
     // a slot's prompt lookup history: the conversation, then the token its first window feeds
     void slot_init(BSlot& sl) override {
         if (!rt_.lookup_on()) return;
-        sl.sfx = std::make_unique<basalt::spec::SuffixDrafter>(std::max(1, runtime_.o.suffix_draft), 64,
-                                                               (size_t) runtime_.o.max_context + 4096);
-        for (int32_t t : runtime_.live) sl.sfx->append(t);
+        if (!sl.sfx)
+            sl.sfx = std::make_unique<basalt::spec::SuffixDrafter>(std::max(1, runtime_.o.suffix_draft), 64,
+                                                                   (size_t) runtime_.o.max_context + 4096);
+        sl.sfx->sync(runtime_.live.data(), runtime_.live.size());
         sl.sfx->append(x);
     }
     Flow restore_image() override {
@@ -764,7 +756,14 @@ Flow SessionRequest::prepare_image() {
 Flow SessionRequest::read_to(int64_t to) {
     if (at == read_from)
         for (next_block_ = 0; next_block_ < blocks_.size() && blocks_[next_block_].at < at;) ++next_block_;
-    while (at < to) {
+    int64_t fold_tail = 0;
+    const int fw = rt_.session().prompt_fold_window();
+    if (fw > 1 && to == n - 1 && !part_checkpoint(to) && next_block_ >= blocks_.size() && (!in_slot || solo_req) &&
+        ppl == nullptr && to > at && to - at < fw) {
+        fold_tail = to - at;
+    }
+    const int64_t pre_to = to - fold_tail;
+    while (at < pre_to) {
         const bool image = next_block_ < blocks_.size() && blocks_[next_block_].at == at;
         basalt::model::Result r;
         if (image) {
@@ -772,7 +771,7 @@ Flow SessionRequest::read_to(int64_t to) {
             r = rt_.session().prefill_embeddings(b.rows.data(), b.n_rows, at, b.grid);
             at += b.n_rows;
         } else {
-            const int64_t end = next_block_ < blocks_.size() ? std::min(to, blocks_[next_block_].at) : to;
+            const int64_t end = next_block_ < blocks_.size() ? std::min(pre_to, blocks_[next_block_].at) : pre_to;
             basalt::model::PrefillRequest pr;
             pr.tokens = ids32.data() + at;
             pr.n_tokens = (int) (end - at);
@@ -781,7 +780,11 @@ Flow SessionRequest::read_to(int64_t to) {
             pr.rows_after = to - end;
             pr.more = end < n - 1;
             const int64_t base = at;
-            pr.progress = [this, base](int k) { progress_line("PP", base + k); basalt::core::progress_beat(); };
+            pr.progress = [this, base](int k) {
+                runtime_.pp_reached = std::max(runtime_.pp_reached, base + k);
+                progress_line("PP", base + k);
+                basalt::core::progress_beat();
+            };
             pr.live = [this, base](int k) {
                 basalt::core::progress_beat();
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
@@ -791,7 +794,7 @@ Flow SessionRequest::read_to(int64_t to) {
             };
             pr.stop = [this] { return runtime_.halted(); };
             r = rt_.session().prefill_chunk(pr);
-            at = end;
+            if (!runtime_.halted()) at = end;
         }
         if (r.status == basalt::model::Status::Refused) {   // no room for this prompt: the engine serves on
             basalt::log::warn("basalt serve", "%s", r.message.c_str());
@@ -805,7 +808,12 @@ Flow SessionRequest::read_to(int64_t to) {
             return Flow::error;
         }
         if (runtime_.halted()) { cancelled = true; return Flow::quit; }
+        runtime_.pp_reached = std::max(runtime_.pp_reached, at);
         progress_line("PP", at);
+    }
+    if (fold_tail > 0) {
+        fold_p0 = pre_to;
+        at = to;
     }
     if (part_checkpoint(to) &&
         !rt_.checkpoint_at(to, to == root_at ? ConvCheckpoint::kRoot : ConvCheckpoint::kTurnEnd, ids)) {

@@ -15,7 +15,7 @@ nvcc --version >> "%LOG%" 2>&1
 cmake --version >> "%LOG%" 2>&1
 ninja --version >> "%LOG%" 2>&1
 echo ---- configure >> "%LOG%"
-cmake -S . -B build-ada -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89 >> "%LOG%" 2>&1
+cmake -S . -B build-ada -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89 -DBASALT_MODELS=all >> "%LOG%" 2>&1
 if errorlevel 1 goto cfgfail
 echo ---- build >> "%LOG%"
 cmake --build build-ada -j -- -k 0 >> "%LOG%" 2>&1
