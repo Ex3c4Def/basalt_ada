@@ -14,8 +14,8 @@ src/prefill/mmq/mmq_common.cuh, src/program/gpu_select.cpp); each upstream merge
 ## Build (Windows, docs/platforms.md has the details)
 Needs Visual Studio 2022 C++ tools, CUDA 13.x, CMake 3.24+, Ninja. The desktop app does not load vcvars, so use
 `ada_build.bat nopause` in this folder (it finds Visual Studio, calls vcvars64.bat, configures and builds with
-`-DCMAKE_CUDA_ARCHITECTURES=89 -G Ninja` into `build-ada`, keeps going past errors with `ninja -k 0`, and writes
-everything to `ada_build.log`; the last lines say BUILD OK / BUILD FAILED / CONFIGURE FAILED).
+`-DCMAKE_CUDA_ARCHITECTURES=89 -DBASALT_MODELS=all -G Ninja` into `build-ada`, keeps going past errors with `ninja -k 0`,
+and writes everything to `ada_build.log`; the last lines say BUILD OK / BUILD FAILED / CONFIGURE FAILED).
 Read the first errors in `ada_build.log`, fix, rerun.
 
 ## What sm_89 does not have (so what any compile error will be about)
@@ -122,9 +122,9 @@ the fallback so the trap is never launched.
   `peer_share_parity` runs with the share on the one card: ok. `ds41_peer_parity` passes with one card.
 - Not run end to end, for want of a second card: the expert tier, the layer split and its overlapped windows, the prompt
   split, the GDN and head splits, and DeepSeek's second-card tier.
-- Mixed Blackwell + Ada setups (a 5090 main card with a 4090 tier, or the other way round): build with
-  `cmake -S . -B build-mixed -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="120;89"` (ada_build.bat builds
-  89 only). The engine refuses at start a card its build has no device code for (`build_archs.hpp`, checked in
+- Mixed Blackwell + Ada setups (a 5090 main card with a 4090 tier, or the other way round): build with `cmake -S . -B
+  build-mixed -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="120;89" -DBASALT_MODELS=all` (ada_build.bat
+  builds 89 only). The engine refuses at start a card its build has no device code for (`build_archs.hpp`, checked in
   cli/gpu.cpp and device.cu), since a 5090 would otherwise run the 8.9 PTX with its sm_90 paths trapping. FP4 prompt
   kernels run only when every engine card is 12.x (`fp4_tensor_cores`; the process sees only its own cards), so on a mixed
   set every card reads NVFP4 prompts through MMQ: the buffers, chunk plan, peer share and row rounding are the same on
@@ -197,37 +197,26 @@ the fallback so the trap is never launched.
   `build_archs.hpp`). gdn_window.cu keeps the fork's `REC_NO_CLUSTER` stubs (they also cover an 89-only build's host
   pass); gu2.cuh and mmq_common.cuh take upstream's `pdl_launch_dependents` (nothing below 9.0); dec_moe.cuh's TMA kernel
   is compiled out below 9.0 by upstream's guard.
-- The rest of upstream's 79 commits add no instruction 8.9 lacks: the new fp16 KV prompt attention is f16 mma m16n8k16
-  and ldmatrix, the GQA decode's next-chunk fetch plain loads, the 27B's layer split and `--kv-resident` host code and
-  flag kernels. The FP8 GEMM's per-device shared-memory opt-in sits beside the fork's `gemm_ada`, which already had one.
-- `gqa_attn_parity` freezes the decode kernel's bits (upstream measured them on Blackwell). The 4090 gives other bits,
-  the same before and after upstream's next-chunk fetch (checked by building the test with that change undone), so the
-  test takes those below 9.0.
+- The rest adds no instruction 8.9 lacks (fp16 KV prompt attention: f16 mma m16n8k16 and ldmatrix; plain loads; host
+  code). `gqa_attn_parity` takes the 4090's own bits below 9.0 (the same before and after upstream's next-chunk fetch).
 - Output: with `--kv int8` (with and without prompt lookup) 3 greedy and 2 sampled cases are identical to fork_4090's.
   With the default fp16 KV they differ from the first token on, by upstream's design: its fp16 prompt attention now rounds
   q and p to fp16 and runs one fp16 mma instead of hi + lo parts (c8f54503; upstream's gate: lossless).
-- sm_120 code: in the 21 files the fork changes, every upstream kernel's SASS equals upstream's, apart from two kernels
-  in verify_kernels.cu whose constant-bank address load reads offset 8 instead of 0 (the fork's `g_l2_ahead_sink` comes
-  first in the module's address table; the instructions are the same).
-- Speed (2 rotated pairs, engine_bench community, int8 KV, 450 W, DDR5-4800): decode_tps 197.4 against 197.9, prefill
-  16K +1.8 %, 64K -3.6 %: where the adaptive swaps leave the experts after the varying sampled prose, not the prefill code
-  (alone 6131 against 6103 t/s; with `--adapt-swaps 0` the same text and 6260 against 6264).
+- sm_120 SASS as upstream's in the 21 files, but for verify_kernels.cu's two kernels whose constant-bank load reads
+  offset 8 instead of 0 (the fork's `g_l2_ahead_sink` comes first in the address table; the same instructions).
+- Speed (2 rotated pairs, engine_bench community, int8 KV, 450 W, DDR5-4800): decode_tps 197.4 against 197.9; prefill
+  16K +1.8 %, 64K -3.6 % from where the adaptive swaps left the experts (`--adapt-swaps 0`: 6260 against 6264).
 
-## Upstream 0.5.0: Hy4-flash (merged 2026-11-20)
-- Hy4-flash and the code it shares with DeepSeek build for 8.9 as they are (f16 mma with ldmatrix and cp.async, the e4m3
-  cvt, NVFP4 experts through MMQ; `attend_mma_kernel` opts in to 85,760 of 101,376 bytes). Its parity tests pass; no pack
-  (158.7 GB) has been run. `file_expert_repin_test` fails on Windows (it assumes Linux's unpinned RAM copy). Output
-  identical, SASS of 33 files as upstream's, A/B a tie (202.2 against 203.0, every run `ram-experts=59.5GB`).
+## Upstream 0.5.0: Hy4-flash, and 0.5.0+58: the shared routing flags (merged 2026-11-20)
+- Hy4-flash builds for 8.9 as it is (f16 mma, ldmatrix, cp.async, the e4m3 cvt, NVFP4 experts through MMQ;
+  `attend_mma_kernel` opts in to 85,760 of 101,376 bytes); its parity tests pass, no pack (158.7 GB) has been run.
+  `file_expert_repin_test` fails on Windows (it assumes Linux's unpinned RAM copy). Output identical, SASS as upstream's,
+  A/B 202.2 against 203.0. +58 needed nothing; upstream's FP4-Local reader (#444) replaced the fork's (dbb54997).
 
 ## PCIe share of solo decode windows (experiment, 2026-11-20)
-- `--exp solo_stage=1` stages a share of each layer's CPU misses over PCIe in solo windows too (`stage_frac=F`,
-  `stage_min=N`; [experiment keys](docs/configuration/diagnostics.md)); off is the old path. NVFP4, 450 W, int8 KV, 8
-  seeds: no share wins (0.1 to 0.35: conv / prose -2.9 to +0.8 %, struct up to +2.2 %; 0.5: -13.7 / -9.2 %); the stage
-  kernel, launch and join cost 0.2-0.5 ms a pass. Staging changes the text, so retest over seeds.
-
-## Upstream 0.5.0+58: the shared routing flags (merged 2026-11-20)
-- Nothing to port (no sm_90+ feature or capability check); upstream's FP4-Local reader (#444) replaces the fork's
-  (dbb54997). CPU 94/94, GPU the 3 known fails; output identical; SASS of 26 files as upstream's; A/B 201.3 against 201.3.
+- `--exp solo_stage=1` stages a share of each layer's CPU misses over PCIe in solo windows too (`stage_frac`, `stage_min`;
+  [experiment keys](docs/configuration/diagnostics.md)). 8 seeds, 450 W, int8 KV: no share wins (0.1-0.35: -2.9 to
+  +2.2 %; 0.5: -13.7 / -9.2 %); stage kernel, launch and join cost 0.2-0.5 ms a pass, and staging changes the text.
 
 ## Upstream 0.5.5: Inkling 2 Mini (merged 2026-11-23)
 - Inkling 2 (src/models/inkling2) checks no compute capability. On 8.9 its fused window attention (a cluster of eight
@@ -285,15 +274,26 @@ the fallback so the trap is never launched.
   `--bench`, 3 runs: -3.8 / -2.4 % at 4096 tokens (Inkling's chunk), +2.6 % at 2048.
 - #652's batched drafter head read its pick as 0.5.5's solo head did (the load hoisted above the barrier on 8.9): the
   same fix (91ea05ad). #673's tensor-core window ring sums to other bits here; its hash takes the 8.9 value.
-- CPU 112/112, GPU the 5 known fails; Flash-Next output identical (fp16, int8 KV); sm_120 SASS of 42 files as upstream's.
-  A/B 4 pairs, `ram-experts=59.5GB`: decode_tps 197.7 against 192.5, the last 2 pairs a tie (195.3 / 195.5); the two
-  runs during which another process took 10 GiB read lowest.
+- CPU 112/112, GPU the 5 known fails; Flash-Next output identical; SASS of 42 files as upstream's. A/B 4 pairs: decode_tps
+  197.7 against 192.5, the last 2 pairs a tie (195.3 / 195.5; the runs beside a 10 GiB process read lowest).
 - Inkling MX8: gate level or lower (fp16 MX8 0.00286 / 97.79 %, DQ8 0.00287 / 97.75 %; int8 as before); 16K prompt
   +2.5 %; per-width verify costs level (1-2 tokens +1-2 %, 5-8 tokens -2-3 %). Conv -3.3 % (5 seeds) and struct -12 %
   are other texts, not kernel cost: on one shared text (struct without thinking) the split kernels, which int8 KV
   always takes, are 4.4 % (MX8) / 2.8 % (DQ8) slower than #673's ring; over 10 seeds they are level (conv +1.9 %, se
   1.3; prose -0.5 %, se 0.5); greedy struct thinks twice as long after a slip (it relists the 200 items). The 16-row
   windows' buffers lower the all-on-card context to MX8 80,020 / 134,265, DQ8 76,620 / 128,678 (fp16 / int8).
+
+## Upstream 0.5.7+148: Inkling's DFlash 2 drafter and kernels, #744's fixes (merged 2026-11-26)
+- Conflicts: gdn_window.cu (#744 laid `RecSmem` out per form; the fork's `REC_NO_CLUSTER` stubs, split-form state write
+  below 9.0 and `dec_gdnf_mode()` sit on that layout), Inkling's session.cpp (#730's deferred guess prefetch keeps
+  `side_reads`), CMakeLists.txt. `BASALT_MODELS` is required (#731): ada_build.bat passes `all`. Nothing new needs sm_90+.
+- `dflash2_parity`: the sm_89 compiler fused the residual add into an FMA for some values in conv2_add and for all in the
+  fused kernel (2 % of values a rounding apart); below 9.0 both spell out sm_120's steps (bitwise alike, as on sm_120).
+- CPU 113/113, GPU the 5 known fails and `batch_graph_memory_test` (Windows: cudaMalloc gave 122.7 GiB, past VRAM into
+  system memory, and a graph still instantiates); Flash-Next output identical (fp16, int8 KV); SASS of 49 files as
+  upstream's. A/B 2 pairs, `ram-experts=59.5GB`: decode_tps 206.5 against 205.1, prefill 16K / 64K +0.4 / -0.3 %.
+- Inkling MX8 fp16: gate as at +79 (0.00286 / 97.79 %); conv / prose +0.9 / +1.0 % over seeds 2-5 (se 0.2), struct
+  +1.7 %, the no-thinking struct text 559.6 against 549.3 tok/s, 16K -0.2 %. DFlash 2 untested: no pack here has it.
 
 ## When a new build fails on the card
 An illegal-instruction or launch failure means a `__trap()` stub was launched: rerun with `CUDA_LAUNCH_BLOCKING=1`
