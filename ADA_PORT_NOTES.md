@@ -208,15 +208,13 @@ the fallback so the trap is never launched.
   16K +1.8 %, 64K -3.6 % from where the adaptive swaps left the experts (`--adapt-swaps 0`: 6260 against 6264).
 
 ## Upstream 0.5.0: Hy4-flash, and 0.5.0+58: the shared routing flags (merged 2026-11-20)
-- Hy4-flash builds for 8.9 as it is (f16 mma, ldmatrix, cp.async, the e4m3 cvt, NVFP4 experts through MMQ;
-  `attend_mma_kernel` opts in to 85,760 of 101,376 bytes); its parity tests pass, no pack (158.7 GB) has been run.
-  `file_expert_repin_test` fails on Windows (it assumes Linux's unpinned RAM copy). Output identical, SASS as upstream's,
-  A/B 202.2 against 203.0. +58 needed nothing; upstream's FP4-Local reader (#444) replaced the fork's (dbb54997).
+- Hy4-flash builds for 8.9 as it is (f16 mma, ldmatrix, cp.async, e4m3 cvt, NVFP4 experts through MMQ; `attend_mma_kernel`
+  opts in to 85,760 of 101,376 bytes); parity tests pass, no pack (158.7 GB) run; `file_expert_repin_test` fails on Windows
+  (Linux's unpinned RAM copy). Output identical, SASS upstream's, A/B 202.2 / 203.0; +58: #444 replaced the fork's FP4-Local.
 
 ## PCIe share of solo decode windows (experiment, 2026-11-20)
-- `--exp solo_stage=1` stages a share of each layer's CPU misses over PCIe in solo windows too (`stage_frac`, `stage_min`;
-  [experiment keys](docs/configuration/diagnostics.md)). 8 seeds, 450 W, int8 KV: no share wins (0.1-0.35: -2.9 to
-  +2.2 %; 0.5: -13.7 / -9.2 %); stage kernel, launch and join cost 0.2-0.5 ms a pass, and staging changes the text.
+- `--exp solo_stage=1` (`stage_frac`, `stage_min`; [keys](docs/configuration/diagnostics.md)) stages CPU misses over PCIe
+  in solo windows: no share wins (8 seeds; 0.1-0.35 -2.9..+2.2 %, 0.5 -13.7 %); 0.2-0.5 ms a pass, and the text changes.
 
 ## Upstream 0.5.5: Inkling 2 Mini (merged 2026-11-23)
 - Inkling 2 (src/models/inkling2) checks no compute capability. On 8.9 its fused window attention (a cluster of eight
@@ -240,9 +238,8 @@ the fallback so the trap is never launched.
   the SMs at the wrong L1/shared split and took the attention's bandwidth. Plain decoding +12 %, MX8 conv / prose +2.9 /
   +4.7 %, same text (both packs alike). Drafts accepted 56 / 97 / 40 % (5090: 68 / 97.5 / 51): deeper drafts pay here.
 - Inkling 2 Mini, every expert on the card, 450 W, DDR5-4800. Gate: upstream's `inkling2-bf16-base.kld`, 100 chunks,
-  T=1, scored-row base PPL 7.0633. Speed: basalt-bench seed 1, two runs (fp16, int8, int8, fp16), tok/s; ms/tok is plain
-  decoding (`--spec 1`) after the 16K prompt. Context: the largest `--max-context` that keeps every expert on the card
-  (CLI, one session, the card otherwise empty; it moves by about 100 between starts).
+  T=1, scored-row base PPL 7.0633. Speed: basalt-bench seed 1, two runs, tok/s; ms/tok: `--spec 1` after the 16K prompt.
+  Context: the largest `--max-context` keeping every expert on the card (CLI, card otherwise empty; +/-100 a start).
 
   | Pack, KV | KLD     | top-1 % | PPL    | conv | struct | prose | 16K   | 64K   | ms/tok | context |
   |----------|--------:|--------:|-------:|-----:|-------:|------:|------:|------:|-------:|--------:|
@@ -253,15 +250,13 @@ the fallback so the trap is never launched.
 
 - A 5090 (400 W, MX8): conv 347, struct 628, prose 296, 16K 15,820. int8 reads 288 against 512 MiB of cache a token at
   16K and fits 1.68x the context. DQ8 reads prompts 2 % faster here (upstream: MX8 5 %; likely 8.9's MXFP8 on f16 mma).
-  Just above each context limit ~35 MiB refused to start instead of moving experts to RAM (#542; fixed by #643).
 
 ## Upstream 0.5.7+39: gpu-mode for several cards, Inkling's tensor-core attention (merged 2026-11-24)
 - `gpu-mode` (peer, split) and `gpu-share` replace each model's multi-card logic; here every card may be sm_120 or sm_89
   in every mode (upstream: sm_89 only as a Flash-Next peer). Inkling's tensor-core attention (#626, #606) is f16 mma and
   ldmatrix within the card's opt-in limits. Three tests frozen on Blackwell take 8.9 values (ad46f9ef);
   `prefill_mmq_mxfp4_test` (new) fails IQ2_XS / IQ2_S gate/up alike at every planning SM count: not 8.9's.
-- CPU 111/111, GPU the 4 known fails; output identical; SASS of 35 files as upstream's. A/B 4 pairs: decode_tps 200.2
-  against 200.1 (prose -3.6 % in 2 pairs, +3.1 % in 2 more: a fixture swings ~4 % a run).
+- CPU 111/111, GPU the 4 known fails; output identical; SASS of 35 files as upstream's; decode_tps 200.2 against 200.1.
 - Inkling (#579 changes its bits): gate MX8 / DQ8 0.00296 / 97.73 %, int8 0.00343 / 97.45 and 0.00345 / 97.40 %; MX8
   struct -6.6 % from another greedy text; with #643 all experts stay on the card up to MX8 80,918 / 135,718, DQ8
   77,500 / 130,129 (fp16 / int8).
@@ -274,8 +269,7 @@ the fallback so the trap is never launched.
   `--bench`, 3 runs: -3.8 / -2.4 % at 4096 tokens (Inkling's chunk), +2.6 % at 2048.
 - #652's batched drafter head read its pick as 0.5.5's solo head did (the load hoisted above the barrier on 8.9): the
   same fix (91ea05ad). #673's tensor-core window ring sums to other bits here; its hash takes the 8.9 value.
-- CPU 112/112, GPU the 5 known fails; Flash-Next output identical; SASS of 42 files as upstream's. A/B 4 pairs: decode_tps
-  197.7 against 192.5, the last 2 pairs a tie (195.3 / 195.5; the runs beside a 10 GiB process read lowest).
+- CPU 112/112, GPU the 5 known fails; output identical; SASS of 42 files as upstream's; decode_tps a tie (195.3 / 195.5).
 - Inkling MX8: gate level or lower (fp16 MX8 0.00286 / 97.79 %, DQ8 0.00287 / 97.75 %; int8 as before); 16K prompt
   +2.5 %; per-width verify costs level (1-2 tokens +1-2 %, 5-8 tokens -2-3 %). Conv -3.3 % (5 seeds) and struct -12 %
   are other texts, not kernel cost: on one shared text (struct without thinking) the split kernels, which int8 KV
@@ -293,7 +287,13 @@ the fallback so the trap is never launched.
   system memory, and a graph still instantiates); Flash-Next output identical (fp16, int8 KV); SASS of 49 files as
   upstream's. A/B 2 pairs, `ram-experts=59.5GB`: decode_tps 206.5 against 205.1, prefill 16K / 64K +0.4 / -0.3 %.
 - Inkling MX8 fp16: gate as at +79 (0.00286 / 97.79 %); conv / prose +0.9 / +1.0 % over seeds 2-5 (se 0.2), struct
-  +1.7 %, the no-thinking struct text 559.6 against 549.3 tok/s, 16K -0.2 %. DFlash 2 untested: no pack here has it.
+  +1.7 %, the no-thinking struct text 559.6 against 549.3 tok/s, 16K -0.2 %.
+- DFlash 2 on an MX8 pack converted here (`--dflash2`, incoai/Inkling-2-Mini-DFlash2 at 4f9088ea; its 656 target tensors
+  are the MX8 pack's bytes): `inkling2_checkpoint_round_trip` 47/47 (skips without `BASALT_INKLING2_PACK`), gate as MX8's.
+  Against the DSpark pack, one binary, seeds 2-9, same token counts: prose +10.8 % (se 1.1, every seed), conv +0.8 % (se
+  0.8), struct -1.4 %, no-thinking text and 16K level; accepted 45 / 57 / 83 % -> 60 / 63 / 87 % (prose / conv / struct).
+  nsys: the drafter takes 1.24 ms a window (DSpark 0.56), 0.55 the whole head as Q8 (490 MB, ~890 GB/s): its FP4 copy
+  needs rows in 128s, the vocabulary is 200,058 (sm_120 too; FP4 reads 259 MB, untried). bf16 mma on both: not 8.9's.
 
 ## When a new build fails on the card
 An illegal-instruction or launch failure means a `__trap()` stub was launched: rerun with `CUDA_LAUNCH_BLOCKING=1`
